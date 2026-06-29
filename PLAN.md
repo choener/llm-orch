@@ -50,11 +50,13 @@ stickiness_grace_period = 120  # seconds
 name = "AMD Radeon 1"
 query-command = "bash /etc/llm-orch/gpu0-info.sh"
 query-interval = "5s"
+environment = { "HIP_VISIBLE_DEVICES" = "0", "GGML_VULKAN_DEVICE" = "0" }
 
 [gpus.1]
 name = "AMD Radeon 2"
 query-command = "bash /etc/llm-orch/gpu1-info.sh"
 query-interval = "5s"
+environment = { "HIP_VISIBLE_DEVICES" = "1", "GGML_VULKAN_DEVICE" = "1" }
 
 [models.qwen3-6b]
 path = "/path/to/qwen3-6b.gguf"
@@ -70,6 +72,7 @@ log-traffic-max-size = "1GB"
 log-traffic-max-age = "7d"
 llama-server-bin = "llama-server"
 llama-server-args = ["--ctx-size", "8192", "--threads", "8"]
+environment = { "LLAMA_ORCH_MODEL" = "qwen3-6b" }
 ```
 
 ### API Keys (separate TOML, hot-reload)
@@ -137,6 +140,8 @@ system rather than simple thresholds:
 - [ ] Pre-load action: execute `pre-load-command` (per-model, optional) before spawning `llama-server`
   - Subject to global `[scripts].timeout`; on failure, block instance from starting and log error
 - [ ] Spawn `llama-server` process with configured args + `--host` + `--port` + GPU placement
+  - Merge `environment` maps: model env vars first, GPU env vars overlaid on top (GPU placement takes precedence)
+  - For Vulkan: set `GGML_VULKAN_DEVICE=<id>`; for ROCm/HIP: set `HIP_VISIBLE_DEVICES=<id>`; for CUDA: set `CUDA_VISIBLE_DEVICES=<id>` (also `--main-gpu` if needed)
 - [ ] Wait for instance to be ready (poll `/v1/models` until 200, with timeout)
 - [ ] Post-load action: execute `post-load-command` (per-model, optional) after instance is ready
   - Subject to global `[scripts].timeout`; on failure, log warning but mark instance as ready (GPU tuning is best-effort)
@@ -159,39 +164,23 @@ system rather than simple thresholds:
 - [ ] API key validation against loaded key set
 - [ ] OpenAI-compatible request/response types (`ChatCompletionRequest`, `ChatCompletionChunk`, etc.)
 - [ ] Error responses in OpenAI format (`{ "error": { "message": ..., "type": ... } }`)
+- [ ] Configurable `max-request-body-size` in `[server]` to prevent oversized chat histories from exhausting memory
 
-### 5. Session Affinity & Routing
-- [ ] Session ID extraction: from `X-Session-Id` header, or generate/assign one
-- [ ] Session registry: maps session_id → instance_id (with last-accessed timestamp)
-- [ ] Routing logic:
-  - If session has an affinity and that instance is healthy → route there
-  - If affinity instance is gone/unhealthy → pick new instance, update affinity
-  - If no affinity → pick instance via pressure model
-- [ ] Forward request to chosen `llama-server` instance via `reqwest`
-- [ ] Pipe SSE streaming response from instance back to client (no buffering)
-- [ ] Handle streaming errors: instance dies mid-stream → close stream with error (no retry)
-
-### 6. API Key Enforcement & Hot-Reload
+### 5. API Key Enforcement, Rate Limiting & Hot-Reload
 - [ ] Load API keys from separate config file at startup
 - [ ] Watch API keys file for changes (`notify` crate)
 - [ ] On reload: compute diff (added/removed keys)
+- [ ] Failed reload safety: if new keys file is invalid or empty, retain previous keys and log error (never lock out due to a bad file write)
 - [ ] Track active connections by API key (insert into shared set on auth success)
 - [ ] On key removal: signal all active streaming connections using that key to abort
 - [ ] Reject new requests with removed keys immediately
 - [ ] New keys take effect immediately without restart
+- [ ] Enforce keys file permissions: warn if not `0600`, refuse to start if world-readable
+- [ ] **Rate limiting:** per-key concurrent-request cap and generous per-minute request quota
+  - Default: high thresholds (e.g., 20 concurrent, 500 req/min), meant to prevent accidental overload between trusted users rather than enforce strict tiers
+  - On limit: return `429` with `Retry-After` header
 
-### 7. Config Hot-Reload
-- [ ] Watch main TOML config file for changes
-- [ ] On reload: parse new config, validate
-- [ ] Apply changes:
-  - New models → available for future requests (no auto-spin)
-  - Removed models → stop accepting new requests, drain existing
-  - Changed `allowed-gpus` → affects next scale-up decision
-  - Changed timeouts → applied immediately
-- [ ] Active LLM connections stay alive during reload
-- [ ] Failed reload → log error, keep old config
-
-### 8. Pressure Engine & Auto-Scaling
+### 6. Pressure Engine & Auto-Scaling
 - [ ] Pressure scorer module with configurable weights (TOML):
   - `vram_usage_weight` — VRAM used / total ratio (default: 1.0)
   - `overcommit_penalty` — additive penalty when VRAM used > total (default: 2.0)
@@ -213,6 +202,28 @@ system rather than simple thresholds:
   - Kill instance after drain
 - [ ] Concurrency limits: max instances per model, max instances per GPU
 
+### 7. Session Affinity & Routing
+- [ ] Session ID extraction: from `X-Session-Id` header, or generate/assign one
+- [ ] Session registry: maps session_id → instance_id (with last-accessed timestamp)
+- [ ] Routing logic:
+  - If session has an affinity and that instance is healthy → route there
+  - If affinity instance is gone/unhealthy → pick new instance, update affinity
+  - If no affinity → pick instance via pressure model
+- [ ] Forward request to chosen `llama-server` instance via `reqwest`
+- [ ] Pipe SSE streaming response from instance back to client (no buffering)
+- [ ] Handle streaming errors: instance dies mid-stream → emit final SSE chunk with structured error, then close stream (no retry)
+
+### 8. Config Hot-Reload
+- [ ] Watch main TOML config file for changes
+- [ ] On reload: parse new config, validate
+- [ ] Apply changes:
+  - New models → available for future requests (no auto-spin)
+  - Removed models → stop accepting new requests, drain existing
+  - Changed `allowed-gpus` → affects next scale-up decision
+  - Changed timeouts → applied immediately
+- [ ] Active LLM connections stay alive during reload
+- [ ] Failed reload → log error, keep old config
+
 ### 9. Streaming Implementation
 - [ ] Async SSE streaming from `llama-server` → `axum` `Stream` response
 - [ ] Proper `Content-Type: text/event-stream` headers
@@ -226,6 +237,7 @@ system rather than simple thresholds:
   - Final: `loading <model-name> on GPU <N> ..... <X>s done
 `
   - Only emitted before the first chunk of the actual response
+- [ ] **Upstream error frames:** if the upstream `llama-server` connection drops mid-stream, emit a final SSE chunk with an orchestrator error object so the client knows the failure was upstream, not end-of-stream
 
 ### 10. Error Handling & Resilience
 - [ ] Timeout handling: per-request timeout, per-instance startup timeout
@@ -239,6 +251,7 @@ system rather than simple thresholds:
 - [ ] Per-model traffic logging (`log-traffic = true`):
   - JSONL format, one entry per completed request
   - Fields: timestamp, model, session_id, request (messages), response (full text), input/output tokens, cached tokens, duration, serving GPU/instance
+  - **Redact API keys:** strip `Authorization` headers and any key material before writing to disk
   - Async write via channel/buffer (must not block request path)
   - Log rotation: `log-traffic-max-size` (default 1GB), `log-traffic-max-age` (default 7d)
   - Path: `log-traffic-path` (required when `log-traffic = true`)
@@ -272,9 +285,10 @@ system rather than simple thresholds:
    changes on disk, running instances won't see it. Document this limitation.
 
 3. **Context window migration.** When a session is migrated to a new instance,
-   the full context is reprocessed. For very long conversations (128k+ tokens),
-   this adds significant latency. Consider: context summarization, or allowing
-   the client to truncate history.
+   the full context is reprocessed. This is intentional: we accept the latency
+   hit for conversations up to 200K+ tokens rather than summarizing or
+   truncating. Clients that need guaranteed fast migration must wait for KV-cache
+   transfer (Task 13).
 
 4. **Race conditions on scale events.** A scale-up and scale-down for the same
    model could race. Mitigation: use a mutex or atomic state machine per model.
