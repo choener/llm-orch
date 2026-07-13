@@ -1,0 +1,10 @@
+# llm-orch API keys
+# =================
+# One entry per line: `<label>: <key>`.  The label is used in logs and
+# metrics to identify the key holder; the key data must never appear in
+# logs.  Blank lines and lines starting with `#` are ignored.
+# Revocation = delete the line.
+#
+personal-laptop:   sk-alice-6a8f3b2d1c
+work-desktop:      sk-bob-9e7d4c5f6a
+openwebui:         sk-carol-1b2c3d4e

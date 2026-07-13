@@ -1,6 +1,7 @@
 use clap::Parser;
 
 mod config;
+mod apikeys;
 
 /// LLM Orch — single-host LLM orchestrator.
 #[derive(Parser, Debug)]
