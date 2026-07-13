@@ -25,15 +25,6 @@ server:
 apikeys_file: "apikeys.txt"
 
 # ---------------------------------------------------------------------------
-# GPU filtering
-# ---------------------------------------------------------------------------
-# PCI slot names to exclude from GPU metrics.  Useful for hiding iGPUs or
-# display-only cards that should never run LLM workloads.
-#
-# gpu_exclude_slots:
-#   - "0000:7b:00.0"   # iGPU with ~2 GB VRAM — too small for models
-
-# ---------------------------------------------------------------------------
 # Device mapping
 # ---------------------------------------------------------------------------
 # Map backend device indices to PCI slots.  The indices here are what

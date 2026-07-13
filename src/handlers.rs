@@ -122,9 +122,9 @@ pub async fn info_endpoint(
     let span = tracing::info_span!("info", id = %uuid::Uuid::new_v4().to_string());
     async {
     // ── 1. Read config, clone what we need, drop the guard. ──────────────
-    let (models, aliases, gpu_exclude_slots) = {
+    let (models, aliases) = {
         let cfg = state.config.read().await;
-        (cfg.models.clone(), cfg.aliases.clone(), cfg.gpu_exclude_slots.clone())
+        (cfg.models.clone(), cfg.aliases.clone())
     }; // cfg read guard dropped
 
     // ── 2. Read instance state, clone what we need, drop the guard. ─────
@@ -164,7 +164,6 @@ pub async fn info_endpoint(
 
     let gpu_statuses: Vec<GpuStatus> = gpu_metrics
         .iter()
-        .filter(|g| !gpu_exclude_slots.iter().any(|s| s == &g.pci_slot))
         .map(|g| {
             let vram_util_pct = if g.vram_total_bytes > 0 {
                 (g.vram_used_bytes as f64 / g.vram_total_bytes as f64) * 100.0
