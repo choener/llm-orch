@@ -8,11 +8,13 @@ use tracing_subscriber::EnvFilter;
 mod apikeys;
 mod backend;
 mod config;
+mod handlers;
 mod http_client;
 mod instance;
 mod port_alloc;
 mod scheduler;
 mod server;
+mod types;
 mod watcher;
 
 /// LLM Orch — single-host LLM orchestrator.
@@ -111,6 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: Arc::clone(&shared_cfg),
         apikeys: Arc::clone(&shared_apikeys),
         manager: Arc::clone(&manager),
+        client: manager.client().clone(),
     };
     let server_task = tokio::spawn(server::serve(app_state));
 

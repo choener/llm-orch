@@ -5,15 +5,17 @@
 
 use crate::apikeys::ApikeysStore;
 use crate::config::Config;
+use crate::handlers;
 use crate::scheduler::InstanceManager;
 
 use axum::{
     extract::FromRequestParts,
     http::{header, request::Parts, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Router,
 };
+use reqwest::Client;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -32,6 +34,8 @@ pub struct AppState {
     pub apikeys: Arc<RwLock<ApikeysStore>>,
     /// Instance manager (model lifecycle).
     pub manager: Arc<InstanceManager>,
+    /// Shared HTTP client for forwarding requests to backends.
+    pub client: Client,
 }
 
 // ── Router ───────────────────────────────────────────────────────────────────
@@ -41,7 +45,11 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         // Health check — no auth required.
         .route("/health", get(health))
-        // TODO: /v1/models, /v1/info, /v1/chat/completions, /admin/*
+        // OpenAI-compatible endpoints.
+        .route("/v1/models", get(handlers::list_models))
+        .route("/v1/info", get(handlers::info_endpoint))
+        .route("/v1/chat/completions", post(handlers::chat_completions))
+        .route("/v1/completions", post(handlers::completions))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .with_state(state)

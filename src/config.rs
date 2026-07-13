@@ -249,7 +249,7 @@ fn default_queue_depth() -> usize {
 // Aliases
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AliasConfig {
     /// The alias name — appears in `/v1/models` and can be used in API requests.
     pub name: String,

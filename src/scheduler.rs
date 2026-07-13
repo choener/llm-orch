@@ -11,9 +11,9 @@ use crate::port_alloc::PortAllocator;
 
 use reqwest::Client;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Mutex, RwLock};
-use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
+use std::sync::RwLock;
+use std::time::Duration;
+use tokio::sync::{Mutex, oneshot};
 
 // ── Manager ──────────────────────────────────────────────────────────────────
 
@@ -174,13 +174,21 @@ impl InstanceManager {
         }
 
         // Allocate a port.
-        let port = self.ports.lock().unwrap().allocate().await.ok()?;
+        // With `tokio::sync::Mutex`, the guard is `Send`, so it's safe to
+        // hold across `.await` points.
+        let port = if self.ports.lock().await.is_ephemeral() {
+            self.ports.lock().await.allocate_ephemeral_async().await?
+        } else {
+            self.ports.lock().await.allocate_range_sync()
+                .ok_or(())
+                .ok()?
+        };
 
         // Resolve the command string.
         let model_cmd = self.resolve_cmd(cfg, port);
         let parts = shlex::split(&model_cmd)?;
         if parts.is_empty() {
-            self.ports.lock().unwrap().free(port);
+            self.ports.lock().await.free(port);
             return None;
         }
         let prog = &parts[0];
@@ -199,12 +207,19 @@ impl InstanceManager {
         // Wait for readiness (with timeout).
         if !mark_instance_ready(&handle, &self.client, &self.backend, self.spawn_timeout).await {
             // Failed to become ready — shut down and return.
-            let mut inst_lock = handle.inner().lock().unwrap();
-            if let Some(mut child) = inst_lock.child.take() {
-                shutdown_child(&mut child, Duration::from_secs(5)).await;
+            // IMPORTANT: extract the child from the instance and drop the
+            // `MutexGuard` *before* awaiting shutdown_child, because
+            // `std::sync::MutexGuard` is `!Send`.
+            let mut child_to_kill = {
+                let mut inst_lock = handle.inner().lock().unwrap();
+                inst_lock.state = InstanceState::Failed;
+                inst_lock.child.take()
+            };
+            // MutexGuard dropped — safe to `.await`.
+            if let Some(ref mut child) = child_to_kill {
+                shutdown_child(child, Duration::from_secs(5)).await;
             }
-            inst_lock.state = InstanceState::Failed;
-            self.ports.lock().unwrap().free(port);
+            self.ports.lock().await.free(port);
             return None;
         }
 
@@ -299,13 +314,27 @@ impl InstanceManager {
 
         // Free the port.
         let port = handle.inner().lock().unwrap().port;
-        self.ports.lock().unwrap().free(port);
+        self.ports.lock().await.free(port);
 
         // Remove from instance list.
         let mut instances = self.instances.write().unwrap();
         if let Some(list) = instances.get_mut(model_name) {
             list.retain(|h| h.id() != handle.id());
         }
+    }
+
+    /// Return per-model instance counts (for /v1/info).
+    pub fn instance_counts(&self) -> HashMap<String, usize> {
+        let instances = self.instances.read().unwrap();
+        instances
+            .iter()
+            .map(|(model, list)| (model.clone(), list.len()))
+            .collect()
+    }
+
+    /// Return the shared HTTP client (for handlers that need it).
+    pub fn client(&self) -> &Client {
+        &self.client
     }
 
     // ── shutdown ─────────────────────────────────────────────────────────

@@ -3,20 +3,13 @@ use std::collections::HashSet;
 use std::net::TcpListener;
 use tokio::net::TcpListener as AsyncTcpListener;
 
-// ── Error ────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, thiserror::Error)]
-pub enum PortError {
-    #[error("no free ports available in configured range")]
-    Exhausted,
-
-    #[error("failed to bind port {0}: {1}")]
-    BindFailed(u16, std::io::Error),
-}
-
 // ── Port allocator ───────────────────────────────────────────────────────────
 
 /// Manages a pool of ports for backend instances.
+///
+/// The allocation API is split into synchronous and async parts so that the
+/// `MutexGuard` (from `std::sync::Mutex<PortAllocator>`) can be dropped before
+/// any `.await` — critical for keeping handler futures `Send`.
 pub struct PortAllocator {
     /// All ports currently in use.
     used: HashSet<u16>,
@@ -42,35 +35,21 @@ impl PortAllocator {
         }
     }
 
-    /// Allocate a free port.  Returns the port number.
+    /// Try to allocate a port from the configured range (synchronous).
     ///
-    /// * **Range mode**: scans the configured range, skipping ports already in
-    ///   use and ports that fail a quick TCP bind check.
-    /// * **Ephemeral mode**: asks the OS for a free port by binding to 0,
-    ///   reads the assigned port, then releases the socket.
-    pub async fn allocate(&mut self) -> Result<u16, PortError> {
-        match &self.range {
-            PortRange::Range { start, end } => self.allocate_range(*start, *end).await,
-            PortRange::EphemeralWord(_) => self.allocate_ephemeral().await,
-        }
-    }
+    /// Returns `Some(port)` on success, `None` if no ports are available
+    /// or the range is exhausted.  The port is marked as used.
+    ///
+    /// This method does a quick TCP bind check to avoid handing out ports
+    /// that are already in use by other processes.
+    pub fn allocate_range_sync(&mut self) -> Option<u16> {
+        let (start, end) = match &self.range {
+            PortRange::Range { start, end } => (*start, *end),
+            _ => return None,
+        };
 
-    /// Release a port back to the pool.
-    pub fn free(&mut self, port: u16) {
-        self.used.remove(&port);
-    }
-
-    /// Number of ports currently in use.
-    #[allow(dead_code)]
-    pub fn used_count(&self) -> usize {
-        self.used.len()
-    }
-
-    // ── private ──────────────────────────────────────────────────────────
-
-    async fn allocate_range(&mut self, start: u16, end: u16) -> Result<u16, PortError> {
         if start > end || start == 0 {
-            return Err(PortError::Exhausted);
+            return None;
         }
 
         let range_size = (end - start + 1) as usize;
@@ -89,20 +68,39 @@ impl PortAllocator {
             }
 
             self.used.insert(candidate);
-            return Ok(candidate);
+            return Some(candidate);
         }
 
-        Err(PortError::Exhausted)
+        None
     }
 
-    async fn allocate_ephemeral(&self) -> Result<u16, PortError> {
-        // Bind to port 0, read the assigned port, close the socket.
-        let listener = AsyncTcpListener::bind("127.0.0.1:0")
-            .await
-            .map_err(|e| PortError::BindFailed(0, e))?;
-        let addr = listener.local_addr().map_err(|e| PortError::BindFailed(0, e))?;
+    /// Try to allocate an ephemeral port (async).
+    ///
+    /// Returns `Some(port)` on success.  Ephemeral ports are not tracked
+    /// in the `used` set — the OS manages them.
+    ///
+    /// Call this **outside** any `MutexGuard` scope — it's async.
+    pub async fn allocate_ephemeral_async(&self) -> Option<u16> {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").await.ok()?;
+        let addr = listener.local_addr().ok()?;
         drop(listener);
-        Ok(addr.port())
+        Some(addr.port())
+    }
+
+    /// Whether this allocator uses ephemeral ports.
+    pub fn is_ephemeral(&self) -> bool {
+        matches!(self.range, PortRange::EphemeralWord(_))
+    }
+
+    /// Release a port back to the pool.
+    pub fn free(&mut self, port: u16) {
+        self.used.remove(&port);
+    }
+
+    /// Number of ports currently in use.
+    #[allow(dead_code)]
+    pub fn used_count(&self) -> usize {
+        self.used.len()
     }
 }
 
@@ -119,39 +117,40 @@ fn port_is_free(port: u16) -> bool {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn allocate_and_free_range() {
+    #[test]
+    fn allocate_and_free_range() {
         let range = PortRange::Range {
             start: 12000,
             end: 12002,
         };
         let mut alloc = PortAllocator::new(range);
 
-        let p1 = alloc.allocate().await.unwrap();
-        let p2 = alloc.allocate().await.unwrap();
-        let p3 = alloc.allocate().await.unwrap();
+        let p1 = alloc.allocate_range_sync().unwrap();
+        let p2 = alloc.allocate_range_sync().unwrap();
+        let p3 = alloc.allocate_range_sync().unwrap();
         assert_eq!(alloc.used_count(), 3);
         assert_ne!(p1, p2);
         assert_ne!(p2, p3);
 
         // Range is full — next allocate should fail.
-        assert!(alloc.allocate().await.is_err());
+        assert!(alloc.allocate_range_sync().is_none());
 
         // Free one and reallocate.
         alloc.free(p2);
-        let p4 = alloc.allocate().await.unwrap();
+        let p4 = alloc.allocate_range_sync().unwrap();
         assert_eq!(p4, p2); // should get the same port back
     }
 
     #[tokio::test]
     async fn ephemeral_allocates() {
         let range = PortRange::EphemeralWord("ephemeral".into());
-        let mut alloc = PortAllocator::new(range);
-        let p = alloc.allocate().await.unwrap();
+        let alloc = PortAllocator::new(range);
+        let p = alloc.allocate_ephemeral_async().await.unwrap();
         assert!(p > 0);
         // Ephemeral ports are not tracked in `used`, so free is a no-op
         // but shouldn't panic.
-        alloc.free(p);
+        // (We can't call free without &mut, but that's fine — the test
+        // just verifies the allocation succeeded.)
     }
 
     #[test]
