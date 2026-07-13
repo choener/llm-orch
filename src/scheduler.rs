@@ -14,6 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::RwLock;
 use std::time::Duration;
 use tokio::sync::{Mutex, oneshot};
+use tracing::{debug, warn};
 
 // ── Manager ──────────────────────────────────────────────────────────────────
 
@@ -177,20 +178,31 @@ impl InstanceManager {
         // With `tokio::sync::Mutex`, the guard is `Send`, so it's safe to
         // hold across `.await` points.
         let port = if self.ports.lock().await.is_ephemeral() {
-            self.ports.lock().await.allocate_ephemeral_async().await?
+            let p = self.ports.lock().await.allocate_ephemeral_async().await;
+            if p.is_some() {
+                debug!(model = %model_name, port = p.unwrap(), "allocated ephemeral port");
+            } else {
+                warn!(model = %model_name, "no ephemeral port available");
+            }
+            p?
         } else {
-            self.ports.lock().await.allocate_range_sync()
-                .ok_or(())
-                .ok()?
+            let p = self.ports.lock().await.allocate_range_sync();
+            if p.is_none() {
+                warn!(model = %model_name, "no free ports in range");
+            }
+            p?
         };
 
         // Resolve the command string.
         let model_cmd = self.resolve_cmd(cfg, port);
-        let parts = shlex::split(&model_cmd)?;
-        if parts.is_empty() {
+        let parts = shlex::split(&model_cmd);
+        if parts.is_none() || parts.as_ref().map(|p| p.is_empty()).unwrap_or(true) {
+            warn!(model = %model_name, cmd = %model_cmd, "invalid or empty command after shlex split");
             self.ports.lock().await.free(port);
             return None;
         }
+        let parts = parts.unwrap();
+        debug!(model = %model_name, parts = ?parts, "parsed command");
         let prog = &parts[0];
         let gpu_indices = vec![]; // TODO: GPU allocation
         let mut args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
@@ -198,7 +210,14 @@ impl InstanceManager {
         let envs = self.backend.gpu_env(&gpu_indices);
 
         // Spawn.
-        let child = spawn_process(prog, &args, &envs).await.ok()?;
+        let child = match spawn_process(prog, &args, &envs).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(model = %model_name, error = %e, "spawn failed");
+                self.ports.lock().await.free(port);
+                return None;
+            }
+        };
 
         let mut inst = Instance::new(model_name, gpu_indices, port);
         inst.child = Some(child);
@@ -206,6 +225,7 @@ impl InstanceManager {
 
         // Wait for readiness (with timeout).
         if !mark_instance_ready(&handle, &self.client, &self.backend, self.spawn_timeout).await {
+            warn!(model = %model_name, port = port, "health check timeout — shutting down instance");
             // Failed to become ready — shut down and return.
             // IMPORTANT: extract the child from the instance and drop the
             // `MutexGuard` *before* awaiting shutdown_child, because
