@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -42,7 +42,85 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let contents = std::fs::read_to_string(path)?;
         let config: Self = serde_yaml_ng::from_str(&contents)?;
+        config.validate()?;
         Ok(config)
+    }
+
+    /// Check the configuration for semantic errors beyond YAML parsing.
+    fn validate(&self) -> Result<(), ConfigError> {
+        // --- models ---
+        let mut seen_names = HashSet::new();
+        for m in &self.models {
+            if m.name.is_empty() {
+                return Err(ConfigError::Validation("model name must not be empty".into()));
+            }
+            if !seen_names.insert(&m.name) {
+                return Err(ConfigError::Validation(format!(
+                    "duplicate model name: {}",
+                    m.name
+                )));
+            }
+            if m.context_length == 0 {
+                return Err(ConfigError::Validation(format!(
+                    "model '{}': context_length must be > 0",
+                    m.name
+                )));
+            }
+            if m.cmd.trim().is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "model '{}': cmd must not be empty",
+                    m.name
+                )));
+            }
+        }
+
+        // --- aliases ---
+        let model_names: HashSet<&str> = self.models.iter().map(|m| m.name.as_str()).collect();
+        let mut seen_aliases = HashSet::new();
+        for a in &self.aliases {
+            if a.name.is_empty() {
+                return Err(ConfigError::Validation(
+                    "alias name must not be empty".into(),
+                ));
+            }
+            if !seen_aliases.insert(&a.name) {
+                return Err(ConfigError::Validation(format!(
+                    "duplicate alias name: {}",
+                    a.name
+                )));
+            }
+            if a.target.is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "alias '{}': target must not be empty",
+                    a.name
+                )));
+            }
+            if !model_names.contains(a.target.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "alias '{}' targets unknown model '{}'",
+                    a.name, a.target
+                )));
+            }
+        }
+
+        // --- cmd_aliases ---
+        if self.cmd_aliases.contains_key("port") {
+            return Err(ConfigError::Validation(
+                "cmd_aliases: 'port' is a reserved name".into(),
+            ));
+        }
+
+        // --- port range ---
+        if let PortRange::Range { start, end } = &self.server.port_range {
+            if start > end {
+                return Err(ConfigError::Validation(format!(
+                    "server.port_range: start ({}) must be <= end ({})",
+                    start, end
+                )));
+            }
+        }
+
+        Ok(())
     }
 
     /// Resolve `{alias_name}` references in a model's `cmd` against `cmd_aliases`.

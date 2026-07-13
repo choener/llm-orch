@@ -2,6 +2,9 @@ use clap::Parser;
 
 mod config;
 mod apikeys;
+mod backend;
+mod http_client;
+mod instance;
 
 /// LLM Orch — single-host LLM orchestrator.
 #[derive(Parser, Debug)]
@@ -30,11 +33,11 @@ async fn main() {
     if let Some(check_path) = cli.check_config {
         match config::Config::load(&check_path) {
             Ok(cfg) => {
-                // TODO: full validation (duplicate names, alias targets, etc.)
                 eprintln!(
-                    "OK: {} model(s), {} alias(es)",
+                    "OK: {} model(s), {} alias(es), {} cmd alias(es)",
                     cfg.models.len(),
-                    cfg.aliases.len()
+                    cfg.aliases.len(),
+                    cfg.cmd_aliases.len(),
                 );
                 std::process::exit(0);
             }

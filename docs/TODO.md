@@ -1,0 +1,1 @@
+- [ ] `/v1/info` endpoint should return utilization of each card
