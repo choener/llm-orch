@@ -243,6 +243,8 @@ pub struct ModelEntry {
 pub struct InfoResponse {
     pub models: Vec<ModelInfo>,
     pub aliases: Vec<AliasInfo>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub gpus: Vec<GpuStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -261,6 +263,32 @@ pub struct AliasInfo {
     pub name: String,
     pub target: String,
     pub has_system_prompt: bool,
+}
+
+// ── GPU status (for /admin/status) ───────────────────────────────────────────
+
+/// Summary of a single GPU, derived from the raw sysfs snapshot.
+#[derive(Debug, Clone, Serialize)]
+pub struct GpuStatus {
+    pub index: usize,
+    pub pci_slot: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vram_vendor: Option<String>,
+    /// VRAM used / total in bytes.
+    pub vram_used_bytes: u64,
+    pub vram_total_bytes: u64,
+    /// VRAM utilisation percentage (0–100).
+    pub vram_util_pct: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature_c: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub power_w: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_busy_pct: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sclk_mhz: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mclk_mhz: Option<u64>,
 }
 
 // ── Admin actions ────────────────────────────────────────────────────────────

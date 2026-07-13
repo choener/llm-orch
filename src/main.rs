@@ -8,6 +8,7 @@ use tracing_subscriber::EnvFilter;
 mod apikeys;
 mod backend;
 mod config;
+mod gpu;
 mod handlers;
 mod http_client;
 mod instance;
@@ -100,6 +101,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manager = Arc::new(scheduler::InstanceManager::new(&cfg));
     info!("instance manager ready");
 
+    // 4. Start GPU metrics reader (periodic sysfs polling).
+    let (gpu_reader, _gpu_poll_task) = gpu::GpuReader::start(Duration::from_secs(5));
+    let gpu_snapshot = gpu_reader.snapshot_arc();
+    info!("gpu metrics reader started");
+
     // Shared state for hot-reload.
     let shared_cfg = Arc::new(RwLock::new(cfg));
     let shared_apikeys = Arc::new(RwLock::new(apikeys));
@@ -114,6 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         apikeys: Arc::clone(&shared_apikeys),
         manager: Arc::clone(&manager),
         client: manager.client().clone(),
+        gpu: gpu_snapshot,
     };
     let server_task = tokio::spawn(server::serve(app_state));
 

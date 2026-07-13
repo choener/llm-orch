@@ -35,6 +35,10 @@ pub struct Config {
 
     #[serde(default)]
     pub aliases: Vec<AliasConfig>,
+
+    /// PCI slot names to exclude from GPU metrics (e.g. iGPU).
+    #[serde(default)]
+    pub gpu_exclude_slots: Vec<String>,
 }
 
 impl Config {

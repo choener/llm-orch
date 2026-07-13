@@ -5,6 +5,7 @@
 
 use crate::apikeys::ApikeysStore;
 use crate::config::Config;
+use crate::gpu::GpuMetrics;
 use crate::handlers;
 use crate::scheduler::InstanceManager;
 
@@ -36,6 +37,8 @@ pub struct AppState {
     pub manager: Arc<InstanceManager>,
     /// Shared HTTP client for forwarding requests to backends.
     pub client: Client,
+    /// Latest GPU metrics snapshot (updated periodically).
+    pub gpu: Arc<RwLock<Vec<GpuMetrics>>>,
 }
 
 // ── Router ───────────────────────────────────────────────────────────────────

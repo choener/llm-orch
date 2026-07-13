@@ -116,9 +116,9 @@ pub async fn info_endpoint(
     _key: ApiKey,
 ) -> Result<Json<InfoResponse>, ApiError> {
     // ── 1. Read config, clone what we need, drop the guard. ──────────────
-    let (models, aliases) = {
+    let (models, aliases, gpu_exclude_slots) = {
         let cfg = state.config.read().await;
-        (cfg.models.clone(), cfg.aliases.clone())
+        (cfg.models.clone(), cfg.aliases.clone(), cfg.gpu_exclude_slots.clone())
     }; // cfg read guard dropped
 
     // ── 2. Read instance state, clone what we need, drop the guard. ─────
@@ -127,7 +127,13 @@ pub async fn info_endpoint(
         instances
     }; // instances read guard dropped
 
-    // ── 3. Build response. ──────────────────────────────────────────────
+    // ── 3. Read GPU snapshot. ────────────────────────────────────────────
+    let gpu_metrics = {
+        let gpu = state.gpu.read().await;
+        gpu.clone()
+    }; // gpu read guard dropped
+
+    // ── 4. Build response. ──────────────────────────────────────────────
     let model_infos: Vec<ModelInfo> = models
         .iter()
         .map(|m| ModelInfo {
@@ -150,9 +156,35 @@ pub async fn info_endpoint(
         })
         .collect();
 
+    let gpu_statuses: Vec<GpuStatus> = gpu_metrics
+        .iter()
+        .filter(|g| !gpu_exclude_slots.iter().any(|s| s == &g.pci_slot))
+        .map(|g| {
+            let vram_util_pct = if g.vram_total_bytes > 0 {
+                (g.vram_used_bytes as f64 / g.vram_total_bytes as f64) * 100.0
+            } else {
+                0.0
+            };
+            GpuStatus {
+                index: g.index,
+                pci_slot: g.pci_slot.clone(),
+                vram_vendor: g.vram_vendor.clone(),
+                vram_used_bytes: g.vram_used_bytes,
+                vram_total_bytes: g.vram_total_bytes,
+                vram_util_pct,
+                temperature_c: g.temperature_c,
+                power_w: g.power_w,
+                gpu_busy_pct: g.gpu_busy_pct,
+                sclk_mhz: g.sclk_mhz,
+                mclk_mhz: g.mclk_mhz,
+            }
+        })
+        .collect();
+
     Ok(Json(InfoResponse {
         models: model_infos,
         aliases: alias_infos,
+        gpus: gpu_statuses,
     }))
 }
 
