@@ -95,6 +95,28 @@ impl Instance {
     pub fn has_capacity(&self, max_concurrent: usize) -> bool {
         self.state == InstanceState::Ready && self.in_flight < max_concurrent
     }
+
+    /// Called after the child process exits.  Returns `true` if this was a
+    /// "zero-output crash" — the instance never reached Ready, so the crash
+    /// counter should be incremented and the model potentially blocked.
+    pub fn on_exit(&mut self) -> bool {
+        self.state = InstanceState::Failed;
+        if self.crash_count == 0 && self.child.is_some() {
+            // Reached Ready at least once — normal exit/crash, restart freely.
+            false
+        } else {
+            // Never produced output — increment crash counter.
+            self.crash_count += 1;
+            true
+        }
+    }
+
+    /// Whether the instance has been idle longer than `ttl_seconds`.
+    pub fn is_idle_expired(&self, ttl_seconds: u64) -> bool {
+        self.in_flight == 0
+            && self.state == InstanceState::Ready
+            && self.last_active.elapsed().as_secs() >= ttl_seconds
+    }
 }
 
 // ── Instance handle (RAII slot tracking) ─────────────────────────────────────
@@ -133,6 +155,11 @@ impl InstanceHandle {
     /// Return a clone of the inner `Arc` for sharing across tasks.
     pub fn clone_arc(&self) -> Arc<Mutex<Instance>> {
         Arc::clone(&self.inner)
+    }
+
+    /// Direct access to the inner mutex (for state transitions).
+    pub fn inner(&self) -> &Arc<Mutex<Instance>> {
+        &self.inner
     }
 }
 

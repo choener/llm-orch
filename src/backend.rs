@@ -54,6 +54,9 @@ impl Backend for LlamaCppBackend {
 // ── Process helpers (shared) ─────────────────────────────────────────────────
 
 use std::process::Stdio;
+use std::time::Duration;
+use reqwest::Client;
+use crate::instance::InstanceHandle;
 
 /// Spawn a backend subprocess with the given program, arguments, and environment.
 ///
@@ -73,4 +76,76 @@ pub async fn spawn_process(
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
     cmd.spawn()
+}
+
+// ── Readiness detection ──────────────────────────────────────────────────────
+
+/// Poll a backend instance's `/health` endpoint until it returns 200 or the
+/// timeout expires.
+pub async fn wait_until_ready(
+    client: &Client,
+    health_url: &str,
+    timeout: Duration,
+) -> bool {
+    let start = tokio::time::Instant::now();
+    loop {
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        match client.get(health_url).send().await {
+            Ok(resp) if resp.status().is_success() => return true,
+            _ => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    }
+}
+
+/// Poll the instance's health endpoint and update its state accordingly.
+/// Returns `true` if the instance became ready.
+pub async fn mark_instance_ready(
+    handle: &InstanceHandle,
+    client: &Client,
+    backend: &dyn Backend,
+    timeout: Duration,
+) -> bool {
+    let url = {
+        let inst = handle.inner().lock().unwrap();
+        backend.health_url(inst.port)
+    };
+
+    if wait_until_ready(client, &url, timeout).await {
+        handle.inner().lock().unwrap().mark_ready();
+        true
+    } else {
+        handle.inner().lock().unwrap().mark_failed();
+        false
+    }
+}
+
+// ── Shutdown ─────────────────────────────────────────────────────────────────
+
+/// Gracefully shut down a backend child process.
+///
+/// Sends SIGTERM, waits up to `drain_timeout`, then sends SIGKILL if the
+/// process is still alive.  Returns once the process has exited.
+pub async fn shutdown_child(child: &mut tokio::process::Child, drain_timeout: Duration) {
+    let pid = child.id().unwrap_or(0);
+
+    // Try graceful shutdown.
+    if let Err(e) = child.start_kill() {
+        tracing::warn!(pid, error = %e, "SIGTERM failed");
+        return; // process already gone
+    }
+
+    let result = tokio::time::timeout(drain_timeout, child.wait()).await;
+    match result {
+        Ok(Ok(_status)) => {
+            tracing::debug!(pid, "backend exited after SIGTERM");
+        }
+        _ => {
+            // Timeout or error — force kill.
+            tracing::warn!(pid, "backend did not exit after SIGTERM, sending SIGKILL");
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+    }
 }

@@ -5,6 +5,7 @@ mod apikeys;
 mod backend;
 mod http_client;
 mod instance;
+mod port_alloc;
 
 /// LLM Orch — single-host LLM orchestrator.
 #[derive(Parser, Debug)]
