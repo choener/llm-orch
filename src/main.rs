@@ -115,6 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TODO §7: start HTTP server.
 
     // ── Start HTTP server §7 ───────────────────────────────────────────
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let app_state = server::AppState {
         config: Arc::clone(&shared_cfg),
         apikeys: Arc::clone(&shared_apikeys),
@@ -122,7 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client: manager.client().clone(),
         gpu: gpu_snapshot,
     };
-    let server_task = tokio::spawn(server::serve(app_state));
+    let server_task = tokio::spawn(server::serve(app_state, shutdown_rx));
 
     // ── File watchers + reload loop §6 ───────────────────────────────────
     let config_path = cli.config.clone();
@@ -178,14 +179,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     info!("running — press Ctrl-C to stop");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            info!("shutting down...");
-        }
-        _ = server_task => {
-            info!("server exited");
+
+    // ── Graceful shutdown §11 ───────────────────────────────────────────
+    //
+    // 1. Wait for SIGINT / SIGTERM.
+    // 2. Signal axum to stop accepting new connections.
+    // 3. Wait for in-flight requests to drain (server_task completes).
+    // 4. Shut down all backend instances.
+
+    // Wait for shutdown signal.
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigint = signal(SignalKind::interrupt())
+            .expect("failed to register SIGINT handler");
+        let mut sigterm = signal(SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = sigint.recv() => info!("received SIGINT"),
+            _ = sigterm.recv() => info!("received SIGTERM"),
         }
     }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.ok();
+        info!("received Ctrl-C");
+    }
+
+    // Signal axum to stop accepting and drain in-flight.
+    info!("stopping http server...");
+    drop(shutdown_tx);
+    let _ = server_task.await;
+    info!("http server drained");
+
+    // Shut down all backend instances.
     manager.shutdown_all().await;
     info!("stopped");
 

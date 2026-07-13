@@ -63,8 +63,12 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Start the HTTP server and block until it exits.
-pub async fn serve(state: AppState) {
+/// Start the HTTP server with graceful shutdown support.
+///
+/// The server stops accepting new connections when `shutdown` is triggered
+/// (oneshot sender dropped).  In-flight requests are allowed to drain before
+/// the function returns.
+pub async fn serve(state: AppState, shutdown: tokio::sync::oneshot::Receiver<()>) {
     let addr: SocketAddr = state
         .config
         .read()
@@ -78,7 +82,12 @@ pub async fn serve(state: AppState) {
 
     info!("listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, router).await.unwrap();
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async {
+            shutdown.await.ok();
+        })
+        .await
+        .unwrap();
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
