@@ -49,6 +49,18 @@ cmd_aliases:
       --n-gpu-layers 99
 
 # ---------------------------------------------------------------------------
+# GPU keep-alive
+# ---------------------------------------------------------------------------
+# Prevent the kernel driver from auto-suspending a GPU while models are
+# loaded.  The command runs periodically per active GPU and stops when the
+# last instance on that GPU is unloaded.
+#
+# keep_alive:
+#   amd:
+#     cmd: "cat /sys/class/drm/card{index}/device/gpu_busy_percent > /dev/null"
+#     sleep: 5
+
+# ---------------------------------------------------------------------------
 # Model definitions
 # ---------------------------------------------------------------------------
 models:

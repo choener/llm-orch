@@ -12,6 +12,7 @@ mod gpu;
 mod handlers;
 mod http_client;
 mod instance;
+mod keepalive;
 mod port_alloc;
 mod scheduler;
 mod server;
@@ -112,8 +113,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gpu_snapshot = gpu_reader.snapshot_arc();
     info!("gpu metrics reader started");
 
-    // 4. Create the instance manager.
-    let manager = Arc::new(scheduler::InstanceManager::new(&cfg, Arc::clone(&gpu_snapshot)));
+    // 4. Create GPU keep-alive manager.
+    let keepalive = keepalive::KeepAliveManager::new(&cfg.keep_alive)
+        .map(Arc::new);
+    if keepalive.is_some() {
+        info!("keep-alive configured");
+    }
+
+    // 5. Create the instance manager.
+    let manager = Arc::new(scheduler::InstanceManager::new(
+        &cfg,
+        Arc::clone(&gpu_snapshot),
+        keepalive,
+    ));
     info!("instance manager ready");
 
     // Shared state for hot-reload.
@@ -223,7 +235,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("http server drained");
 
     // Shut down all backend instances.
+    info!("shutting down backends...");
     manager.shutdown_all().await;
+    info!("backends shut down");
     info!("stopped");
 
     Ok(())

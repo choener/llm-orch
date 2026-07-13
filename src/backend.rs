@@ -146,7 +146,8 @@ pub async fn shutdown_child(child: &mut tokio::process::Child, drain_timeout: Du
             // Timeout or error — force kill.
             tracing::warn!(pid, "backend did not exit after SIGTERM, sending SIGKILL");
             let _ = child.kill().await;
-            let _ = child.wait().await;
+            // Wait with a timeout — stuck D-state processes may never exit.
+            let _ = tokio::time::timeout(Duration::from_secs(10), child.wait()).await;
         }
     }
 }

@@ -8,6 +8,7 @@ use crate::config::ModelConfig;
 use crate::gpu::GpuMetrics;
 use crate::http_client;
 use crate::instance::{Instance, InstanceHandle, InstanceState};
+use crate::keepalive::KeepAliveManager;
 use crate::port_alloc::PortAllocator;
 
 use reqwest::Client;
@@ -51,6 +52,9 @@ pub struct InstanceManager {
     /// Vulkan device index → PCI slot mapping (from config).
     vulkan_slots: HashMap<usize, String>,
 
+    /// GPU keep-alive manager (None if not configured).
+    keepalive: Option<Arc<KeepAliveManager>>,
+
     /// Crash limit before a model is blocked.
     crash_limit: usize,
 
@@ -63,6 +67,7 @@ impl InstanceManager {
     pub fn new(
         config: &crate::config::Config,
         gpu_snapshot: Arc<tokio::sync::RwLock<Vec<GpuMetrics>>>,
+        keepalive: Option<Arc<KeepAliveManager>>,
     ) -> Self {
         let model_configs: HashMap<_, _> = config
             .models
@@ -87,6 +92,7 @@ impl InstanceManager {
             blocked: RwLock::new(HashMap::new()),
             gpu_snapshot,
             vulkan_slots,
+            keepalive,
             crash_limit: 3,
             spawn_timeout: Duration::from_secs(120),
         }
@@ -279,6 +285,19 @@ impl InstanceManager {
             inst.id.clone()
         };
         info!(model = %model_name, inst = %instance_id, port = port, "spawn succeeded");
+
+        // Start keep-alive for the GPU(s) this instance occupies.
+        if let Some(ref ka) = self.keepalive {
+            let gpus = {
+                let inst = handle.inner().lock().unwrap();
+                inst.gpu_indices.clone()
+            };
+            for vulkan_idx in &gpus {
+                if let Some(slot) = self.vulkan_slots.get(vulkan_idx) {
+                    ka.ensure_running(slot);
+                }
+            }
+        }
 
         Some(handle)
     }
@@ -482,6 +501,12 @@ impl InstanceManager {
     /// Remove a specific instance: kill its subprocess, free its port, and
     /// drop it from the instance list.
     async fn remove_instance(&self, model_name: &str, handle: &InstanceHandle) {
+        // Capture GPU indices before shutting down.
+        let gpu_indices: Vec<usize> = {
+            let inst = handle.inner().lock().unwrap();
+            inst.gpu_indices.clone()
+        };
+
         // Shut down the process.
         let mut child = {
             let mut inst = handle.inner().lock().unwrap();
@@ -497,9 +522,29 @@ impl InstanceManager {
         self.ports.lock().await.free(port);
 
         // Remove from instance list.
-        let mut instances = self.instances.write().unwrap();
-        if let Some(list) = instances.get_mut(model_name) {
-            list.retain(|h| h.id() != handle.id());
+        {
+            let mut instances = self.instances.write().unwrap();
+            if let Some(list) = instances.get_mut(model_name) {
+                list.retain(|h| h.id() != handle.id());
+            }
+        } // write lock dropped before keep-alive check
+
+        // Stop keep-alive for GPUs no longer in use.
+        if let Some(ref ka) = self.keepalive {
+            for vulkan_idx in &gpu_indices {
+                let still_in_use = {
+                    let instances = self.instances.read().unwrap();
+                    instances.values().flatten().any(|h| {
+                        let inst = h.inner().lock().unwrap();
+                        inst.gpu_indices.contains(vulkan_idx)
+                    })
+                };
+                if !still_in_use {
+                    if let Some(slot) = self.vulkan_slots.get(vulkan_idx) {
+                        ka.stop(slot);
+                    }
+                }
+            }
         }
     }
 
@@ -550,6 +595,10 @@ impl InstanceManager {
 
         for (model_name, handle) in all {
             self.remove_instance(&model_name, &handle).await;
+        }
+
+        if let Some(ref ka) = self.keepalive {
+            ka.stop_all();
         }
     }
 }

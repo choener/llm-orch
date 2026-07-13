@@ -39,6 +39,10 @@ pub struct Config {
     /// Device mapping: logical backend indices → PCI slots.
     #[serde(default)]
     pub devices: Option<DevicesConfig>,
+
+    /// GPU keep-alive configuration to prevent driver autosuspend.
+    #[serde(default)]
+    pub keep_alive: Option<KeepAliveConfig>,
 }
 
 impl Config {
@@ -326,6 +330,35 @@ fn list_pci_slots() -> Vec<String> {
         }
     }
     slots
+}
+
+// ---------------------------------------------------------------------------
+// Keep-alive
+// ---------------------------------------------------------------------------
+
+/// Per-GPU-type keep-alive configuration.
+///
+/// When at least one model instance is running on a GPU, the configured
+/// command is invoked periodically to prevent the kernel driver from
+/// auto-suspending the device.
+#[derive(Debug, Clone, Deserialize)]
+pub struct KeepAliveConfig {
+    /// AMD (amdgpu) keep-alive.
+    #[serde(default)]
+    pub amd: Option<GpuKeepAlive>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GpuKeepAlive {
+    /// Command to run.  `{index}` is substituted with the GPU index.
+    pub cmd: String,
+    /// Seconds between invocations.
+    #[serde(default = "default_keepalive_sleep")]
+    pub sleep: u64,
+}
+
+fn default_keepalive_sleep() -> u64 {
+    5
 }
 
 // ---------------------------------------------------------------------------
