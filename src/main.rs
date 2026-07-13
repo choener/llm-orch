@@ -1,5 +1,7 @@
 use clap::Parser;
 
+mod config;
+
 /// LLM Orch — single-host LLM orchestrator.
 #[derive(Parser, Debug)]
 #[command(name = "llm-orch", version, about)]
@@ -25,10 +27,21 @@ async fn main() {
 
     // §2 — check-config mode: validate and exit.
     if let Some(check_path) = cli.check_config {
-        eprintln!("llm-orch: checking config: {}", check_path.display());
-        // TODO: load & validate config (task §2).
-        eprintln!("llm-orch: config validation not yet implemented");
-        std::process::exit(1);
+        match config::Config::load(&check_path) {
+            Ok(cfg) => {
+                // TODO: full validation (duplicate names, alias targets, etc.)
+                eprintln!(
+                    "OK: {} model(s), {} alias(es)",
+                    cfg.models.len(),
+                    cfg.aliases.len()
+                );
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("ERROR: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
 
     eprintln!("llm-orch: starting with config: {}", cli.config.display());
