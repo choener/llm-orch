@@ -5,13 +5,14 @@
 
 use crate::backend::{shutdown_child, spawn_process, mark_instance_ready, Backend, LlamaCppBackend};
 use crate::config::ModelConfig;
+use crate::gpu::GpuMetrics;
 use crate::http_client;
 use crate::instance::{Instance, InstanceHandle, InstanceState};
 use crate::port_alloc::PortAllocator;
 
 use reqwest::Client;
 use std::collections::{HashMap, VecDeque};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, oneshot};
 use tracing::{debug, info, warn};
@@ -44,6 +45,12 @@ pub struct InstanceManager {
     /// Per-model blocked flag.  A blocked model refuses all requests.
     blocked: RwLock<HashMap<String, bool>>,
 
+    /// Latest GPU metrics snapshot for VRAM-aware scheduling.
+    gpu_snapshot: Arc<tokio::sync::RwLock<Vec<GpuMetrics>>>,
+
+    /// Vulkan device index → PCI slot mapping (from config).
+    vulkan_slots: HashMap<usize, String>,
+
     /// Crash limit before a model is blocked.
     crash_limit: usize,
 
@@ -53,12 +60,21 @@ pub struct InstanceManager {
 
 impl InstanceManager {
     /// Create a new manager from the loaded config.
-    pub fn new(config: &crate::config::Config) -> Self {
+    pub fn new(
+        config: &crate::config::Config,
+        gpu_snapshot: Arc<tokio::sync::RwLock<Vec<GpuMetrics>>>,
+    ) -> Self {
         let model_configs: HashMap<_, _> = config
             .models
             .iter()
             .map(|m| (m.name.clone(), m.clone()))
             .collect();
+
+        let vulkan_slots = config
+            .devices
+            .as_ref()
+            .map(|d| d.vulkan.clone())
+            .unwrap_or_default();
 
         Self {
             client: http_client::build(),
@@ -69,6 +85,8 @@ impl InstanceManager {
             instances: RwLock::new(HashMap::new()),
             queues: RwLock::new(HashMap::new()),
             blocked: RwLock::new(HashMap::new()),
+            gpu_snapshot,
+            vulkan_slots,
             crash_limit: 3,
             spawn_timeout: Duration::from_secs(120),
         }
@@ -204,7 +222,11 @@ impl InstanceManager {
         let parts = parts.unwrap();
         debug!(model = %model_name, parts = ?parts, "parsed command");
         let prog = &parts[0];
-        let gpu_indices = vec![]; // TODO: GPU allocation
+        let gpu_indices: Vec<usize> = self
+            .select_gpu_for_model(cfg)
+            .await
+            .into_iter()
+            .collect();
         let mut args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
         args.extend(self.backend.gpu_args(&gpu_indices));
         let envs = self.backend.gpu_env(&gpu_indices);
@@ -269,6 +291,133 @@ impl InstanceManager {
             resolved = resolved.replace(&placeholder, value);
         }
         resolved.replace("{port}", &port.to_string())
+    }
+
+    /// Pick a Vulkan device for a new instance from the model's `vulkan_devices` pool.
+    ///
+    /// * Skips devices already occupied by another instance of this model.
+    /// * Among remaining, picks the least-loaded (fewest total instances)
+    ///   that has `free_vram >= model.vram`.
+    /// * Returns `None` if no device qualifies → fall back to CPU.
+    async fn select_gpu_for_model(&self, model_cfg: &ModelConfig) -> Option<usize> {
+        let vulkan_devices = &model_cfg.vulkan_devices;
+        if vulkan_devices.is_empty() || self.vulkan_slots.is_empty() {
+            debug!(model = %model_cfg.name, "no vulkan_devices configured");
+            return None;
+        }
+
+        let gpus = self.gpu_snapshot.read().await;
+        debug!(
+            model = %model_cfg.name,
+            vram_mb = model_cfg.vram,
+            vulkan_pool = ?vulkan_devices,
+            gpu_count = gpus.len(),
+            "selecting GPU"
+        );
+
+        // Collect vulkan indices already running this model.
+        let occupied: std::collections::HashSet<usize> = {
+            let instances = self.instances.read().unwrap();
+            if let Some(list) = instances.get(&model_cfg.name) {
+                list.iter()
+                    .filter_map(|h| {
+                        let inst = h.inner().lock().unwrap();
+                        inst.gpu_indices.first().copied()
+                    })
+                    .collect()
+            } else {
+                std::collections::HashSet::new()
+            }
+        };
+
+        // Sum declared VRAM of all running instances per vulkan index.
+        let vram_used: HashMap<usize, u64> = {
+            let instances = self.instances.read().unwrap();
+            let mut used = HashMap::new();
+            for (model_name, list) in instances.iter() {
+                let model_vram = self.model_configs.get(model_name)
+                    .map(|c| c.vram)
+                    .unwrap_or(0);
+                for handle in list {
+                    let inst = handle.inner().lock().unwrap();
+                    if let Some(&vulkan_idx) = inst.gpu_indices.first() {
+                        *used.entry(vulkan_idx).or_default() += model_vram;
+                    }
+                }
+            }
+            used
+        };
+
+        // Find candidate vulkan indices.
+        let model_vram_bytes = model_cfg.vram * 1024 * 1024;
+        let mut candidates: Vec<(usize, u64)> = Vec::new();
+        for &vulkan_idx in vulkan_devices {
+            if occupied.contains(&vulkan_idx) {
+                debug!(model = %model_cfg.name, vulkan = vulkan_idx, "skipping — already has instance");
+                continue;
+            }
+
+            // Resolve vulkan index → PCI slot → GpuMetrics.
+            let pci_slot = match self.vulkan_slots.get(&vulkan_idx) {
+                Some(s) => s.as_str(),
+                None => {
+                    debug!(model = %model_cfg.name, vulkan = vulkan_idx, "slot not in device map");
+                    continue;
+                }
+            };
+            let gpu = match gpus.iter().find(|g| g.pci_slot == pci_slot) {
+                Some(g) => g,
+                None => {
+                    debug!(model = %model_cfg.name, vulkan = vulkan_idx, slot = pci_slot, "GPU not in metrics snapshot");
+                    continue;
+                }
+            };
+
+            let used = vram_used.get(&vulkan_idx).copied().unwrap_or(0);
+            let free = gpu.vram_total_bytes.saturating_sub(used);
+            debug!(
+                model = %model_cfg.name, vulkan = vulkan_idx, slot = pci_slot,
+                vram_total_mb = gpu.vram_total_bytes / (1024 * 1024),
+                vram_used_mb = used / (1024 * 1024),
+                vram_free_mb = free / (1024 * 1024),
+                model_mb = model_cfg.vram,
+            );
+            if free < model_vram_bytes {
+                debug!(model = %model_cfg.name, vulkan = vulkan_idx, "insufficient free VRAM");
+                continue;
+            }
+            candidates.push((vulkan_idx, free));
+        }
+
+        if candidates.is_empty() {
+            debug!(model = %model_cfg.name, "no GPU candidate — falling back to CPU");
+            return None;
+        }
+
+        // Compute total instance count per vulkan index for load-aware selection.
+        let instance_counts: HashMap<usize, usize> = {
+            let instances = self.instances.read().unwrap();
+            let mut counts = HashMap::new();
+            for list in instances.values() {
+                for handle in list {
+                    let inst = handle.inner().lock().unwrap();
+                    if let Some(&vulkan_idx) = inst.gpu_indices.first() {
+                        *counts.entry(vulkan_idx).or_default() += 1;
+                    }
+                }
+            }
+            counts
+        };
+
+        // Pick least-loaded candidate.
+        let chosen = candidates
+            .into_iter()
+            .min_by_key(|(idx, _)| instance_counts.get(idx).copied().unwrap_or(0));
+
+        if let Some((idx, _)) = &chosen {
+            debug!(model = %model_cfg.name, vulkan = idx, "selected GPU");
+        }
+        chosen.map(|(idx, _)| idx)
     }
 
     // ── blocked flag ─────────────────────────────────────────────────────

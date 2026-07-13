@@ -39,6 +39,10 @@ pub struct Config {
     /// PCI slot names to exclude from GPU metrics (e.g. iGPU).
     #[serde(default)]
     pub gpu_exclude_slots: Vec<String>,
+
+    /// Device mapping: logical backend indices → PCI slots.
+    #[serde(default)]
+    pub devices: Option<DevicesConfig>,
 }
 
 impl Config {
@@ -127,6 +131,48 @@ impl Config {
                     "server.port_range: start ({}) must be <= end ({})",
                     start, end
                 )));
+            }
+        }
+
+        // --- devices ---
+        if let Some(ref devs) = self.devices {
+            let pci_slots = list_pci_slots();
+            let existing_slots: HashSet<&str> = pci_slots
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+            for (idx, slot) in &devs.vulkan {
+                if !existing_slots.contains(slot.as_str()) {
+                    return Err(ConfigError::Validation(format!(
+                        "devices.vulkan.{}: PCI slot '{}' not found in /sys/class/drm/card*/device/",
+                        idx, slot
+                    )));
+                }
+            }
+            // Check for duplicate slots.
+            let mut seen = HashSet::new();
+            for slot in devs.vulkan.values() {
+                if !seen.insert(slot) {
+                    return Err(ConfigError::Validation(format!(
+                        "devices.vulkan: PCI slot '{}' assigned to multiple indices",
+                        slot
+                    )));
+                }
+            }
+        }
+
+        // --- model vulkan_devices ---
+        if let Some(ref devs) = self.devices {
+            let valid_indices: HashSet<&usize> = devs.vulkan.keys().collect();
+            for m in &self.models {
+                for idx in &m.vulkan_devices {
+                    if !valid_indices.contains(idx) {
+                        return Err(ConfigError::Validation(format!(
+                            "model '{}': vulkan_device {} not defined in devices.vulkan",
+                            m.name, idx
+                        )));
+                    }
+                }
             }
         }
 
@@ -234,6 +280,11 @@ pub struct ModelConfig {
     /// `{alias_name}` placeholders are resolved from `cmd_aliases` at load time;
     /// `{port}` is replaced with the allocated port number before spawning.
     pub cmd: String,
+
+    /// Vulkan device indices this model can be placed on (from `devices.vulkan`).
+    /// Empty = CPU only.
+    #[serde(default)]
+    pub vulkan_devices: Vec<usize>,
 }
 
 fn default_max_instances() -> usize {
@@ -247,6 +298,38 @@ fn default_idle_ttl() -> u64 {
 }
 fn default_queue_depth() -> usize {
     10
+}
+
+// ---------------------------------------------------------------------------
+// Device mapping
+// ---------------------------------------------------------------------------
+
+/// Global device index → PCI slot mapping.
+///
+/// Each backend gets its own namespace (e.g. `vulkan`).  The indices here
+/// are what `GGML_VK_VISIBLE_DEVICES` uses — they correspond to Vulkan's
+/// enumeration order, not sysfs card numbers.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DevicesConfig {
+    /// Vulkan device index → PCI slot name.
+    #[serde(default)]
+    pub vulkan: HashMap<usize, String>,
+}
+
+/// List PCI slot names from `/sys/class/drm/card*/device/uevent`.
+fn list_pci_slots() -> Vec<String> {
+    let mut slots = Vec::new();
+    for i in 0..16 {
+        let uevent = format!("/sys/class/drm/card{}/device/uevent", i);
+        if let Ok(contents) = std::fs::read_to_string(&uevent) {
+            for line in contents.lines() {
+                if let Some(slot) = line.strip_prefix("PCI_SLOT_NAME=") {
+                    slots.push(slot.trim().to_string());
+                }
+            }
+        }
+    }
+    slots
 }
 
 // ---------------------------------------------------------------------------

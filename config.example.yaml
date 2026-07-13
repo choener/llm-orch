@@ -34,6 +34,17 @@ apikeys_file: "apikeys.txt"
 #   - "0000:7b:00.0"   # iGPU with ~2 GB VRAM — too small for models
 
 # ---------------------------------------------------------------------------
+# Device mapping
+# ---------------------------------------------------------------------------
+# Map backend device indices to PCI slots.  The indices here are what
+# GGML_VK_VISIBLE_DEVICES and similar env vars use — they correspond to
+# the backend's enumeration order (e.g. Vulkan0 → 0, Vulkan1 → 1).
+devices:
+  vulkan:
+    0: "0000:03:00.0"  # dGPU — find with `llama-server --list-devices`
+    # 1: "0000:7b:00.0" # iGPU — too small for LLMs
+
+# ---------------------------------------------------------------------------
 # Command aliases
 # ---------------------------------------------------------------------------
 # Named `{key}` → value fragments substituted into model `cmd` fields.
@@ -60,13 +71,14 @@ models:
     ram: 0                    # declared system RAM usage (MB)
     idle_ttl: 300             # unload after 5 min of inactivity (seconds)
     queue_depth: 20           # max queued requests before returning 429
+    vulkan_devices: [0]       # run on Vulkan device 0
 
     cmd: |
       {llama}
         --model /models/qwen3-32b-q4_k_m.gguf
         --ctx-size 32768
 
-  # --- Example 2: a smaller model -------------------------------------------
+  # --- Example 2: a smaller model — runs on CPU ----------------------------
   - name: "deepseek-coder-7b"
     context_length: 16384
     max_instances: 1
@@ -76,6 +88,7 @@ models:
     ram: 0
     idle_ttl: 120             # unload after 2 min
     queue_depth: 10
+    # vulkan_devices: [0]     # uncomment for GPU offload
 
     cmd: |
       {llama}
@@ -92,6 +105,7 @@ models:
     ram: 0
     idle_ttl: 600            # keep vision models around longer (10 min)
     queue_depth: 5
+    vulkan_devices: [0]      # run on Vulkan device 0
 
     cmd: |
       {llama}

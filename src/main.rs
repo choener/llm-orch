@@ -107,14 +107,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
 
-    // 3. Create the instance manager.
-    let manager = Arc::new(scheduler::InstanceManager::new(&cfg));
-    info!("instance manager ready");
-
-    // 4. Start GPU metrics reader (periodic sysfs polling).
+    // 3. Start GPU metrics reader (periodic sysfs polling).
     let (gpu_reader, _gpu_poll_task) = gpu::GpuReader::start(Duration::from_secs(5));
     let gpu_snapshot = gpu_reader.snapshot_arc();
     info!("gpu metrics reader started");
+
+    // 4. Create the instance manager.
+    let manager = Arc::new(scheduler::InstanceManager::new(&cfg, Arc::clone(&gpu_snapshot)));
+    info!("instance manager ready");
 
     // Shared state for hot-reload.
     let shared_cfg = Arc::new(RwLock::new(cfg));

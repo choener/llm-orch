@@ -29,12 +29,17 @@ pub trait Backend: Send + Sync {
 
 /// Backend for llama.cpp built with Vulkan, ROCm, or CUDA.
 ///
-/// GPU selection is done via `--device` (comma-separated indices).  No
-/// environment variables are set — the binary auto-detects its backend.
+/// GPU selection uses `GGML_VK_VISIBLE_DEVICES` (Vulkan) — other backends
+/// may use different env vars or CLI flags.  The indices passed to `gpu_env`
+/// are logical backend device indices, not sysfs card numbers.
 pub struct LlamaCppBackend;
 
 impl Backend for LlamaCppBackend {
-    fn gpu_args(&self, indices: &[usize]) -> Vec<String> {
+    fn gpu_args(&self, _indices: &[usize]) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn gpu_env(&self, indices: &[usize]) -> Vec<(String, String)> {
         if indices.is_empty() {
             return Vec::new();
         }
@@ -43,11 +48,7 @@ impl Backend for LlamaCppBackend {
             .map(usize::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        vec!["--device".into(), list]
-    }
-
-    fn gpu_env(&self, _indices: &[usize]) -> Vec<(String, String)> {
-        Vec::new()
+        vec![("GGML_VK_VISIBLE_DEVICES".into(), list)]
     }
 }
 
