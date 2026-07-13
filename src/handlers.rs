@@ -45,6 +45,7 @@ use crate::config::AliasConfig;
 use crate::instance::InstanceHandle;
 use crate::server::{ApiKey, ApiError, AppState};
 use crate::types::*;
+use tracing::Instrument;
 
 // ── /v1/models ───────────────────────────────────────────────────────────────
 
@@ -57,6 +58,8 @@ pub async fn list_models(
     State(state): State<AppState>,
     _key: ApiKey,
 ) -> Result<Json<ModelsResponse>, ApiError> {
+    let span = tracing::info_span!("list_models", id = %uuid::Uuid::new_v4().to_string());
+    async {
     // ── 1. Read config, clone what we need, drop the guard. ──────────────
     let (models, aliases) = {
         let cfg = state.config.read().await;
@@ -102,6 +105,7 @@ pub async fn list_models(
         object: "list".into(),
         data,
     }))
+    }.instrument(span).await
 }
 
 // ── /v1/info ─────────────────────────────────────────────────────────────────
@@ -115,6 +119,8 @@ pub async fn info_endpoint(
     State(state): State<AppState>,
     _key: ApiKey,
 ) -> Result<Json<InfoResponse>, ApiError> {
+    let span = tracing::info_span!("info", id = %uuid::Uuid::new_v4().to_string());
+    async {
     // ── 1. Read config, clone what we need, drop the guard. ──────────────
     let (models, aliases, gpu_exclude_slots) = {
         let cfg = state.config.read().await;
@@ -186,6 +192,7 @@ pub async fn info_endpoint(
         aliases: alias_infos,
         gpus: gpu_statuses,
     }))
+    }.instrument(span).await
 }
 
 // ── /v1/chat/completions ─────────────────────────────────────────────────────
@@ -216,6 +223,13 @@ pub async fn chat_completions(
     _key: ApiKey,
     Json(mut request): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let span = tracing::info_span!(
+        "chat_completion",
+        id = %request_id,
+        model = %request.model,
+    );
+    async {
     // ── 1. Resolve alias → underlying model. ────────────────────────────
     //    Read config, extract what we need, drop the guard.
     let (model_name, alias_system_prompt, alias_prompt_template) = {
@@ -272,6 +286,11 @@ pub async fn chat_completions(
         // Streaming mode: forward SSE stream from backend to client.
         // The `InstanceHandle` is moved into the stream wrapper so the
         // in-flight slot is released when the stream ends (Drop).
+        let instance_id = {
+            let inst = handle.inner().lock().unwrap();
+            inst.id.clone()
+        };
+        info!("stream start model={} inst={}", model_name, instance_id);
         let stream = build_sse_stream(
             state.client.clone(),
             backend_url,
@@ -284,18 +303,27 @@ pub async fn chat_completions(
         Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
     } else {
         // Non-streaming mode: aggregate the backend response.
+        let t0 = std::time::Instant::now();
         let response_body = forward_request_aggregate(
             &state.client,
             &backend_url,
             &serde_json::to_value(&request).unwrap_or_default(),
         )
         .await?;
+        let elapsed = t0.elapsed();
 
-        // Release the instance slot immediately.
+        // Capture instance ID before dropping the handle.
+        let instance_id = {
+            let inst = handle.inner().lock().unwrap();
+            inst.id.clone()
+        };
         drop(handle);
+
+        log_completion(&response_body, &model_name, &instance_id, elapsed);
 
         Ok(Json(response_body).into_response())
     }
+    }.instrument(span).await
 }
 
 // ── /v1/completions ──────────────────────────────────────────────────────────
@@ -312,6 +340,13 @@ pub async fn completions(
     _key: ApiKey,
     Json(request): Json<CompletionRequest>,
 ) -> Result<Response, ApiError> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let span = tracing::info_span!(
+        "completion",
+        id = %request_id,
+        model = %request.model,
+    );
+    async {
     // ── 1. Resolve alias. ───────────────────────────────────────────────
     let (model_name, _alias_system_prompt, _alias_prompt_template) = {
         let cfg = state.config.read().await;
@@ -353,6 +388,11 @@ pub async fn completions(
 
     // ── 5. Forward request. ─────────────────────────────────────────────
     if request.stream {
+        let instance_id = {
+            let inst = handle.inner().lock().unwrap();
+            inst.id.clone()
+        };
+        info!("stream start model={} inst={}", model_name, instance_id);
         let stream = build_sse_stream(
             state.client.clone(),
             backend_url,
@@ -364,17 +404,26 @@ pub async fn completions(
 
         Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
     } else {
+        let t0 = std::time::Instant::now();
         let response_body = forward_request_aggregate(
             &state.client,
             &backend_url,
             &serde_json::to_value(&request).unwrap_or_default(),
         )
         .await?;
+        let elapsed = t0.elapsed();
 
+        let instance_id = {
+            let inst = handle.inner().lock().unwrap();
+            inst.id.clone()
+        };
         drop(handle);
+
+        log_completion(&response_body, &model_name, &instance_id, elapsed);
 
         Ok(Json(response_body).into_response())
     }
+    }.instrument(span).await
 }
 
 // ── Admin endpoints ──────────────────────────────────────────────────────────
@@ -400,6 +449,8 @@ pub async fn admin_load(
     _key: ApiKey,
     Json(body): Json<AdminModelAction>,
 ) -> Result<Json<AdminResponse>, ApiError> {
+    let span = tracing::info_span!("admin_load", id = %uuid::Uuid::new_v4().to_string(), model = %body.model);
+    async {
     // Verify the model exists.
     {
         let cfg = state.config.read().await;
@@ -432,6 +483,7 @@ pub async fn admin_load(
         status: "ok".into(),
         message: format!("model '{}' loaded (instance spawned or already running)", body.model),
     }))
+    }.instrument(span).await
 }
 
 /// `POST /admin/unload` — force-unload all instances of a model.
@@ -443,6 +495,8 @@ pub async fn admin_unload(
     _key: ApiKey,
     Json(body): Json<AdminModelAction>,
 ) -> Result<Json<AdminResponse>, ApiError> {
+    let span = tracing::info_span!("admin_unload", id = %uuid::Uuid::new_v4().to_string(), model = %body.model);
+    async {
     // Verify the model exists.
     {
         let cfg = state.config.read().await;
@@ -457,6 +511,7 @@ pub async fn admin_unload(
         status: "ok".into(),
         message: format!("all instances of model '{}' unloaded", body.model),
     }))
+    }.instrument(span).await
 }
 
 /// `POST /admin/unblock` — clear the crash-block on a model.
@@ -468,6 +523,8 @@ pub async fn admin_unblock(
     _key: ApiKey,
     Json(body): Json<AdminModelAction>,
 ) -> Result<Json<AdminResponse>, ApiError> {
+    let span = tracing::info_span!("admin_unblock", id = %uuid::Uuid::new_v4().to_string(), model = %body.model);
+    async {
     // Verify the model exists.
     {
         let cfg = state.config.read().await;
@@ -490,6 +547,7 @@ pub async fn admin_unblock(
         status: "ok".into(),
         message: format!("model '{}' unblocked", body.model),
     }))
+    }.instrument(span).await
 }
 
 // ── Helpers (lock-free) ──────────────────────────────────────────────────────
@@ -560,6 +618,60 @@ fn apply_alias_prompts(
             }
         }
     }
+}
+
+// ── Completion logging ───────────────────────────────────────────────────────
+
+/// Extract timing and usage from the backend response JSON and emit an
+/// `info!` log line suitable for request auditing.
+fn log_completion(
+    resp: &serde_json::Value,
+    model_name: &str,
+    instance_id: &str,
+    elapsed: std::time::Duration,
+) {
+    let prompt_tokens = resp
+        .pointer("/usage/prompt_tokens")
+        .and_then(|v| v.as_u64());
+    let gen_tokens = resp
+        .pointer("/usage/completion_tokens")
+        .and_then(|v| v.as_u64());
+    let cached_tokens = resp
+        .pointer("/usage/prompt_tokens_details/cached_tokens")
+        .and_then(|v| v.as_u64());
+
+    let prompt_per_second = resp
+        .pointer("/timings/prompt_per_second")
+        .and_then(|v| v.as_f64());
+    let predicted_per_second = resp
+        .pointer("/timings/predicted_per_second")
+        .and_then(|v| v.as_f64());
+
+    let req_id = resp
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
+
+    let server_ms = elapsed.as_millis();
+
+    // Build a compact log line.
+    let prompt_cached = match (prompt_tokens, cached_tokens) {
+        (Some(p), Some(c)) if c > 0 => format!("prompt={}(cached:{})", p, c),
+        (Some(p), _) => format!("prompt={}", p),
+        _ => String::new(),
+    };
+    let gen_part = gen_tokens
+        .map(|g| format!(" generated={}", g))
+        .unwrap_or_default();
+    let speed = match (prompt_per_second, predicted_per_second) {
+        (Some(pp), Some(tg)) => format!(" pp={:.0}t/s tg={:.0}t/s", pp, tg),
+        _ => String::new(),
+    };
+
+    info!(
+        "id={} model={} inst={}{}{}{} server_ms={}",
+        req_id, model_name, instance_id, prompt_cached, gen_part, speed, server_ms
+    );
 }
 
 // ── Backend forwarding ───────────────────────────────────────────────────────

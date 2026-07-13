@@ -14,7 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::RwLock;
 use std::time::Duration;
 use tokio::sync::{Mutex, oneshot};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 // ── Manager ──────────────────────────────────────────────────────────────────
 
@@ -252,6 +252,12 @@ impl InstanceManager {
                 .push(handle.clone());
         }
 
+        let instance_id = {
+            let inst = handle.inner().lock().unwrap();
+            inst.id.clone()
+        };
+        info!(model = %model_name, inst = %instance_id, port = port, "spawn succeeded");
+
         Some(handle)
     }
 
@@ -314,8 +320,13 @@ impl InstanceManager {
             candidates
         };
 
+        let mut evicted_by_model: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for (model_name, handle) in to_evict {
+            *evicted_by_model.entry(model_name.clone()).or_default() += 1;
             self.remove_instance(&model_name, &handle).await;
+        }
+        for (model, count) in &evicted_by_model {
+            info!(model = %model, count = *count, "unloaded via TTL idle eviction");
         }
     }
 
@@ -367,8 +378,12 @@ impl InstanceManager {
                 .unwrap_or_default()
         };
 
-        for handle in handles {
-            self.remove_instance(model_name, &handle).await;
+        let count = handles.len();
+        for handle in &handles {
+            self.remove_instance(model_name, handle).await;
+        }
+        if count > 0 {
+            info!(model = %model_name, count = count, "unloaded via admin");
         }
     }
 
