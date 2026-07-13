@@ -1,0 +1,110 @@
+# llm-orch configuration example
+# ==============================
+# Copy to config.yaml and adjust for your setup.
+
+# ---------------------------------------------------------------------------
+# Server settings
+# ---------------------------------------------------------------------------
+server:
+  # Address and port the HTTP server listens on.
+  listen: "127.0.0.1:8080"
+
+  # Port range for backend instance allocation.  Each spawned backend
+  # instance gets a port from this range.  Use "ephemeral" to let the OS
+  # pick a free port for every instance.
+  port_range:
+    start: 9000
+    end: 9100
+  # port_range: "ephemeral"
+
+# ---------------------------------------------------------------------------
+# API keys
+# ---------------------------------------------------------------------------
+# Path to the API keys file (one key per line, optional # comment suffix).
+# Hot-reloaded at runtime; changes take effect without restart.
+apikeys_file: "apikeys.txt"
+
+# ---------------------------------------------------------------------------
+# Command aliases
+# ---------------------------------------------------------------------------
+# Named `{key}` → value fragments substituted into model `cmd` fields.
+# Use `{alias_name}` in any model's `cmd` to include the alias value.
+# `{port}` is the only runtime placeholder — resolved at spawn time.
+cmd_aliases:
+  llama: |
+    llama-server
+      --host 127.0.0.1
+      --port {port}
+      --n-gpu-layers 99
+
+# ---------------------------------------------------------------------------
+# Model definitions
+# ---------------------------------------------------------------------------
+models:
+  # --- Example 1: a large GPU-resident model --------------------------------
+  - name: "qwen3-32b"
+    context_length: 32768
+    max_instances: 2          # at most 2 instances across all GPUs
+    max_concurrent: 4         # up to 4 parallel requests per instance
+    priority: 100             # higher = less likely to be evicted
+    vram: 24000               # declared VRAM usage (MB) for scheduler hints
+    ram: 0                    # declared system RAM usage (MB)
+    idle_ttl: 300             # unload after 5 min of inactivity (seconds)
+    queue_depth: 20           # max queued requests before returning 429
+
+    cmd: |
+      {llama}
+        --model /models/qwen3-32b-q4_k_m.gguf
+        --ctx-size 32768
+
+  # --- Example 2: a smaller model -------------------------------------------
+  - name: "deepseek-coder-7b"
+    context_length: 16384
+    max_instances: 1
+    max_concurrent: 8
+    priority: 50
+    vram: 8000
+    ram: 0
+    idle_ttl: 120             # unload after 2 min
+    queue_depth: 10
+
+    cmd: |
+      {llama}
+        --model /models/deepseek-coder-7b-q4_k_m.gguf
+        --ctx-size 16384
+
+  # --- Example 3: a multimodal model ----------------------------------------
+  - name: "llava-13b"
+    context_length: 4096
+    max_instances: 1
+    max_concurrent: 2
+    priority: 75
+    vram: 14000
+    ram: 0
+    idle_ttl: 600            # keep vision models around longer (10 min)
+    queue_depth: 5
+
+    cmd: |
+      {llama}
+        --model /models/llava-13b-q4_k_m.gguf
+        --mmproj /models/llava-13b-mmproj.gguf
+        --ctx-size 4096
+
+# ---------------------------------------------------------------------------
+# Aliases
+# ---------------------------------------------------------------------------
+# Aliases present an alternative name that routes to an underlying model.
+# They appear in /v1/models so clients can discover them.
+aliases:
+  - name: "qwen"
+    target: "qwen3-32b"
+    # Optional system prompt injected when this alias is used.
+    system_prompt: null
+    # system_prompt: "You are a helpful assistant."
+    # Optional prompt template (e.g. for chat format overrides).
+    prompt_template: null
+
+  - name: "coder"
+    target: "deepseek-coder-7b"
+    system_prompt: "You are an expert software engineer. Write clean, correct code."
+    prompt_template: null
