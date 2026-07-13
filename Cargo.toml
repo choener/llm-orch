@@ -1,0 +1,46 @@
+[package]
+name = "llm-orch"
+version = "0.1.0"
+edition = "2024"
+description = "Single-host LLM orchestrator with hot-reload, API key auth, and llama.cpp backend management"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+
+# HTTP server
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "compression-gzip", "compression-br", "request-id"] }
+
+# HTTP client (backend forwarding, SSE streaming)
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls", "http2", "charset", "gzip", "brotli"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# serde_yaml is deprecated/unmaintained — use serde_yaml_ng
+serde_yaml_ng = "0.10"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# Error handling
+thiserror = "2"
+
+# Per-request correlation IDs (§12)
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# File watching for config hot-reload
+notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Byte buffers for streaming
+bytes = "1"
+
+[dev-dependencies]
+tokio-test = "0.4"
