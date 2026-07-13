@@ -42,5 +42,8 @@ clap = { version = "4", features = ["derive"] }
 # Byte buffers for streaming
 bytes = "1"
 
+# Shell-style command splitting
+shlex = "1"
+
 [dev-dependencies]
 tokio-test = "0.4"

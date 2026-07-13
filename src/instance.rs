@@ -125,6 +125,7 @@ impl Instance {
 ///
 /// When the last handle referring to a particular request context is dropped,
 /// `release_slot()` is called automatically, preventing leaked in-flight counts.
+#[derive(Clone)]
 pub struct InstanceHandle {
     inner: Arc<Mutex<Instance>>,
 }
@@ -134,6 +135,11 @@ impl InstanceHandle {
         Self {
             inner: Arc::new(Mutex::new(instance)),
         }
+    }
+
+    /// Unique identifier of this instance (e.g. `"qwen3-32b@0,1"`).
+    pub fn id(&self) -> String {
+        self.inner.lock().unwrap().id.clone()
     }
 
     /// Acquire a slot on the instance.  Returns `true` if capacity was available.

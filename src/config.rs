@@ -139,7 +139,7 @@ impl Config {
 // Server settings
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     /// Address and port the HTTP server listens on, e.g. `"127.0.0.1:8080"`.
     #[serde(default = "default_listen")]
@@ -155,7 +155,7 @@ fn default_listen() -> String {
 }
 
 /// Port allocation strategy for backend instances.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum PortRange {
     /// Explicit start-end range.
@@ -184,7 +184,7 @@ impl PortRange {
 // Model definitions
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ModelConfig {
     /// Unique model name, used as the identifier in `/v1/models` and alias targets.
     pub name: String,

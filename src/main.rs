@@ -6,6 +6,7 @@ mod backend;
 mod http_client;
 mod instance;
 mod port_alloc;
+mod scheduler;
 
 /// LLM Orch — single-host LLM orchestrator.
 #[derive(Parser, Debug)]
