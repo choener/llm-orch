@@ -337,6 +337,21 @@ impl InstanceManager {
         &self.client
     }
 
+    /// Unload all instances of a specific model.
+    pub async fn unload_model(&self, model_name: &str) {
+        let handles: Vec<InstanceHandle> = {
+            let instances = self.instances.read().unwrap();
+            instances
+                .get(model_name)
+                .map(|list| list.iter().cloned().collect())
+                .unwrap_or_default()
+        };
+
+        for handle in handles {
+            self.remove_instance(model_name, &handle).await;
+        }
+    }
+
     // ── shutdown ─────────────────────────────────────────────────────────
 
     /// Gracefully drain all instances.

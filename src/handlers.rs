@@ -1,6 +1,6 @@
 // ── HTTP Handlers ─────────────────────────────────────────────────────────────
 //
-// All OpenAI-compatible endpoints live here.
+// All OpenAI-compatible and admin endpoints live here.
 //
 // # Solving the axum `Send` bound issue
 //
@@ -39,7 +39,7 @@ use futures_util::stream::Stream;
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::AliasConfig;
 use crate::instance::InstanceHandle;
@@ -343,6 +343,121 @@ pub async fn completions(
 
         Ok(Json(response_body).into_response())
     }
+}
+
+// ── Admin endpoints ──────────────────────────────────────────────────────────
+
+/// `GET /admin/status` — detailed runtime status for all models.
+///
+/// # Send safety
+/// Config read guard is cloned and dropped before building the response.
+pub async fn admin_status(
+    State(state): State<AppState>,
+    _key: ApiKey,
+) -> Result<Json<InfoResponse>, ApiError> {
+    // Reuse /v1/info logic.
+    info_endpoint(State(state), _key).await
+}
+
+/// `POST /admin/load` — force-load a model (pre-spawn an instance).
+///
+/// # Send safety
+/// Config read guard is dropped before the async `get_or_spawn` call.
+pub async fn admin_load(
+    State(state): State<AppState>,
+    _key: ApiKey,
+    Json(body): Json<AdminModelAction>,
+) -> Result<Json<AdminResponse>, ApiError> {
+    // Verify the model exists.
+    {
+        let cfg = state.config.read().await;
+        if !cfg.models.iter().any(|m| m.name == body.model) {
+            return Err(ApiError::ModelNotFound(body.model));
+        }
+    }
+
+    // Spawn an instance (or get an existing one).
+    let _handle = state
+        .manager
+        .get_or_spawn(&body.model)
+        .await
+        .ok_or_else(|| {
+            if state.manager.is_blocked(&body.model) {
+                ApiError::ModelBlocked(body.model.clone())
+            } else {
+                ApiError::NoCapacity(format!(
+                    "cannot load model '{}': instance cap reached and queue is full",
+                    body.model
+                ))
+            }
+        })?;
+
+    // Drop the handle immediately — we just wanted to ensure an instance exists.
+    // The in-flight counter is decremented on drop.
+    drop(_handle);
+
+    Ok(Json(AdminResponse {
+        status: "ok".into(),
+        message: format!("model '{}' loaded (instance spawned or already running)", body.model),
+    }))
+}
+
+/// `POST /admin/unload` — force-unload all instances of a model.
+///
+/// # Send safety
+/// Config read guard is dropped before the async unload call.
+pub async fn admin_unload(
+    State(state): State<AppState>,
+    _key: ApiKey,
+    Json(body): Json<AdminModelAction>,
+) -> Result<Json<AdminResponse>, ApiError> {
+    // Verify the model exists.
+    {
+        let cfg = state.config.read().await;
+        if !cfg.models.iter().any(|m| m.name == body.model) {
+            return Err(ApiError::ModelNotFound(body.model));
+        }
+    }
+
+    state.manager.unload_model(&body.model).await;
+
+    Ok(Json(AdminResponse {
+        status: "ok".into(),
+        message: format!("all instances of model '{}' unloaded", body.model),
+    }))
+}
+
+/// `POST /admin/unblock` — clear the crash-block on a model.
+///
+/// # Send safety
+/// No locks cross `.await` — `unblock_model` is synchronous on `std::sync::RwLock`.
+pub async fn admin_unblock(
+    State(state): State<AppState>,
+    _key: ApiKey,
+    Json(body): Json<AdminModelAction>,
+) -> Result<Json<AdminResponse>, ApiError> {
+    // Verify the model exists.
+    {
+        let cfg = state.config.read().await;
+        if !cfg.models.iter().any(|m| m.name == body.model) {
+            return Err(ApiError::ModelNotFound(body.model));
+        }
+    }
+
+    if !state.manager.is_blocked(&body.model) {
+        return Ok(Json(AdminResponse {
+            status: "ok".into(),
+            message: format!("model '{}' is not blocked", body.model),
+        }));
+    }
+
+    state.manager.unblock_model(&body.model);
+
+    info!(model = %body.model, "model unblocked via admin");
+    Ok(Json(AdminResponse {
+        status: "ok".into(),
+        message: format!("model '{}' unblocked", body.model),
+    }))
 }
 
 // ── Helpers (lock-free) ──────────────────────────────────────────────────────

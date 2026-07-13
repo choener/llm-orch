@@ -50,6 +50,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/info", get(handlers::info_endpoint))
         .route("/v1/chat/completions", post(handlers::chat_completions))
         .route("/v1/completions", post(handlers::completions))
+        // Admin endpoints.
+        .route("/admin/status", get(handlers::admin_status))
+        .route("/admin/load", post(handlers::admin_load))
+        .route("/admin/unload", post(handlers::admin_unload))
+        .route("/admin/unblock", post(handlers::admin_unblock))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .with_state(state)

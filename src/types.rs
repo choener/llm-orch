@@ -262,3 +262,16 @@ pub struct AliasInfo {
     pub target: String,
     pub has_system_prompt: bool,
 }
+
+// ── Admin actions ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdminModelAction {
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminResponse {
+    pub status: String,
+    pub message: String,
+}
