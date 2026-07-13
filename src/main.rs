@@ -12,6 +12,7 @@ mod http_client;
 mod instance;
 mod port_alloc;
 mod scheduler;
+mod server;
 mod watcher;
 
 /// LLM Orch — single-host LLM orchestrator.
@@ -98,6 +99,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // TODO §7: start HTTP server.
 
+    // ── Start HTTP server §7 ───────────────────────────────────────────
+    let app_state = server::AppState {
+        config: Arc::clone(&shared_cfg),
+        apikeys: Arc::clone(&shared_apikeys),
+        manager: Arc::clone(&manager),
+    };
+    let server_task = tokio::spawn(server::serve(app_state));
+
     // ── File watchers + reload loop §6 ───────────────────────────────────
     let config_path = cli.config.clone();
     let apikeys_path = shared_cfg.read().await.apikeys_file.clone();
@@ -152,8 +161,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     info!("running — press Ctrl-C to stop");
-    tokio::signal::ctrl_c().await?;
-    info!("shutting down...");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!("shutting down...");
+        }
+        _ = server_task => {
+            info!("server exited");
+        }
+    }
     manager.shutdown_all().await;
     info!("stopped");
 

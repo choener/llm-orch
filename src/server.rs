@@ -1,0 +1,154 @@
+// ── HTTP server ──────────────────────────────────────────────────────────────
+//
+// Sets up the axum router with tracing, compression, API key auth, and the
+// OpenAI-compatible endpoints.
+
+use crate::apikeys::ApikeysStore;
+use crate::config::Config;
+use crate::scheduler::InstanceManager;
+
+use axum::{
+    extract::FromRequestParts,
+    http::{header, request::Parts, StatusCode},
+    response::{IntoResponse, Response},
+    routing::get,
+    Router,
+};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tower_http::compression::CompressionLayer;
+use tower_http::trace::TraceLayer;
+use tracing::info;
+
+// ── Application state ───────────────────────────────────────────────────────
+
+/// Shared application state, cloned per-request by axum.
+#[derive(Clone)]
+pub struct AppState {
+    /// Hot-reloaded config.
+    pub config: Arc<RwLock<Config>>,
+    /// Hot-reloaded API keys.
+    pub apikeys: Arc<RwLock<ApikeysStore>>,
+    /// Instance manager (model lifecycle).
+    pub manager: Arc<InstanceManager>,
+}
+
+// ── Router ───────────────────────────────────────────────────────────────────
+
+/// Build the full axum router with all middleware and routes.
+pub fn build_router(state: AppState) -> Router {
+    Router::new()
+        // Health check — no auth required.
+        .route("/health", get(health))
+        // TODO: /v1/models, /v1/info, /v1/chat/completions, /admin/*
+        .layer(CompressionLayer::new())
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+/// Start the HTTP server and block until it exits.
+pub async fn serve(state: AppState) {
+    let addr: SocketAddr = state
+        .config
+        .read()
+        .await
+        .server
+        .listen
+        .parse()
+        .expect("invalid server.listen address");
+
+    let router = build_router(state);
+
+    info!("listening on {}", addr);
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, router).await.unwrap();
+}
+
+// ── Handlers ─────────────────────────────────────────────────────────────────
+
+/// `GET /health` — always returns 200 OK.
+async fn health() -> StatusCode {
+    StatusCode::OK
+}
+
+// ── Error type ───────────────────────────────────────────────────────────────
+
+/// Unified error type for HTTP responses.
+#[derive(Debug, thiserror::Error)]
+pub enum ApiError {
+    #[error("unauthorized")]
+    Unauthorized,
+
+    #[error("model not found: {0}")]
+    ModelNotFound(String),
+
+    #[error("model blocked: {0}")]
+    ModelBlocked(String),
+
+    #[error("no capacity: {0}")]
+    NoCapacity(String),
+
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, message) = match &self {
+            ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
+            ApiError::ModelNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
+            ApiError::ModelBlocked(_) => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
+            ApiError::NoCapacity(_) => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
+            ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+        };
+        (status, message).into_response()
+    }
+}
+
+// ── Auth extractor ───────────────────────────────────────────────────────────
+
+/// Extract and validate the `Authorization: Bearer <key>` header.
+///
+/// **Fail-closed**: if no API keys are configured, all requests are denied.
+pub struct ApiKey {
+    /// The label associated with this key (for logging).
+    pub label: String,
+}
+
+impl FromRequestParts<AppState> for ApiKey {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let apikeys = state.apikeys.read().await;
+
+        // Fail-closed: if no keys are configured, deny all access.
+        if apikeys.is_empty() {
+            return Err(ApiError::Unauthorized);
+        }
+
+        // Extract the Authorization header.
+        let auth = parts
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        // Expect "Bearer <key>"
+        let key = auth
+            .strip_prefix("Bearer ")
+            .or_else(|| auth.strip_prefix("bearer "))
+            .ok_or(ApiError::Unauthorized)?;
+
+        // Look up the key.
+        match apikeys.authenticate(key) {
+            Some(label) => Ok(ApiKey {
+                label: label.to_owned(),
+            }),
+            None => Err(ApiError::Unauthorized),
+        }
+    }
+}
