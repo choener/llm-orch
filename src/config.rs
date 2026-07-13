@@ -41,7 +41,13 @@ impl Config {
     /// Load and deserialize configuration from a YAML file.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let contents = std::fs::read_to_string(path)?;
-        let config: Self = serde_yaml_ng::from_str(&contents)?;
+        let mut config: Self = serde_yaml_ng::from_str(&contents)?;
+        // Resolve relative apikeys_file against the config file's directory.
+        if config.apikeys_file.is_relative() {
+            if let Some(parent) = path.parent() {
+                config.apikeys_file = parent.join(&config.apikeys_file);
+            }
+        }
         config.validate()?;
         Ok(config)
     }

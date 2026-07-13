@@ -111,6 +111,13 @@ impl ApikeysStore {
     pub fn len(&self) -> usize {
         self.keys.len()
     }
+
+    /// Create an empty store (fail-closed — all requests denied).
+    pub fn empty() -> Self {
+        Self {
+            keys: HashMap::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

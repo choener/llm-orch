@@ -21,6 +21,7 @@
           rustfmt
           rust-analyzer
           cargo-expand
+          jq
         ];
 
         # Ensure cargo-expand can find the nightly rustfmt it needs, or

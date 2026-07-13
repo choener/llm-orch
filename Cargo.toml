@@ -42,6 +42,10 @@ clap = { version = "4", features = ["derive"] }
 # Byte buffers for streaming
 bytes = "1"
 
+# Stream utilities
+futures-util = "0.3"
+tokio-stream = "0.1"
+
 # Shell-style command splitting
 shlex = "1"
 

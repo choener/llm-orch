@@ -75,8 +75,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // 2. Load API keys from the path specified in the config.
+    //    If the file doesn't exist, continue with an empty store (fail-closed).
     info!("loading apikeys: {}", cfg.apikeys_file.display());
-    let apikeys = apikeys::ApikeysStore::load(&cfg.apikeys_file)?;
+    let apikeys = match apikeys::ApikeysStore::load(&cfg.apikeys_file) {
+        Ok(a) => a,
+        Err(e) => {
+            warn!("could not load apikeys (fail-closed): {}", e);
+            apikeys::ApikeysStore::empty()
+        }
+    };
     info!(
         "loaded {} apikey(s){}",
         apikeys.len(),
