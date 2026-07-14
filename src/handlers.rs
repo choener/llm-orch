@@ -121,6 +121,9 @@ pub async fn info_endpoint(
 ) -> Result<Json<InfoResponse>, ApiError> {
     let span = tracing::info_span!("info", id = %uuid::Uuid::new_v4().to_string());
     async {
+    // ── 0. Force-refresh metrics so returned values are never stale. ─
+    state.manager.force_refresh();
+
     // ── 1. Read config, clone what we need, drop the guard. ──────────────
     let (models, aliases) = {
         let cfg = state.config.read().await;
@@ -139,17 +142,30 @@ pub async fn info_endpoint(
         gpu.clone()
     }; // gpu read guard dropped
 
-    // ── 4. Build response. ──────────────────────────────────────────────
+    // ── 4. Read metrics snapshot. ──────────────────────────────────────
+    let metrics_snapshot = state.manager.model_metrics_snapshot();
+
+    // ── 5. Build response. ──────────────────────────────────────────────
     let model_infos: Vec<ModelInfo> = models
         .iter()
-        .map(|m| ModelInfo {
-            name: m.name.clone(),
-            context_length: m.context_length,
-            instance_count: instance_counts.get(&m.name).copied().unwrap_or(0),
-            max_instances: m.max_instances,
-            queue_depth_used: 0, // TODO: expose from manager
-            queue_depth_max: m.queue_depth,
-            blocked: state.manager.is_blocked(&m.name),
+        .map(|m| {
+            let mets = metrics_snapshot.get(&m.name);
+            ModelInfo {
+                name: m.name.clone(),
+                context_length: m.context_length,
+                instance_count: instance_counts.get(&m.name).copied().unwrap_or(0),
+                max_instances: m.max_instances,
+                queue_depth_used: 0, // TODO: expose from manager
+                queue_depth_max: m.queue_depth,
+                blocked: state.manager.is_blocked(&m.name),
+                load_m1: mets.map(|x| x.load_m1).unwrap_or(0.0),
+                load_m5: mets.map(|x| x.load_m5).unwrap_or(0.0),
+                load_m15: mets.map(|x| x.load_m15).unwrap_or(0.0),
+                req_rate_m1: mets.map(|x| x.req_rate_m1).unwrap_or(0.0),
+                req_rate_m5: mets.map(|x| x.req_rate_m5).unwrap_or(0.0),
+                req_rate_m15: mets.map(|x| x.req_rate_m15).unwrap_or(0.0),
+                completions_total: mets.map(|x| x.completions_total).unwrap_or(0),
+            }
         })
         .collect();
 

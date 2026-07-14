@@ -126,6 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&gpu_snapshot),
         keepalive,
     ));
+    manager.init_self_weak(Arc::downgrade(&manager));
     info!("instance manager ready");
 
     // Shared state for hot-reload.

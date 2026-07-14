@@ -256,6 +256,16 @@ pub struct ModelInfo {
     pub queue_depth_used: usize,
     pub queue_depth_max: usize,
     pub blocked: bool,
+    /// 1 / 5 / 15-minute EMA of concurrent in-flight requests.
+    pub load_m1: f64,
+    pub load_m5: f64,
+    pub load_m15: f64,
+    /// 1 / 5 / 15-minute EMA of request completion rate (req/min).
+    pub req_rate_m1: f64,
+    pub req_rate_m5: f64,
+    pub req_rate_m15: f64,
+    /// Total completed requests since daemon start.
+    pub completions_total: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]

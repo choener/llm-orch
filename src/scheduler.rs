@@ -13,10 +13,94 @@ use crate::port_alloc::PortAllocator;
 
 use reqwest::Client;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, oneshot};
 use tracing::{debug, info, warn};
+
+// ── Model metrics (tickless EMA) ────────────────────────────────────────────
+
+/// Per-model exponentially-weighted moving averages for load and request rate.
+///
+/// Updated on every slot acquire / release with the real Δt since the last
+/// event — no periodic tick, no polling.  Also forced-refreshed when the
+/// info / status endpoints are queried so returned values are never stale.
+#[derive(Debug, Clone)]
+pub struct ModelMetrics {
+    /// 1 / 5 / 15-minute EMA of concurrent in-flight requests (Unix-style load).
+    pub load_m1: f64,
+    pub load_m5: f64,
+    pub load_m15: f64,
+    /// 1 / 5 / 15-minute EMA of request completion rate (req / min).
+    pub req_rate_m1: f64,
+    pub req_rate_m5: f64,
+    pub req_rate_m15: f64,
+    /// Total completed requests since daemon start.
+    pub completions_total: u64,
+
+    last_update: Instant,
+    last_active: usize,
+}
+
+impl Default for ModelMetrics {
+    fn default() -> Self {
+        Self {
+            load_m1: 0.0,
+            load_m5: 0.0,
+            load_m15: 0.0,
+            req_rate_m1: 0.0,
+            req_rate_m5: 0.0,
+            req_rate_m15: 0.0,
+            completions_total: 0,
+            last_update: Instant::now(),
+            last_active: 0,
+        }
+    }
+}
+
+impl ModelMetrics {
+    /// Advance all EMAs to `now` with `active` as the current in-flight count
+    /// and `completions_delta` newly-completed requests since the last tick.
+    ///
+    /// The load averages decay with the *old* active count (which was present
+    /// during the Δt interval), then record the new count for the next tick.
+    fn tick(&mut self, now: Instant, active: usize, completions_delta: u64) {
+        let dt = now.duration_since(self.last_update).as_secs_f64();
+        if dt <= 0.0 {
+            self.last_active = active;
+            self.completions_total += completions_delta;
+            self.last_update = now;
+            return;
+        }
+
+        let active_f = self.last_active as f64;
+
+        let alpha_1  = 1.0 - (-dt / 60.0_f64).exp();
+        let alpha_5  = 1.0 - (-dt / 300.0_f64).exp();
+        let alpha_15 = 1.0 - (-dt / 900.0_f64).exp();
+
+        // ── Load averages ───────────────────────────────────────────
+        self.load_m1  = self.load_m1  * (1.0 - alpha_1)  + active_f * alpha_1;
+        self.load_m5  = self.load_m5  * (1.0 - alpha_5)  + active_f * alpha_5;
+        self.load_m15 = self.load_m15 * (1.0 - alpha_15) + active_f * alpha_15;
+
+        // ── Request rate ───────────────────────────────────────────
+        if completions_delta > 0 {
+            let rate_per_min = (completions_delta as f64) / (dt / 60.0);
+            self.req_rate_m1  = self.req_rate_m1  * (1.0 - alpha_1)  + rate_per_min * alpha_1;
+            self.req_rate_m5  = self.req_rate_m5  * (1.0 - alpha_5)  + rate_per_min * alpha_5;
+            self.req_rate_m15 = self.req_rate_m15 * (1.0 - alpha_15) + rate_per_min * alpha_15;
+            self.completions_total += completions_delta;
+        } else {
+            self.req_rate_m1  *= 1.0 - alpha_1;
+            self.req_rate_m5  *= 1.0 - alpha_5;
+            self.req_rate_m15 *= 1.0 - alpha_15;
+        }
+
+        self.last_update = now;
+        self.last_active = active;
+    }
+}
 
 // ── Manager ──────────────────────────────────────────────────────────────────
 
@@ -60,6 +144,13 @@ pub struct InstanceManager {
 
     /// Spawn readiness timeout.
     spawn_timeout: Duration,
+
+    /// Per-model EMA metrics (load & request rate).
+    model_metrics: RwLock<HashMap<String, ModelMetrics>>,
+
+    /// Weak pointer to self, set after `Arc` wrapping in main.rs.
+    /// Cloned into every `Instance` so `release_slot` can tick metrics.
+    self_weak: StdMutex<Option<Weak<InstanceManager>>>,
 }
 
 impl InstanceManager {
@@ -81,6 +172,8 @@ impl InstanceManager {
             .map(|d| d.vulkan.clone())
             .unwrap_or_default();
 
+        let model_metrics = RwLock::new(HashMap::new());
+
         Self {
             client: http_client::build(),
             backend: LlamaCppBackend,
@@ -95,6 +188,8 @@ impl InstanceManager {
             keepalive,
             crash_limit: 3,
             spawn_timeout: Duration::from_secs(120),
+            model_metrics,
+            self_weak: StdMutex::new(None),
         }
     }
 
@@ -103,6 +198,10 @@ impl InstanceManager {
     /// Acquire an instance handle for `model_name`, spawning a new instance
     /// if necessary.  Returns `None` when the model is blocked, all instances
     /// are at capacity, the instance cap is reached and the queue is full.
+    ///
+    /// The returned handle already has a slot acquired — the caller must
+    /// not call `try_acquire` again.  The slot is released automatically
+    /// when the handle is dropped.
     pub async fn get_or_spawn(&self, model_name: &str) -> Option<InstanceHandle> {
         // Fast path: blocked model.
         if self.is_blocked(model_name) {
@@ -110,24 +209,39 @@ impl InstanceManager {
         }
 
         let cfg = self.model_configs.get(model_name)?;
+        let max_concurrent = cfg.max_concurrent;
 
         // Fast path: find a ready instance with spare capacity.
-        if let Some(handle) = self.find_ready_instance(model_name, cfg.max_concurrent) {
-            return Some(handle);
+        if let Some(handle) = self.find_ready_instance(model_name, max_concurrent) {
+            if handle.try_acquire(max_concurrent) {
+                self.record_metrics_event(model_name, 0);
+                return Some(handle);
+            }
+            // Race: another task grabbed the last slot between find and acquire.
+            // Fall through to slow path.
         }
 
         // Slow path: try to spawn a new instance.
         if let Some(handle) = self.try_spawn(model_name, cfg).await {
-            return Some(handle);
+            if handle.try_acquire(max_concurrent) {
+                self.record_metrics_event(model_name, 0);
+                return Some(handle);
+            }
         }
 
         // Queue path: all instances busy and at cap.
-        self.enqueue(model_name, cfg.queue_depth).await
+        self.enqueue(model_name, cfg.queue_depth, max_concurrent).await
     }
 
     /// Enqueue the caller, waiting for an instance slot to free up.
     /// Returns `None` if the queue is at capacity (caller should return 429).
-    async fn enqueue(&self, model_name: &str, max_depth: usize) -> Option<InstanceHandle> {
+    /// Acquires the slot on the received handle before returning.
+    async fn enqueue(
+        &self,
+        model_name: &str,
+        max_depth: usize,
+        max_concurrent: usize,
+    ) -> Option<InstanceHandle> {
         let (tx, rx) = oneshot::channel();
 
         {
@@ -141,7 +255,18 @@ impl InstanceManager {
 
         // Park until a slot frees up and we get an instance handle.
         // If the sender was dropped (shutdown), this returns an error.
-        rx.await.ok()
+        let handle = rx.await.ok()?;
+
+        // Acquire the slot on the received handle.
+        if handle.try_acquire(max_concurrent) {
+            self.record_metrics_event(model_name, 0);
+            Some(handle)
+        } else {
+            // Race: capacity was available when wake_one sent the handle,
+            // but another task grabbed the slot before we could acquire.
+            // Return None — caller retries.
+            None
+        }
     }
 
     /// Wake the first queued waiter for `model_name` if an instance is available.
@@ -247,7 +372,12 @@ impl InstanceManager {
             }
         };
 
-        let mut inst = Instance::new(model_name, gpu_indices, port);
+        let mut inst = Instance::new(
+            model_name,
+            gpu_indices,
+            port,
+            self.self_weak.lock().unwrap().clone(),
+        );
         inst.child = Some(child);
         let handle = InstanceHandle::new(inst);
 
@@ -594,11 +724,131 @@ impl InstanceManager {
         };
 
         for (model_name, handle) in all {
+            // Clear the weak manager ref so remove_instance's drop
+            // doesn't try to tick metrics on a dying manager.
+            {
+                let mut inst = handle.inner().lock().unwrap();
+                inst.mgr = None;
+            }
             self.remove_instance(&model_name, &handle).await;
         }
 
         if let Some(ref ka) = self.keepalive {
             ka.stop_all();
         }
+    }
+
+    // ── Metrics ──────────────────────────────────────────────────────
+
+    /// Read the current queue depth for a model (number of parked waiters).
+    fn queue_depth(&self, model_name: &str) -> usize {
+        self.queues
+            .read()
+            .unwrap()
+            .get(model_name)
+            .map(|q| q.len())
+            .unwrap_or(0)
+    }
+
+    /// Set the weak self-reference after the manager is wrapped in `Arc`.
+    /// Must be called once before any `get_or_spawn` requests.
+    pub fn init_self_weak(&self, weak: Weak<InstanceManager>) {
+        *self.self_weak.lock().unwrap() = Some(weak);
+    }
+
+    /// Record a metrics event for `model_name`.
+    /// `completions_delta` is 0 for acquires, 1 for releases.
+    fn record_metrics_event(&self, model_name: &str, completions_delta: u64) {
+        let in_flight: usize = self
+            .instances
+            .read()
+            .unwrap()
+            .get(model_name)
+            .map(|list| list.iter().map(|h| h.inner().lock().unwrap().in_flight).sum())
+            .unwrap_or(0);
+        let queued = self.queue_depth(model_name);
+        let active = in_flight + queued;
+
+        let now = Instant::now();
+        let mut metrics_map = self.model_metrics.write().unwrap();
+        let m = metrics_map.entry(model_name.to_owned()).or_default();
+        m.tick(now, active, completions_delta);
+    }
+
+    /// Called from `Instance::release_slot` when a slot is freed.
+    /// Public because `Instance` lives in another module.
+    ///
+    /// `self_in_flight` is the releasing instance's in_flight value
+    /// *after* the decrement.  We need it because `release_slot` already
+    /// holds that instance's Mutex, so we can't re-lock it here.
+    #[doc(hidden)]
+    pub fn record_metrics_release(&self, model_name: &str, self_in_flight: usize) {
+        // Compute total in_flight, using try_lock to skip the instance whose
+        // mutex is already held by the caller (release_slot).
+        let in_flight: usize = self
+            .instances
+            .read()
+            .unwrap()
+            .get(model_name)
+            .map(|list| {
+                list.iter()
+                    .map(|h| match h.inner().try_lock() {
+                        Ok(guard) => guard.in_flight,
+                        Err(_) => self_in_flight,
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+        let queued = self.queue_depth(model_name);
+        let active = in_flight + queued;
+
+        let now = Instant::now();
+        let mut metrics_map = self.model_metrics.write().unwrap();
+        let m = metrics_map.entry(model_name.to_owned()).or_default();
+        m.tick(now, active, 1);
+    }
+
+    /// Force-refresh metrics for all models to `now`.
+    ///
+    /// Called by `/v1/info` and `/admin/status` to ensure returned load
+    /// numbers are never stale, even for models that have been idle for
+    /// minutes (no state changes → no ticks).
+    ///
+    /// **Lock ordering**: collects (model, active) pairs under
+    /// `instances.read()`, drops that lock, then acquires
+    /// `model_metrics.write()`.  This avoids a deadlock with
+    /// `release_slot` which holds an Instance Mutex and then calls
+    /// `record_metrics_event` → `metrics.write()`.
+    pub fn force_refresh(&self) {
+        let now = Instant::now();
+
+        // Collect (model_name, active) under the instances read lock,
+        // then drop it before touching the metrics write lock.
+        let snap: Vec<(String, usize)> = {
+            let instances = self.instances.read().unwrap();
+            let queues = self.queues.read().unwrap();
+            instances
+                .iter()
+                .map(|(model_name, list)| {
+                    let in_flight: usize = list
+                        .iter()
+                        .map(|h| h.inner().lock().unwrap().in_flight)
+                        .sum();
+                    let queued = queues.get(model_name).map(|q| q.len()).unwrap_or(0);
+                    (model_name.clone(), in_flight + queued)
+                })
+                .collect()
+        }; // instances + queues read locks dropped
+
+        let mut metrics_map = self.model_metrics.write().unwrap();
+        for (model_name, active) in snap {
+            let m = metrics_map.entry(model_name).or_default();
+            m.tick(now, active, 0);
+        }
+    }
+
+    /// Return a snapshot of all per-model metrics (for info/status responses).
+    pub fn model_metrics_snapshot(&self) -> HashMap<String, ModelMetrics> {
+        self.model_metrics.read().unwrap().clone()
     }
 }

@@ -1,6 +1,8 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 use tokio::process::Child;
+
+use crate::scheduler::InstanceManager;
 
 // ── Instance state ───────────────────────────────────────────────────────────
 
@@ -49,11 +51,20 @@ pub struct Instance {
     /// How many times this instance has crashed *before* producing output.
     /// Reset on first successful health check.
     pub crash_count: usize,
+
+    /// Weak reference to the instance manager for metrics ticking on release.
+    /// `None` in tests or after shutdown.
+    pub mgr: Option<Weak<InstanceManager>>,
 }
 
 impl Instance {
     /// Create a new instance descriptor.  The subprocess has not been spawned yet.
-    pub fn new(model_name: &str, gpu_indices: Vec<usize>, port: u16) -> Self {
+    pub fn new(
+        model_name: &str,
+        gpu_indices: Vec<usize>,
+        port: u16,
+        mgr: Option<Weak<InstanceManager>>,
+    ) -> Self {
         let id = format!("{}@{}", model_name, display_gpus(&gpu_indices));
         Self {
             id,
@@ -65,6 +76,7 @@ impl Instance {
             in_flight: 0,
             last_active: Instant::now(),
             crash_count: 0,
+            mgr,
         }
     }
 
@@ -87,8 +99,16 @@ impl Instance {
 
     /// Decrement the in-flight counter.  Called by `InstanceHandle::drop()`.
     pub fn release_slot(&mut self) {
+        let was_active = self.in_flight > 0;
         self.in_flight = self.in_flight.saturating_sub(1);
         self.last_active = Instant::now();
+        if was_active {
+            if let Some(ref mgr_weak) = self.mgr {
+                if let Some(mgr) = mgr_weak.upgrade() {
+                    mgr.record_metrics_release(&self.model_name, self.in_flight);
+                }
+            }
+        }
     }
 
     /// Whether this instance has spare capacity for another request.
@@ -201,19 +221,19 @@ mod tests {
 
     #[test]
     fn instance_id_format() {
-        let inst = Instance::new("qwen3-32b", vec![0, 1], 9001);
+        let inst = Instance::new("qwen3-32b", vec![0, 1], 9001, None);
         assert_eq!(inst.id, "qwen3-32b@0,1");
     }
 
     #[test]
     fn instance_id_cpu() {
-        let inst = Instance::new("tiny-model", vec![], 9002);
+        let inst = Instance::new("tiny-model", vec![], 9002, None);
         assert_eq!(inst.id, "tiny-model@cpu");
     }
 
     #[test]
     fn handle_acquire_release() {
-        let mut inst = Instance::new("test", vec![0], 9003);
+        let mut inst = Instance::new("test", vec![0], 9003, None);
         inst.mark_ready();
         let handle = InstanceHandle::new(inst);
         assert!(handle.try_acquire(4));
@@ -230,7 +250,7 @@ mod tests {
 
     #[test]
     fn handle_no_capacity() {
-        let mut inst = Instance::new("test", vec![0], 9004);
+        let mut inst = Instance::new("test", vec![0], 9004, None);
         inst.mark_ready();
         let handle = InstanceHandle::new(inst);
         // max_concurrent = 1, acquire one slot
