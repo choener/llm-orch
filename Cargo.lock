@@ -836,6 +836,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures-util",
+ "libc",
  "notify",
  "reqwest",
  "serde",

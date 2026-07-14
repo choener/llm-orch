@@ -49,5 +49,9 @@ tokio-stream = "0.1"
 # Shell-style command splitting
 shlex = "1"
 
+# Unix process control (PR_SET_PDEATHSIG)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio-test = "0.4"
