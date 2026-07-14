@@ -436,6 +436,95 @@ pub async fn completions(
     }.instrument(span).await
 }
 
+// ── /v1/embeddings ──────────────────────────────────────────────────────────
+
+/// `POST /v1/embeddings` — OpenAI-compatible embeddings endpoint.
+///
+/// Same alias resolution and instance management as chat completions,
+/// but always non-streaming and forwarded to the backend's `/v1/embeddings`.
+pub async fn embeddings(
+    State(state): State<AppState>,
+    _key: ApiKey,
+    Json(request): Json<EmbeddingRequest>,
+) -> Result<Json<EmbeddingResponse>, ApiError> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let span = tracing::info_span!(
+        "embedding",
+        id = %request_id,
+        model = %request.model,
+    );
+    async {
+    // ── 1. Resolve alias. ───────────────────────────────────────────────
+    let (model_name, _alias_system_prompt, _alias_prompt_template) = {
+        let cfg = state.config.read().await;
+        resolve_alias(&cfg.aliases, &request.model)
+    };
+
+    // ── 2. Verify model exists. ─────────────────────────────────────────
+    {
+        let cfg = state.config.read().await;
+        let exists = cfg.models.iter().any(|m| m.name == model_name);
+        if !exists {
+            return Err(ApiError::ModelNotFound(model_name));
+        }
+    }
+
+    // ── 3. Acquire instance. ────────────────────────────────────────────
+    let handle = state
+        .manager
+        .get_or_spawn(&model_name)
+        .await
+        .ok_or_else(|| {
+            if state.manager.is_blocked(&model_name) {
+                ApiError::ModelBlocked(model_name.clone())
+            } else {
+                ApiError::NoCapacity(format!(
+                    "model '{}' is at capacity and the queue is full",
+                    model_name
+                ))
+            }
+        })?;
+
+    // ── 4. Read port. ──────────────────────────────────────────────────
+    let port = {
+        let inst = handle.inner().lock().unwrap();
+        inst.port
+    };
+
+    let backend_url = format!("http://127.0.0.1:{}/v1/embeddings", port);
+
+    // ── 5. Forward request, aggregate, release. ────────────────────────
+    let t0 = std::time::Instant::now();
+    let response_body = forward_request_aggregate(
+        &state.client,
+        &backend_url,
+        &serde_json::to_value(&request).unwrap_or_default(),
+    )
+    .await?;
+    let elapsed = t0.elapsed();
+
+    let instance_id = {
+        let inst = handle.inner().lock().unwrap();
+        inst.id.clone()
+    };
+    drop(handle);
+
+    let resp: EmbeddingResponse = serde_json::from_value(response_body)
+        .map_err(|e| ApiError::Internal(format!("failed to parse backend embedding response: {}", e)))?;
+
+    info!(
+        "id={} model={} inst={} embeddings={} server_ms={}",
+        request_id,
+        model_name,
+        instance_id,
+        resp.data.len(),
+        elapsed.as_millis()
+    );
+
+    Ok(Json(resp))
+    }.instrument(span).await
+}
+
 // ── Admin endpoints ──────────────────────────────────────────────────────────
 
 /// `GET /admin/status` — detailed runtime status for all models.

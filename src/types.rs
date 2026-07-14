@@ -301,6 +301,45 @@ pub struct GpuStatus {
     pub mclk_mhz: Option<u64>,
 }
 
+// ── /v1/embeddings request/response ─────────────────────────────────────────
+
+/// Input to the embeddings endpoint — a single string or an array of strings.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum EmbeddingInput {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+/// Request body for `POST /v1/embeddings`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EmbeddingRequest {
+    pub model: String,
+    pub input: EmbeddingInput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding_format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<u32>,
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingResponse {
+    pub object: String,
+    pub data: Vec<EmbeddingObject>,
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingObject {
+    pub object: String,
+    pub index: u32,
+    pub embedding: Vec<f32>,
+}
+
 // ── Admin actions ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
