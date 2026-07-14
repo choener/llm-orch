@@ -121,13 +121,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 5. Create the instance manager.
-    let manager = Arc::new(scheduler::InstanceManager::new(
+    let (manager, release_rx) = scheduler::InstanceManager::new(
         &cfg,
         Arc::clone(&gpu_snapshot),
         keepalive,
-    ));
-    manager.init_self_weak(Arc::downgrade(&manager));
+    );
+    let manager = Arc::new(manager);
     info!("instance manager ready");
+
+    // Spawn the background release-processing task.
+    // This task receives model names from Instance::release_slot (via
+    // the unbounded channel) and calls record_metrics_event + wake_one.
+    // Because the task holds no locks when it receives a message, it can
+    // safely acquire instances.read() → metrics.write() without deadlocking
+    // with the request-completion Drop path.
+    tokio::spawn({
+        let mgr = Arc::clone(&manager);
+        async move {
+            let mut rx = release_rx;
+            while let Some(model_name) = rx.recv().await {
+                mgr.record_metrics_event(&model_name, 1);
+                mgr.wake_one(&model_name);
+            }
+        }
+    });
 
     // Shared state for hot-reload.
     let shared_cfg = Arc::new(RwLock::new(cfg));

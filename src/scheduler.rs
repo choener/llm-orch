@@ -13,9 +13,9 @@ use crate::port_alloc::PortAllocator;
 
 use reqwest::Client;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{mpsc, Mutex, Semaphore, oneshot};
 use tracing::{debug, info, warn};
 
 // ── Model metrics (tickless EMA) ────────────────────────────────────────────
@@ -148,18 +148,28 @@ pub struct InstanceManager {
     /// Per-model EMA metrics (load & request rate).
     model_metrics: RwLock<HashMap<String, ModelMetrics>>,
 
-    /// Weak pointer to self, set after `Arc` wrapping in main.rs.
-    /// Cloned into every `Instance` so `release_slot` can tick metrics.
-    self_weak: StdMutex<Option<Weak<InstanceManager>>>,
+    /// Per-model semaphores to serialize `try_spawn` attempts.
+    spawn_semaphores: tokio::sync::Mutex<HashMap<String, Arc<Semaphore>>>,
+
+    /// Sender side of the release-notification channel.
+    /// Cloned into every `Instance` so `release_slot` can notify the
+    /// background release-processing task without holding any locks.
+    release_tx: mpsc::UnboundedSender<String>,
 }
 
 impl InstanceManager {
-    /// Create a new manager from the loaded config.
+    /// Create a new manager and the receiver for the release channel.
+    ///
+    /// The caller must spawn a background task that drains `release_rx`
+    /// and calls `record_metrics_event` + `wake_one` on the manager for
+    /// each model name received.  This task runs with no locks held, so
+    /// it can safely acquire `instances.read()` → `metrics.write()`
+    /// without deadlocking with the request-completion Drop path.
     pub fn new(
         config: &crate::config::Config,
         gpu_snapshot: Arc<tokio::sync::RwLock<Vec<GpuMetrics>>>,
         keepalive: Option<Arc<KeepAliveManager>>,
-    ) -> Self {
+    ) -> (Self, mpsc::UnboundedReceiver<String>) {
         let model_configs: HashMap<_, _> = config
             .models
             .iter()
@@ -172,9 +182,9 @@ impl InstanceManager {
             .map(|d| d.vulkan.clone())
             .unwrap_or_default();
 
-        let model_metrics = RwLock::new(HashMap::new());
+        let (release_tx, release_rx) = mpsc::unbounded_channel();
 
-        Self {
+        let mgr = Self {
             client: http_client::build(),
             backend: LlamaCppBackend,
             ports: Mutex::new(PortAllocator::new(config.server.port_range.clone())),
@@ -188,9 +198,11 @@ impl InstanceManager {
             keepalive,
             crash_limit: 3,
             spawn_timeout: Duration::from_secs(120),
-            model_metrics,
-            self_weak: StdMutex::new(None),
-        }
+            model_metrics: RwLock::new(HashMap::new()),
+            spawn_semaphores: tokio::sync::Mutex::new(HashMap::new()),
+            release_tx,
+        };
+        (mgr, release_rx)
     }
 
     // ── get-or-spawn ──────────────────────────────────────────────────────
@@ -203,7 +215,6 @@ impl InstanceManager {
     /// not call `try_acquire` again.  The slot is released automatically
     /// when the handle is dropped.
     pub async fn get_or_spawn(&self, model_name: &str) -> Option<InstanceHandle> {
-        // Fast path: blocked model.
         if self.is_blocked(model_name) {
             return None;
         }
@@ -217,8 +228,6 @@ impl InstanceManager {
                 self.record_metrics_event(model_name, 0);
                 return Some(handle);
             }
-            // Race: another task grabbed the last slot between find and acquire.
-            // Fall through to slow path.
         }
 
         // Slow path: try to spawn a new instance.
@@ -248,35 +257,28 @@ impl InstanceManager {
             let mut queues = self.queues.write().unwrap();
             let queue = queues.entry(model_name.to_owned()).or_default();
             if queue.len() >= max_depth {
-                return None; // queue full → 429
+                return None;
             }
             queue.push_back(tx);
         }
 
-        // Park until a slot frees up and we get an instance handle.
-        // If the sender was dropped (shutdown), this returns an error.
         let handle = rx.await.ok()?;
 
-        // Acquire the slot on the received handle.
         if handle.try_acquire(max_concurrent) {
             self.record_metrics_event(model_name, 0);
             Some(handle)
         } else {
-            // Race: capacity was available when wake_one sent the handle,
-            // but another task grabbed the slot before we could acquire.
-            // Return None — caller retries.
             None
         }
     }
 
     /// Wake the first queued waiter for `model_name` if an instance is available.
-    fn wake_one(&self, model_name: &str) {
+    pub(crate) fn wake_one(&self, model_name: &str) {
         let cfg = match self.model_configs.get(model_name) {
             Some(c) => c,
             None => return,
         };
 
-        // Find a ready instance with capacity.
         let handle = self.find_ready_instance(model_name, cfg.max_concurrent);
 
         if let Some(h) = handle {
@@ -286,7 +288,6 @@ impl InstanceManager {
                     if tx.send(h.clone()).is_ok() {
                         return;
                     }
-                    // Receiver dropped — try next waiter.
                 }
             }
         }
@@ -300,7 +301,6 @@ impl InstanceManager {
     ) -> Option<InstanceHandle> {
         let instances = self.instances.read().unwrap();
         let list = instances.get(model_name)?;
-        // Pick the least-loaded instance.
         list.iter()
             .filter(|h| {
                 let inst = h.inner().lock().unwrap();
@@ -313,7 +313,16 @@ impl InstanceManager {
     /// Attempt to spawn a new instance for `model`.  Returns `None` if the
     /// per-model instance cap has been reached.
     async fn try_spawn(&self, model_name: &str, cfg: &ModelConfig) -> Option<InstanceHandle> {
-        // Check instance cap.
+        // Serialize spawn attempts per model.
+        let spawn_semaphore = {
+            let mut guard = self.spawn_semaphores.lock().await;
+            guard.entry(model_name.to_owned())
+                 .or_insert_with(|| Arc::new(Semaphore::new(1)))
+                 .clone()
+        };
+        let _permit = spawn_semaphore.acquire_owned().await.ok()?;
+
+        // Inside the semaphore: check instance cap.
         {
             let instances = self.instances.read().unwrap();
             if let Some(list) = instances.get(model_name) {
@@ -324,8 +333,6 @@ impl InstanceManager {
         }
 
         // Allocate a port.
-        // With `tokio::sync::Mutex`, the guard is `Send`, so it's safe to
-        // hold across `.await` points.
         let port = if self.ports.lock().await.is_ephemeral() {
             let p = self.ports.lock().await.allocate_ephemeral_async().await;
             if p.is_some() {
@@ -376,38 +383,47 @@ impl InstanceManager {
             model_name,
             gpu_indices,
             port,
-            self.self_weak.lock().unwrap().clone(),
+            Some(self.release_tx.clone()),
         );
         inst.child = Some(child);
         let handle = InstanceHandle::new(inst);
 
-        // Wait for readiness (with timeout).
-        if !mark_instance_ready(&handle, &self.client, &self.backend, self.spawn_timeout).await {
-            warn!(model = %model_name, port = port, "health check timeout — shutting down instance");
-            // Failed to become ready — shut down and return.
-            // IMPORTANT: extract the child from the instance and drop the
-            // `MutexGuard` *before* awaiting shutdown_child, because
-            // `std::sync::MutexGuard` is `!Send`.
-            let mut child_to_kill = {
-                let mut inst_lock = handle.inner().lock().unwrap();
-                inst_lock.state = InstanceState::Failed;
-                inst_lock.child.take()
-            };
-            // MutexGuard dropped — safe to `.await`.
-            if let Some(ref mut child) = child_to_kill {
-                shutdown_child(child, Duration::from_secs(5)).await;
-            }
-            self.ports.lock().await.free(port);
-            return None;
-        }
-
-        // Register under model name.
+        // Register under model name immediately as Loading.
         {
             let mut instances = self.instances.write().unwrap();
             instances
                 .entry(model_name.to_owned())
                 .or_default()
                 .push(handle.clone());
+        }
+
+        // Wait for readiness (with timeout).
+        if !mark_instance_ready(&handle, &self.client, &self.backend, self.spawn_timeout).await {
+            warn!(model = %model_name, port = port, "health check timeout — shutting down instance");
+            let mut child_to_kill = {
+                let mut inst_lock = handle.inner().lock().unwrap();
+                inst_lock.state = InstanceState::Failed;
+                inst_lock.child.take()
+            };
+            if let Some(ref mut child) = child_to_kill {
+                shutdown_child(child, Duration::from_secs(5)).await;
+            }
+            self.ports.lock().await.free(port);
+
+            {
+                let mut instances = self.instances.write().unwrap();
+                if let Some(list) = instances.get_mut(model_name) {
+                    list.retain(|h| h.id() != handle.id());
+                }
+            }
+
+            return None;
+        }
+
+        // Mark ready.
+        {
+            let mut inst_lock = handle.inner().lock().unwrap();
+            inst_lock.state = InstanceState::Ready;
         }
 
         let instance_id = {
@@ -443,11 +459,6 @@ impl InstanceManager {
     }
 
     /// Pick a Vulkan device for a new instance from the model's `vulkan_devices` pool.
-    ///
-    /// * Skips devices already occupied by another instance of this model.
-    /// * Among remaining, picks the least-loaded (fewest total instances)
-    ///   that has `free_vram >= model.vram`.
-    /// * Returns `None` if no device qualifies → fall back to CPU.
     async fn select_gpu_for_model(&self, model_cfg: &ModelConfig) -> Option<usize> {
         let vulkan_devices = &model_cfg.vulkan_devices;
         if vulkan_devices.is_empty() || self.vulkan_slots.is_empty() {
@@ -464,7 +475,6 @@ impl InstanceManager {
             "selecting GPU"
         );
 
-        // Collect vulkan indices already running this model.
         let occupied: std::collections::HashSet<usize> = {
             let instances = self.instances.read().unwrap();
             if let Some(list) = instances.get(&model_cfg.name) {
@@ -479,7 +489,6 @@ impl InstanceManager {
             }
         };
 
-        // Sum declared VRAM of all running instances per vulkan index.
         let vram_used: HashMap<usize, u64> = {
             let instances = self.instances.read().unwrap();
             let mut used = HashMap::new();
@@ -497,7 +506,6 @@ impl InstanceManager {
             used
         };
 
-        // Find candidate vulkan indices.
         let model_vram_bytes = model_cfg.vram * 1024 * 1024;
         let mut candidates: Vec<(usize, u64)> = Vec::new();
         for &vulkan_idx in vulkan_devices {
@@ -506,7 +514,6 @@ impl InstanceManager {
                 continue;
             }
 
-            // Resolve vulkan index → PCI slot → GpuMetrics.
             let pci_slot = match self.vulkan_slots.get(&vulkan_idx) {
                 Some(s) => s.as_str(),
                 None => {
@@ -543,7 +550,6 @@ impl InstanceManager {
             return None;
         }
 
-        // Compute total instance count per vulkan index for load-aware selection.
         let instance_counts: HashMap<usize, usize> = {
             let instances = self.instances.read().unwrap();
             let mut counts = HashMap::new();
@@ -558,7 +564,6 @@ impl InstanceManager {
             counts
         };
 
-        // Pick least-loaded candidate.
         let chosen = candidates
             .into_iter()
             .min_by_key(|(idx, _)| instance_counts.get(idx).copied().unwrap_or(0));
@@ -571,7 +576,6 @@ impl InstanceManager {
 
     // ── blocked flag ─────────────────────────────────────────────────────
 
-    /// Check whether a model is blocked.
     pub fn is_blocked(&self, model_name: &str) -> bool {
         self.blocked
             .read()
@@ -581,7 +585,6 @@ impl InstanceManager {
             .unwrap_or(false)
     }
 
-    /// Block a model (called when crash limit exhausted).
     #[allow(dead_code)]
     pub fn block_model(&self, model_name: &str) {
         self.blocked
@@ -590,7 +593,6 @@ impl InstanceManager {
             .insert(model_name.to_owned(), true);
     }
 
-    /// Unblock a model (called by /admin/unblock or config reload).
     #[allow(dead_code)]
     pub fn unblock_model(&self, model_name: &str) {
         self.blocked.write().unwrap().remove(model_name);
@@ -598,7 +600,6 @@ impl InstanceManager {
 
     // ── idle eviction ────────────────────────────────────────────────────
 
-    /// Evict instances that have been idle beyond their model's `idle_ttl`.
     pub async fn unload_idle(&self) {
         let to_evict: Vec<(String, InstanceHandle)> = {
             let instances = self.instances.read().unwrap();
@@ -618,7 +619,7 @@ impl InstanceManager {
             candidates
         };
 
-        let mut evicted_by_model: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut evicted_by_model: HashMap<String, usize> = HashMap::new();
         for (model_name, handle) in to_evict {
             *evicted_by_model.entry(model_name.clone()).or_default() += 1;
             self.remove_instance(&model_name, &handle).await;
@@ -628,16 +629,12 @@ impl InstanceManager {
         }
     }
 
-    /// Remove a specific instance: kill its subprocess, free its port, and
-    /// drop it from the instance list.
     async fn remove_instance(&self, model_name: &str, handle: &InstanceHandle) {
-        // Capture GPU indices before shutting down.
         let gpu_indices: Vec<usize> = {
             let inst = handle.inner().lock().unwrap();
             inst.gpu_indices.clone()
         };
 
-        // Shut down the process.
         let mut child = {
             let mut inst = handle.inner().lock().unwrap();
             inst.state = InstanceState::Failed;
@@ -647,19 +644,16 @@ impl InstanceManager {
             shutdown_child(c, Duration::from_secs(5)).await;
         }
 
-        // Free the port.
         let port = handle.inner().lock().unwrap().port;
         self.ports.lock().await.free(port);
 
-        // Remove from instance list.
         {
             let mut instances = self.instances.write().unwrap();
             if let Some(list) = instances.get_mut(model_name) {
                 list.retain(|h| h.id() != handle.id());
             }
-        } // write lock dropped before keep-alive check
+        }
 
-        // Stop keep-alive for GPUs no longer in use.
         if let Some(ref ka) = self.keepalive {
             for vulkan_idx in &gpu_indices {
                 let still_in_use = {
@@ -678,7 +672,6 @@ impl InstanceManager {
         }
     }
 
-    /// Return per-model instance counts (for /v1/info).
     pub fn instance_counts(&self) -> HashMap<String, usize> {
         let instances = self.instances.read().unwrap();
         instances
@@ -687,12 +680,10 @@ impl InstanceManager {
             .collect()
     }
 
-    /// Return the shared HTTP client (for handlers that need it).
     pub fn client(&self) -> &Client {
         &self.client
     }
 
-    /// Unload all instances of a specific model.
     pub async fn unload_model(&self, model_name: &str) {
         let handles: Vec<InstanceHandle> = {
             let instances = self.instances.read().unwrap();
@@ -713,7 +704,6 @@ impl InstanceManager {
 
     // ── shutdown ─────────────────────────────────────────────────────────
 
-    /// Gracefully drain all instances.
     pub async fn shutdown_all(&self) {
         let all: Vec<(String, InstanceHandle)> = {
             let instances = self.instances.read().unwrap();
@@ -724,11 +714,11 @@ impl InstanceManager {
         };
 
         for (model_name, handle) in all {
-            // Clear the weak manager ref so remove_instance's drop
-            // doesn't try to tick metrics on a dying manager.
+            // Clear the release channel sender so remove_instance's drop
+            // doesn't fire a spurious release event.
             {
                 let mut inst = handle.inner().lock().unwrap();
-                inst.mgr = None;
+                inst.release_tx = None;
             }
             self.remove_instance(&model_name, &handle).await;
         }
@@ -740,7 +730,6 @@ impl InstanceManager {
 
     // ── Metrics ──────────────────────────────────────────────────────
 
-    /// Read the current queue depth for a model (number of parked waiters).
     fn queue_depth(&self, model_name: &str) -> usize {
         self.queues
             .read()
@@ -750,15 +739,14 @@ impl InstanceManager {
             .unwrap_or(0)
     }
 
-    /// Set the weak self-reference after the manager is wrapped in `Arc`.
-    /// Must be called once before any `get_or_spawn` requests.
-    pub fn init_self_weak(&self, weak: Weak<InstanceManager>) {
-        *self.self_weak.lock().unwrap() = Some(weak);
-    }
-
     /// Record a metrics event for `model_name`.
     /// `completions_delta` is 0 for acquires, 1 for releases.
-    fn record_metrics_event(&self, model_name: &str, completions_delta: u64) {
+    ///
+    /// Called from `get_or_spawn` / `enqueue` (acquire path) and from the
+    /// background release-processing task (release path).  In both cases
+    /// the caller holds **no locks**, so we can safely acquire
+    /// `instances.read()` → `model_metrics.write()` without deadlock.
+    pub(crate) fn record_metrics_event(&self, model_name: &str, completions_delta: u64) {
         let in_flight: usize = self
             .instances
             .read()
@@ -775,55 +763,14 @@ impl InstanceManager {
         m.tick(now, active, completions_delta);
     }
 
-    /// Called from `Instance::release_slot` when a slot is freed.
-    /// Public because `Instance` lives in another module.
-    ///
-    /// `self_in_flight` is the releasing instance's in_flight value
-    /// *after* the decrement.  We need it because `release_slot` already
-    /// holds that instance's Mutex, so we can't re-lock it here.
-    #[doc(hidden)]
-    pub fn record_metrics_release(&self, model_name: &str, self_in_flight: usize) {
-        // Compute total in_flight, using try_lock to skip the instance whose
-        // mutex is already held by the caller (release_slot).
-        let in_flight: usize = self
-            .instances
-            .read()
-            .unwrap()
-            .get(model_name)
-            .map(|list| {
-                list.iter()
-                    .map(|h| match h.inner().try_lock() {
-                        Ok(guard) => guard.in_flight,
-                        Err(_) => self_in_flight,
-                    })
-                    .sum()
-            })
-            .unwrap_or(0);
-        let queued = self.queue_depth(model_name);
-        let active = in_flight + queued;
-
-        let now = Instant::now();
-        let mut metrics_map = self.model_metrics.write().unwrap();
-        let m = metrics_map.entry(model_name.to_owned()).or_default();
-        m.tick(now, active, 1);
-    }
-
     /// Force-refresh metrics for all models to `now`.
     ///
     /// Called by `/v1/info` and `/admin/status` to ensure returned load
-    /// numbers are never stale, even for models that have been idle for
-    /// minutes (no state changes → no ticks).
-    ///
-    /// **Lock ordering**: collects (model, active) pairs under
-    /// `instances.read()`, drops that lock, then acquires
-    /// `model_metrics.write()`.  This avoids a deadlock with
-    /// `release_slot` which holds an Instance Mutex and then calls
-    /// `record_metrics_event` → `metrics.write()`.
+    /// numbers are never stale.  Collects data under `instances.read()`,
+    /// drops it, then acquires `model_metrics.write()` — no lock inversion.
     pub fn force_refresh(&self) {
         let now = Instant::now();
 
-        // Collect (model_name, active) under the instances read lock,
-        // then drop it before touching the metrics write lock.
         let snap: Vec<(String, usize)> = {
             let instances = self.instances.read().unwrap();
             let queues = self.queues.read().unwrap();
@@ -838,7 +785,7 @@ impl InstanceManager {
                     (model_name.clone(), in_flight + queued)
                 })
                 .collect()
-        }; // instances + queues read locks dropped
+        };
 
         let mut metrics_map = self.model_metrics.write().unwrap();
         for (model_name, active) in snap {
@@ -847,7 +794,6 @@ impl InstanceManager {
         }
     }
 
-    /// Return a snapshot of all per-model metrics (for info/status responses).
     pub fn model_metrics_snapshot(&self) -> HashMap<String, ModelMetrics> {
         self.model_metrics.read().unwrap().clone()
     }

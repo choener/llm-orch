@@ -288,7 +288,13 @@ pub async fn chat_completions(
             }
         })?;
 
-    // ── 5. Read the port from the instance, then drop the inner lock. ───
+    // Capture instance ID now that we have the handle.
+    let instance_id = {
+        let inst = handle.inner().lock().unwrap();
+        inst.id.clone()
+    }; // inner lock dropped — `handle` itself is still alive (Arc)
+
+    // ── 5. Read the port from the instance. ────────────────────────────
     let port = {
         let inst = handle.inner().lock().unwrap();
         inst.port
@@ -301,16 +307,14 @@ pub async fn chat_completions(
         // Streaming mode: forward SSE stream from backend to client.
         // The `InstanceHandle` is moved into the stream wrapper so the
         // in-flight slot is released when the stream ends (Drop).
-        let instance_id = {
-            let inst = handle.inner().lock().unwrap();
-            inst.id.clone()
-        };
         info!("stream start model={} inst={}", model_name, instance_id);
         let stream = build_sse_stream(
             state.client.clone(),
             backend_url,
             serde_json::to_value(&request).unwrap_or_default(),
             handle,
+            model_name.clone(),
+            instance_id.clone(),
         )
         .await
         .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
@@ -326,13 +330,6 @@ pub async fn chat_completions(
         )
         .await?;
         let elapsed = t0.elapsed();
-
-        // Capture instance ID before dropping the handle.
-        let instance_id = {
-            let inst = handle.inner().lock().unwrap();
-            inst.id.clone()
-        };
-        drop(handle);
 
         log_completion(&response_body, &model_name, &instance_id, elapsed);
 
@@ -393,7 +390,13 @@ pub async fn completions(
             }
         })?;
 
-    // ── 4. Read port, drop inner lock. ──────────────────────────────────
+    // Capture instance ID now that we have the handle.
+    let instance_id = {
+        let inst = handle.inner().lock().unwrap();
+        inst.id.clone()
+    };
+
+    // ── 4. Read port. ──────────────────────────────────────────────────
     let port = {
         let inst = handle.inner().lock().unwrap();
         inst.port
@@ -403,16 +406,14 @@ pub async fn completions(
 
     // ── 5. Forward request. ─────────────────────────────────────────────
     if request.stream {
-        let instance_id = {
-            let inst = handle.inner().lock().unwrap();
-            inst.id.clone()
-        };
         info!("stream start model={} inst={}", model_name, instance_id);
         let stream = build_sse_stream(
             state.client.clone(),
             backend_url,
             serde_json::to_value(&request).unwrap_or_default(),
             handle,
+            model_name.clone(),
+            instance_id.clone(),
         )
         .await
         .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
@@ -428,12 +429,6 @@ pub async fn completions(
         .await?;
         let elapsed = t0.elapsed();
 
-        let instance_id = {
-            let inst = handle.inner().lock().unwrap();
-            inst.id.clone()
-        };
-        drop(handle);
-
         log_completion(&response_body, &model_name, &instance_id, elapsed);
 
         Ok(Json(response_body).into_response())
@@ -444,21 +439,14 @@ pub async fn completions(
 // ── Admin endpoints ──────────────────────────────────────────────────────────
 
 /// `GET /admin/status` — detailed runtime status for all models.
-///
-/// # Send safety
-/// Config read guard is cloned and dropped before building the response.
 pub async fn admin_status(
     State(state): State<AppState>,
     _key: ApiKey,
 ) -> Result<Json<InfoResponse>, ApiError> {
-    // Reuse /v1/info logic.
     info_endpoint(State(state), _key).await
 }
 
 /// `POST /admin/load` — force-load a model (pre-spawn an instance).
-///
-/// # Send safety
-/// Config read guard is dropped before the async `get_or_spawn` call.
 pub async fn admin_load(
     State(state): State<AppState>,
     _key: ApiKey,
@@ -502,9 +490,6 @@ pub async fn admin_load(
 }
 
 /// `POST /admin/unload` — force-unload all instances of a model.
-///
-/// # Send safety
-/// Config read guard is dropped before the async unload call.
 pub async fn admin_unload(
     State(state): State<AppState>,
     _key: ApiKey,
@@ -530,9 +515,6 @@ pub async fn admin_unload(
 }
 
 /// `POST /admin/unblock` — clear the crash-block on a model.
-///
-/// # Send safety
-/// No locks cross `.await` — `unblock_model` is synchronous on `std::sync::RwLock`.
 pub async fn admin_unblock(
     State(state): State<AppState>,
     _key: ApiKey,
@@ -571,14 +553,10 @@ pub async fn admin_unblock(
 ///
 /// Returns `(model_name, optional_system_prompt, optional_prompt_template)`.
 /// If the name is not an alias, returns the name unchanged with `None` prompts.
-///
-/// This function is pure — it doesn't touch any locks.  The caller is
-/// responsible for passing in the alias list (already cloned from config).
 fn resolve_alias(
     aliases: &[AliasConfig],
     requested_model: &str,
 ) -> (String, Option<String>, Option<String>) {
-    // Check if the requested model is an alias.
     if let Some(alias) = aliases.iter().find(|a| a.name == requested_model) {
         return (
             alias.target.clone(),
@@ -586,26 +564,16 @@ fn resolve_alias(
             alias.prompt_template.clone(),
         );
     }
-    // Not an alias — use as-is.
     (requested_model.to_owned(), None, None)
 }
 
 /// Apply alias system prompt and/or prompt template injection to messages.
-///
-/// If `system_prompt` is `Some(...)`, it is prepended as a system message
-/// (unless the first message is already a system message with content).
-///
-/// If `prompt_template` is `Some(...)`, it is applied to the last user message.
-///
-/// This function is pure — no locks, no `.await`.
 fn apply_alias_prompts(
     messages: &mut Vec<ChatMessage>,
     system_prompt: Option<String>,
     prompt_template: Option<String>,
 ) {
-    // ── System prompt injection ────────────────────────────────────────
     if let Some(sp) = system_prompt {
-        // Only inject if the first message isn't already a system message.
         let needs_injection = match messages.first() {
             Some(m) if m.role == "system" => false,
             _ => true,
@@ -622,9 +590,6 @@ fn apply_alias_prompts(
         }
     }
 
-    // ── Prompt template injection ──────────────────────────────────────
-    //    A simple template substitution: `{prompt}` in the template is
-    //    replaced with the last user message's content.
     if let Some(tmpl) = prompt_template {
         if let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user") {
             if let Some(MessageContent::Text(ref text)) = last_user.content {
@@ -669,7 +634,6 @@ fn log_completion(
 
     let server_ms = elapsed.as_millis();
 
-    // Build a compact log line.
     let prompt_cached = match (prompt_tokens, cached_tokens) {
         (Some(p), Some(c)) if c > 0 => format!("prompt={}(cached:{})", p, c),
         (Some(p), _) => format!("prompt={}", p),
@@ -692,12 +656,6 @@ fn log_completion(
 // ── Backend forwarding ───────────────────────────────────────────────────────
 
 /// Forward a request to a backend and aggregate the full response.
-///
-/// Used for non-streaming mode.  Returns the raw JSON body from the backend.
-///
-/// # Send safety
-/// This function takes `&Client` and `&Value` by reference — it owns no
-/// lock guards, so its returned future is `Send`.
 async fn forward_request_aggregate(
     client: &reqwest::Client,
     backend_url: &str,
@@ -734,17 +692,13 @@ async fn forward_request_aggregate(
 ///
 /// The `InstanceHandle` is moved into the returned stream so the in-flight
 /// slot is released when the stream ends (via `Drop`).
-///
-/// # Send safety
-/// The backend response is initiated *before* returning the stream.  The
-/// response headers are captured, and the stream body is forwarded chunk
-/// by chunk.  No lock guards are held across `.await` boundaries inside
-/// the stream's `poll_next`.
 async fn build_sse_stream(
     client: reqwest::Client,
     backend_url: String,
     body: serde_json::Value,
     handle: InstanceHandle,
+    model_name: String,
+    instance_id: String,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>, reqwest::Error> {
     let resp = client
         .post(&backend_url)
@@ -777,7 +731,7 @@ async fn build_sse_stream(
 
     // Success — forward the byte stream as SSE events.
     let byte_stream = resp.bytes_stream();
-    let sse_stream = SseForwarder::new(byte_stream, handle);
+    let sse_stream = SseForwarder::new(byte_stream, handle, model_name, instance_id);
 
     Ok(Box::pin(sse_stream))
 }
@@ -795,17 +749,22 @@ struct SseForwarder<S> {
     buffer: Vec<u8>,
     /// Kept alive until the stream ends.
     _handle: InstanceHandle,
+    model_name: String,
+    instance_id: String,
 }
 
 impl<S> SseForwarder<S>
 where
     S: Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
 {
-    fn new(stream: S, handle: InstanceHandle) -> Self {
+    fn new(stream: S, handle: InstanceHandle, model_name: String, instance_id: String) -> Self {
+        debug!("SseForwarder::new: model={} inst={}", model_name, instance_id);
         Self {
             inner: stream,
             buffer: Vec::new(),
             _handle: handle,
+            model_name,
+            instance_id,
         }
     }
 }
@@ -817,6 +776,7 @@ where
     type Item = Result<Event, Infallible>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        debug!("SseForwarder::poll_next: model={} inst={} buffer={} capacity={}", self.model_name, self.instance_id, self.buffer.len(), self.buffer.capacity());
         loop {
             // Try to extract a complete event from the buffer.
             if let Some(event) = extract_sse_event(&mut self.buffer) {
@@ -831,7 +791,6 @@ where
                 }
                 Poll::Ready(Some(Err(e))) => {
                     warn!(error = %e, "backend stream error");
-                    // Emit an error event and end.
                     let error_event = Event::default()
                         .data(format!("{{\"error\":\"{}\"}}", e))
                         .event("error");
@@ -846,7 +805,7 @@ where
                             return Poll::Ready(Some(Ok(Event::default().data(remaining))));
                         }
                     }
-                    // Send [DONE] marker.
+                    debug!("SseForwarder::poll_next: stream ended model={} inst={}", self.model_name, self.instance_id);
                     return Poll::Ready(Some(Ok(Event::default().data("[DONE]"))));
                 }
                 Poll::Pending => return Poll::Pending,
@@ -855,21 +814,24 @@ where
     }
 }
 
+impl<S> Drop for SseForwarder<S> {
+    fn drop(&mut self) {
+        debug!("SseForwarder::drop: model={} inst={}", self.model_name, self.instance_id);
+    }
+}
+
 /// Extract a complete SSE event from a byte buffer.
 ///
 /// SSE events are terminated by a double newline (`\n\n` or `\r\n\r\n`).
 /// Returns the extracted event and removes it from the buffer.
 fn extract_sse_event(buffer: &mut Vec<u8>) -> Option<Event> {
-    // Look for a double newline.
     let double_nl = find_double_newline(buffer)?;
     let event_bytes: Vec<u8> = buffer.drain(..double_nl).collect();
-    // Also drain the double newline itself.
     let sep_len = detect_separator_len(buffer);
     buffer.drain(..sep_len);
 
     let event_str = String::from_utf8_lossy(&event_bytes);
 
-    // Parse the SSE fields.
     let mut data_lines: Vec<String> = Vec::new();
     let mut event_type: Option<String> = None;
 
@@ -879,7 +841,6 @@ fn extract_sse_event(buffer: &mut Vec<u8>) -> Option<Event> {
         } else if let Some(rest) = line.strip_prefix("event:") {
             event_type = Some(rest.trim().to_string());
         }
-        // Ignore other fields (id:, retry:, comments).
     }
 
     if data_lines.is_empty() {

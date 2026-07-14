@@ -1,8 +1,7 @@
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::process::Child;
-
-use crate::scheduler::InstanceManager;
+use tokio::sync::mpsc;
 
 // ── Instance state ───────────────────────────────────────────────────────────
 
@@ -52,9 +51,9 @@ pub struct Instance {
     /// Reset on first successful health check.
     pub crash_count: usize,
 
-    /// Weak reference to the instance manager for metrics ticking on release.
+    /// Channel sender for notifying the manager on slot release.
     /// `None` in tests or after shutdown.
-    pub mgr: Option<Weak<InstanceManager>>,
+    pub release_tx: Option<mpsc::UnboundedSender<String>>,
 }
 
 impl Instance {
@@ -63,7 +62,7 @@ impl Instance {
         model_name: &str,
         gpu_indices: Vec<usize>,
         port: u16,
-        mgr: Option<Weak<InstanceManager>>,
+        release_tx: Option<mpsc::UnboundedSender<String>>,
     ) -> Self {
         let id = format!("{}@{}", model_name, display_gpus(&gpu_indices));
         Self {
@@ -76,14 +75,14 @@ impl Instance {
             in_flight: 0,
             last_active: Instant::now(),
             crash_count: 0,
-            mgr,
+            release_tx,
         }
     }
 
     /// Mark this instance as ready (health check passed).
     pub fn mark_ready(&mut self) {
         self.state = InstanceState::Ready;
-        self.crash_count = 0; // successful startup resets crash counter
+        self.crash_count = 0;
     }
 
     /// Mark this instance as failed.
@@ -98,15 +97,19 @@ impl Instance {
     }
 
     /// Decrement the in-flight counter.  Called by `InstanceHandle::drop()`.
+    ///
+    /// Sends a release notification on the metrics channel only when this
+    /// release actually freed a slot (`in_flight` was > 0 before decrement).
+    /// The background task that receives this message runs with no locks
+    /// held, so it can safely acquire `instances.read()` → `metrics.write()`
+    /// without deadlocking with the request-completion Drop path.
     pub fn release_slot(&mut self) {
         let was_active = self.in_flight > 0;
         self.in_flight = self.in_flight.saturating_sub(1);
         self.last_active = Instant::now();
         if was_active {
-            if let Some(ref mgr_weak) = self.mgr {
-                if let Some(mgr) = mgr_weak.upgrade() {
-                    mgr.record_metrics_release(&self.model_name, self.in_flight);
-                }
+            if let Some(ref tx) = self.release_tx {
+                let _ = tx.send(self.model_name.clone());
             }
         }
     }
@@ -122,10 +125,8 @@ impl Instance {
     pub fn on_exit(&mut self) -> bool {
         self.state = InstanceState::Failed;
         if self.crash_count == 0 && self.child.is_some() {
-            // Reached Ready at least once — normal exit/crash, restart freely.
             false
         } else {
-            // Never produced output — increment crash counter.
             self.crash_count += 1;
             true
         }
@@ -191,8 +192,6 @@ impl InstanceHandle {
 
 impl Drop for InstanceHandle {
     fn drop(&mut self) {
-        // Release the slot synchronously.  The mutex is held for a few
-        // nanoseconds — just a counter decrement and timestamp update.
         if let Ok(mut inst) = self.inner.lock() {
             inst.release_slot();
         }
