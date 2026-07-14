@@ -285,6 +285,12 @@ pub struct ModelConfig {
     /// Empty = CPU only.
     #[serde(default)]
     pub vulkan_devices: Vec<usize>,
+
+    /// Optional path for per-request debug I/O logging (JSONL).
+    /// When set, every request/response pair for this model is appended
+    /// as one JSON object per line.
+    #[serde(default)]
+    pub debug_log: Option<PathBuf>,
 }
 
 fn default_max_instances() -> usize {

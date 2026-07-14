@@ -4,7 +4,7 @@
 // `/v1/completions`.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Number, Value};
 
 // ── Chat completions request ─────────────────────────────────────────────────
 
@@ -53,19 +53,19 @@ pub struct ChatCompletionRequest {
     /// The conversation messages.
     pub messages: Vec<ChatMessage>,
     /// Whether to stream the response.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "bool_is_false")]
     pub stream: bool,
     /// Sampling temperature.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f64>,
+    pub temperature: Option<Number>,
     /// Nucleus sampling probability.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f64>,
+    pub top_p: Option<Number>,
     /// Number of completions to generate.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub n: Option<u32>,
     /// Whether to stream log probabilities.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<Value>,
     /// Stop sequences.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -75,10 +75,10 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<u32>,
     /// Presence penalty.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub presence_penalty: Option<f64>,
+    pub presence_penalty: Option<Number>,
     /// Frequency penalty.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub frequency_penalty: Option<f64>,
+    pub frequency_penalty: Option<Number>,
     /// Random seed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<i64>,
@@ -93,7 +93,7 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<Value>,
     /// Additional parameters passed through to the backend.
     #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, Value>,
+    pub extra: Map<String, Value>,
 }
 
 /// Stop sequences — can be a single string or an array.
@@ -172,23 +172,23 @@ pub struct CompletionRequest {
     /// The prompt text.
     pub prompt: PromptContent,
     /// Whether to stream.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "bool_is_false")]
     pub stream: bool,
     /// Maximum tokens to generate.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     /// Sampling temperature.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f64>,
+    pub temperature: Option<Number>,
     /// Nucleus sampling.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f64>,
+    pub top_p: Option<Number>,
     /// Stop sequences.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<StopSequences>,
     /// Additional parameters passed through to the backend.
     #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, Value>,
+    pub extra: Map<String, Value>,
 }
 
 /// Prompt content — can be a single string or an array of strings.
@@ -321,7 +321,7 @@ pub struct EmbeddingRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dimensions: Option<u32>,
     #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, Value>,
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -334,10 +334,17 @@ pub struct EmbeddingResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingVector {
+    Float(Vec<f32>),
+    Base64(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingObject {
     pub object: String,
     pub index: u32,
-    pub embedding: Vec<f32>,
+    pub embedding: EmbeddingVector,
 }
 
 // ── Admin actions ────────────────────────────────────────────────────────────
@@ -351,4 +358,65 @@ pub struct AdminModelAction {
 pub struct AdminResponse {
     pub status: String,
     pub message: String,
+}
+
+// ── Serialization helpers ────────────────────────────────────────────────────
+
+/// Used by `#[serde(skip_serializing_if = "bool_is_false")]` to omit
+/// `stream: false` from the serialized output, matching the behavior of
+/// transparent proxies that don't add default-valued fields.
+fn bool_is_false(b: &bool) -> bool {
+    !*b
+}
+
+// ── Round-trip idempotency tests ─────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_request_round_trip_omits_stream_when_false() {
+        let input = r#"{"model":"m","temperature":0,"messages":[{"role":"system","content":"hi"}]}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(input).unwrap();
+        let output = serde_json::to_string(&req).unwrap();
+        // stream=false must be absent (not serialized)
+        assert!(!output.contains("\"stream\":"), "stream should be absent: {}", output);
+        // stream_options must be absent when None
+        assert!(!output.contains("stream_options"), "stream_options should be absent: {}", output);
+        // temperature:0 must stay 0 (integer), not 0.0
+        assert!(output.contains("\"temperature\":0"), "temperature should be 0 int: {}", output);
+    }
+
+    #[test]
+    fn chat_request_preserves_extra_field_order() {
+        let input = r#"{"model":"m","messages":[],"prompt_cache_key":"abc","custom_flag":true,"temperature":0.7}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(input).unwrap();
+        let output = serde_json::to_string(&req).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let keys: Vec<&str> = val.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        // Declaration order: model, messages, temperature, top_p, ..., extra fields in insertion order
+        assert_eq!(keys[0], "model");
+        assert_eq!(keys[1], "messages");
+        // prompt_cache_key and custom_flag are flattened extra — order preserved
+        let pk_pos = keys.iter().position(|&k| k == "prompt_cache_key").unwrap();
+        let cf_pos = keys.iter().position(|&k| k == "custom_flag").unwrap();
+        assert!(pk_pos < cf_pos, "prompt_cache_key should come before custom_flag");
+    }
+
+    #[test]
+    fn chat_request_stream_true_is_serialized() {
+        let input = r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(input).unwrap();
+        let output = serde_json::to_string(&req).unwrap();
+        assert!(output.contains("\"stream\":true"), "stream=true must be present: {}", output);
+    }
+
+    #[test]
+    fn completion_request_round_trip() {
+        let input = r#"{"model":"m","prompt":"hello","temperature":0,"top_p":1}"#;
+        let req: CompletionRequest = serde_json::from_str(input).unwrap();
+        let output = serde_json::to_string(&req).unwrap();
+        assert!(!output.contains("\"stream\":"), "stream should be absent: {}", output);
+    }
 }

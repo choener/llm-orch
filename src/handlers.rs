@@ -42,6 +42,7 @@ use std::task::{Context, Poll};
 use tracing::{debug, info, warn};
 
 use crate::config::AliasConfig;
+use crate::debug_log::{DebugLogEntry, DebugStreamContext, ts_now};
 use crate::instance::InstanceHandle;
 use crate::server::{ApiKey, ApiError, AppState};
 use crate::types::*;
@@ -263,14 +264,15 @@ pub async fn chat_completions(
     //    Pure computation — no locks involved.
     apply_alias_prompts(&mut request.messages, alias_system_prompt, alias_prompt_template);
 
-    // ── 3. Verify the model exists in the config. ───────────────────────
-    {
+    // ── 3. Verify the model exists in the config and extract debug_log. ─
+    let request_model = request.model.clone();
+    let debug_log_path: Option<std::path::PathBuf> = {
         let cfg = state.config.read().await;
-        let exists = cfg.models.iter().any(|m| m.name == model_name);
-        if !exists {
-            return Err(ApiError::ModelNotFound(model_name));
+        match cfg.models.iter().find(|m| m.name == model_name) {
+            Some(m) => m.debug_log.clone(),
+            None => return Err(ApiError::ModelNotFound(model_name)),
         }
-    } // cfg read guard dropped
+    }; // cfg read guard dropped
 
     // ── 4. Acquire an instance (or queue). ──────────────────────────────
     let handle = state
@@ -303,18 +305,47 @@ pub async fn chat_completions(
     let backend_url = format!("http://127.0.0.1:{}/v1/chat/completions", port);
 
     // ── 6. Forward the request. ─────────────────────────────────────────
+    let request_body = serde_json::to_value(&request).unwrap_or_default();
+
+    // Debug log: request (exact body being forwarded).
+    if let Some(ref log_path) = debug_log_path {
+        state.debug_loggers.write_line(log_path, &DebugLogEntry {
+            ts: ts_now(),
+            request_id: request_id.clone(),
+            model: model_name.clone(),
+            alias: Some(request_model.clone()),
+            instance_id: Some(instance_id.clone()),
+            dir: "request".into(),
+            stream: Some(request.stream),
+            body: Some(request_body.clone()),
+            usage: None,
+            duration_ms: None,
+            error: None,
+        });
+    }
+
     if request.stream {
         // Streaming mode: forward SSE stream from backend to client.
         // The `InstanceHandle` is moved into the stream wrapper so the
         // in-flight slot is released when the stream ends (Drop).
         info!("stream start model={} inst={}", model_name, instance_id);
+        let debug_ctx = debug_log_path.map(|path| DebugStreamContext {
+            loggers: state.debug_loggers.clone(),
+            path,
+            request_id: request_id.clone(),
+            model_name: model_name.clone(),
+            alias: Some(request_model.clone()),
+            instance_id: instance_id.clone(),
+            t0: std::time::Instant::now(),
+        });
         let stream = build_sse_stream(
             state.client.clone(),
             backend_url,
-            serde_json::to_value(&request).unwrap_or_default(),
+            request_body,
             handle,
             model_name.clone(),
             instance_id.clone(),
+            debug_ctx,
         )
         .await
         .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
@@ -326,10 +357,28 @@ pub async fn chat_completions(
         let response_body = forward_request_aggregate(
             &state.client,
             &backend_url,
-            &serde_json::to_value(&request).unwrap_or_default(),
+            &request_body,
         )
         .await?;
         let elapsed = t0.elapsed();
+
+        // Debug log: response.
+        if let Some(ref log_path) = debug_log_path {
+            let usage = response_body.pointer("/usage").cloned();
+            state.debug_loggers.write_line(log_path, &DebugLogEntry {
+                ts: ts_now(),
+                request_id: request_id.clone(),
+                model: model_name.clone(),
+                alias: Some(request_model),
+                instance_id: Some(instance_id.clone()),
+                dir: "response".into(),
+                stream: Some(false),
+                body: Some(response_body.clone()),
+                usage,
+                duration_ms: Some(elapsed.as_millis() as u64),
+                error: None,
+            });
+        }
 
         log_completion(&response_body, &model_name, &instance_id, elapsed);
 
@@ -414,6 +463,7 @@ pub async fn completions(
             handle,
             model_name.clone(),
             instance_id.clone(),
+            None,
         )
         .await
         .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
@@ -500,7 +550,11 @@ pub async fn embeddings(
         &backend_url,
         &serde_json::to_value(&request).unwrap_or_default(),
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        warn!("embedding backend request failed: {}", e);
+        e
+    })?;
     let elapsed = t0.elapsed();
 
     let instance_id = {
@@ -763,6 +817,7 @@ async fn forward_request_aggregate(
             .text()
             .await
             .unwrap_or_else(|_| "unknown error".into());
+        warn!(backend_status = %status, error = %text, "backend returned non-success");
         return Err(ApiError::Internal(format!(
             "backend returned {}: {}",
             status, text
@@ -788,6 +843,7 @@ async fn build_sse_stream(
     handle: InstanceHandle,
     model_name: String,
     instance_id: String,
+    debug: Option<DebugStreamContext>,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>, reqwest::Error> {
     let resp = client
         .post(&backend_url)
@@ -800,6 +856,24 @@ async fn build_sse_stream(
         // Non-success before streaming — return an error event stream.
         let error_text = resp.text().await.unwrap_or_else(|_| "unknown error".into());
         warn!(backend_status = %status, error = %error_text, "backend returned non-success");
+
+        // Debug log: error response.
+        if let Some(ctx) = debug {
+            ctx.loggers.write_line(&ctx.path, &DebugLogEntry {
+                ts: ts_now(),
+                request_id: ctx.request_id,
+                model: ctx.model_name,
+                alias: ctx.alias,
+                instance_id: Some(ctx.instance_id),
+                dir: "response".into(),
+                stream: Some(true),
+                body: None,
+                usage: None,
+                duration_ms: Some(ctx.t0.elapsed().as_millis() as u64),
+                error: Some(format!("backend {}: {}", status.as_u16(), error_text)),
+            });
+        }
+
         // Return a stream that emits a single error event and then ends.
         let stream = futures_util::stream::once(async move {
             let error_sse = serde_json::json!({
@@ -820,7 +894,7 @@ async fn build_sse_stream(
 
     // Success — forward the byte stream as SSE events.
     let byte_stream = resp.bytes_stream();
-    let sse_stream = SseForwarder::new(byte_stream, handle, model_name, instance_id);
+    let sse_stream = SseForwarder::new(byte_stream, handle, model_name, instance_id, debug);
 
     Ok(Box::pin(sse_stream))
 }
@@ -836,6 +910,9 @@ struct SseForwarder<S> {
     inner: Option<S>,
     /// Accumulated partial line from previous chunks.
     buffer: Vec<u8>,
+    /// Debug log context + accumulated SSE data chunks (logged on Drop).
+    debug: Option<DebugStreamContext>,
+    chunks: Vec<String>,
     /// Kept alive until the stream ends.
     _handle: InstanceHandle,
     model_name: String,
@@ -846,11 +923,13 @@ impl<S> SseForwarder<S>
 where
     S: Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
 {
-    fn new(stream: S, handle: InstanceHandle, model_name: String, instance_id: String) -> Self {
+    fn new(stream: S, handle: InstanceHandle, model_name: String, instance_id: String, debug: Option<DebugStreamContext>) -> Self {
         debug!("SseForwarder::new: model={} inst={}", model_name, instance_id);
         Self {
             inner: Some(stream),
             buffer: Vec::new(),
+            debug,
+            chunks: Vec::new(),
             _handle: handle,
             model_name,
             instance_id,
@@ -874,7 +953,11 @@ where
         debug!("SseForwarder::poll_next: model={} inst={} buffer={} capacity={}", model, inst, self.buffer.len(), self.buffer.capacity());
         loop {
             // Try to extract a complete event from the buffer.
-            if let Some(event) = extract_sse_event(&mut self.buffer) {
+            if let Some((event, data)) = extract_sse_event(&mut self.buffer) {
+                // Accumulate raw data for debug logging.
+                if self.debug.is_some() && !data.is_empty() && data != "[DONE]" {
+                    self.chunks.push(data);
+                }
                 return Poll::Ready(Some(Ok(event)));
             }
 
@@ -918,14 +1001,33 @@ where
 impl<S> Drop for SseForwarder<S> {
     fn drop(&mut self) {
         debug!("SseForwarder::drop: model={} inst={}", self.model_name, self.instance_id);
+        // Debug log: streaming response (logged on drop so we capture partial
+        // output even on client disconnect).
+        if let Some(ctx) = self.debug.take() {
+            let body = serde_json::json!({"chunks": self.chunks});
+            ctx.loggers.write_line(&ctx.path, &DebugLogEntry {
+                ts: ts_now(),
+                request_id: ctx.request_id,
+                model: ctx.model_name,
+                alias: ctx.alias,
+                instance_id: Some(ctx.instance_id),
+                dir: "response".into(),
+                stream: Some(true),
+                body: Some(body),
+                usage: None,
+                duration_ms: Some(ctx.t0.elapsed().as_millis() as u64),
+                error: None,
+            });
+        }
     }
 }
 
 /// Extract a complete SSE event from a byte buffer.
 ///
 /// SSE events are terminated by a double newline (`\n\n` or `\r\n\r\n`).
-/// Returns the extracted event and removes it from the buffer.
-fn extract_sse_event(buffer: &mut Vec<u8>) -> Option<Event> {
+/// Returns the extracted event with its raw data string and removes both
+/// from the buffer.
+fn extract_sse_event(buffer: &mut Vec<u8>) -> Option<(Event, String)> {
     let double_nl = find_double_newline(buffer)?;
     let event_bytes: Vec<u8> = buffer.drain(..double_nl).collect();
     let sep_len = detect_separator_len(buffer);
@@ -949,11 +1051,11 @@ fn extract_sse_event(buffer: &mut Vec<u8>) -> Option<Event> {
     }
 
     let data = data_lines.join("\n");
-    let mut event = Event::default().data(data);
+    let mut event = Event::default().data(data.clone());
     if let Some(et) = event_type {
         event = event.event(et);
     }
-    Some(event)
+    Some((event, data))
 }
 
 /// Find the position of a double newline (`\n\n` or `\r\n\r\n`) in the buffer.

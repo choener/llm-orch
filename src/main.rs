@@ -8,6 +8,7 @@ use tracing_subscriber::EnvFilter;
 mod apikeys;
 mod backend;
 mod config;
+mod debug_log;
 mod gpu;
 mod handlers;
 mod http_client;
@@ -156,12 +157,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Start HTTP server §7 ───────────────────────────────────────────
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let debug_loggers = Arc::new(debug_log::DebugLoggers::new());
     let app_state = server::AppState {
         config: Arc::clone(&shared_cfg),
         apikeys: Arc::clone(&shared_apikeys),
         manager: Arc::clone(&manager),
         client: manager.client().clone(),
         gpu: gpu_snapshot,
+        debug_loggers,
     };
     let server_task = tokio::spawn(server::serve(app_state, shutdown_rx));
 
