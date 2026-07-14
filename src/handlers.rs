@@ -744,7 +744,7 @@ async fn build_sse_stream(
 /// Holds an `InstanceHandle` so the in-flight slot is released when the
 /// stream is dropped (end of response or client disconnect).
 struct SseForwarder<S> {
-    inner: S,
+    inner: Option<S>,
     /// Accumulated partial line from previous chunks.
     buffer: Vec<u8>,
     /// Kept alive until the stream ends.
@@ -760,7 +760,7 @@ where
     fn new(stream: S, handle: InstanceHandle, model_name: String, instance_id: String) -> Self {
         debug!("SseForwarder::new: model={} inst={}", model_name, instance_id);
         Self {
-            inner: stream,
+            inner: Some(stream),
             buffer: Vec::new(),
             _handle: handle,
             model_name,
@@ -776,7 +776,13 @@ where
     type Item = Result<Event, Infallible>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        debug!("SseForwarder::poll_next: model={} inst={} buffer={} capacity={}", self.model_name, self.instance_id, self.buffer.len(), self.buffer.capacity());
+        // Fast path: stream already exhausted.
+        if self.inner.is_none() {
+            return Poll::Ready(None);
+        }
+        let model = self.model_name.clone();
+        let inst = self.instance_id.clone();
+        debug!("SseForwarder::poll_next: model={} inst={} buffer={} capacity={}", model, inst, self.buffer.len(), self.buffer.capacity());
         loop {
             // Try to extract a complete event from the buffer.
             if let Some(event) = extract_sse_event(&mut self.buffer) {
@@ -784,13 +790,18 @@ where
             }
 
             // Need more data — poll the inner stream.
-            match Pin::new(&mut self.inner).poll_next(cx) {
+            let inner = match self.inner.as_mut() {
+                Some(s) => s,
+                None => unreachable!(),
+            };
+            match Pin::new(inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
                     self.buffer.extend_from_slice(&chunk);
                     // Loop back to try extracting an event.
                 }
                 Poll::Ready(Some(Err(e))) => {
                     warn!(error = %e, "backend stream error");
+                    self.inner = None;
                     let error_event = Event::default()
                         .data(format!("{{\"error\":\"{}\"}}", e))
                         .event("error");
@@ -806,6 +817,7 @@ where
                         }
                     }
                     debug!("SseForwarder::poll_next: stream ended model={} inst={}", self.model_name, self.instance_id);
+                    self.inner = None;
                     return Poll::Ready(Some(Ok(Event::default().data("[DONE]"))));
                 }
                 Poll::Pending => return Poll::Pending,
