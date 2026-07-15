@@ -151,6 +151,9 @@ pub struct InstanceManager {
     /// Per-model semaphores to serialize `try_spawn` attempts.
     spawn_semaphores: tokio::sync::Mutex<HashMap<String, Arc<Semaphore>>>,
 
+    /// Per-model timestamp of the last autoscale action (cooldown enforcement).
+    last_scale_action: RwLock<HashMap<String, Instant>>,
+
     /// Sender side of the release-notification channel.
     /// Cloned into every `Instance` so `release_slot` can notify the
     /// background release-processing task without holding any locks.
@@ -200,6 +203,7 @@ impl InstanceManager {
             spawn_timeout: Duration::from_secs(120),
             model_metrics: RwLock::new(HashMap::new()),
             spawn_semaphores: tokio::sync::Mutex::new(HashMap::new()),
+            last_scale_action: RwLock::new(HashMap::new()),
             release_tx,
         };
         (mgr, release_rx)
@@ -230,11 +234,49 @@ impl InstanceManager {
             }
         }
 
+        // Autoscale spawn gate: only spawn if sustained load exceeds
+        // threshold (skip for cold-start, i.e. zero existing instances).
+        let should_spawn = if let Some(ref a) = cfg.autoscale {
+            if !a.enabled {
+                true
+            } else {
+                let num_existing = {
+                    self.instances.read().unwrap()
+                        .get(model_name).map(|l| l.len()).unwrap_or(0)
+                };
+                if num_existing == 0 {
+                    true // cold start — always spawn immediately
+                } else {
+                    let load_m5 = self.model_metrics.read().unwrap()
+                        .get(model_name)
+                        .map(|m| m.load_m5)
+                        .unwrap_or(0.0);
+                    let cap = (max_concurrent * num_existing) as f64;
+                    let threshold = a.scale_up_at * cap;
+                    if load_m5 <= threshold {
+                        debug!(
+                            model = %model_name,
+                            load_m5 = %load_m5,
+                            threshold = %threshold,
+                            "autoscale gate: load too low, queuing"
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                }
+            }
+        } else {
+            true // no autoscale config — spawn immediately
+        };
+
         // Slow path: try to spawn a new instance.
-        if let Some(handle) = self.try_spawn(model_name, cfg).await {
-            if handle.try_acquire(max_concurrent) {
-                self.record_metrics_event(model_name, 0);
-                return Some(handle);
+        if should_spawn {
+            if let Some(handle) = self.try_spawn(model_name, cfg).await {
+                if handle.try_acquire(max_concurrent) {
+                    self.record_metrics_event(model_name, 0);
+                    return Some(handle);
+                }
             }
         }
 
@@ -796,5 +838,106 @@ impl InstanceManager {
 
     pub fn model_metrics_snapshot(&self) -> HashMap<String, ModelMetrics> {
         self.model_metrics.read().unwrap().clone()
+    }
+
+    // ── Autoscaler ────────────────────────────────────────────────────
+
+    /// Evaluate autoscaling decisions for all models.
+    ///
+    /// Called periodically by a background task.  Uses `load_m5` for
+    /// scale-up decisions and `load_m15` for scale-down, with hysteresis
+    /// between the two thresholds and a per-model cooldown.
+    pub async fn evaluate_autoscale(&self) {
+        let now = Instant::now();
+        let metrics = self.model_metrics_snapshot();
+
+        // Snapshot configs for the iteration (cheap clone, small structs).
+        let configs: Vec<(String, ModelConfig)> = self
+            .model_configs
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        for (model_name, cfg) in &configs {
+            let a = match &cfg.autoscale {
+                Some(a) if a.enabled => a,
+                _ => continue,
+            };
+
+            // ── Cooldown ──────────────────────────────────────────
+            {
+                let last = self.last_scale_action.read().unwrap();
+                if let Some(t) = last.get(model_name) {
+                    if now.duration_since(*t).as_secs() < a.cooldown_secs {
+                        continue;
+                    }
+                }
+            }
+
+            let num_instances = {
+                self.instances.read().unwrap()
+                    .get(model_name)
+                    .map(|l| l.len())
+                    .unwrap_or(0)
+            };
+            if num_instances == 0 {
+                continue;
+            }
+
+            let m = match metrics.get(model_name) {
+                Some(m) => m,
+                None => continue,
+            };
+
+            // ── Scale-up (n → n+1) ─────────────────────────────
+            // Proactive: spawn when sustained load exceeds threshold,
+            // even if no incoming request triggers the request-path gate.
+            if num_instances < cfg.max_instances {
+                let capacity = (cfg.max_concurrent * num_instances) as f64;
+                if m.load_m5 > a.scale_up_at * capacity {
+                    info!(
+                        model = %model_name,
+                        load_m5 = %m.load_m5,
+                        threshold = %(a.scale_up_at * capacity),
+                        "autoscale: scaling up"
+                    );
+                    if self.try_spawn(model_name, cfg).await.is_some() {
+                        self.last_scale_action.write().unwrap()
+                            .insert(model_name.clone(), now);
+                        continue;
+                    }
+                }
+            }
+
+            // ── Scale-down (n → n−1) ─────────────────────────────
+            if num_instances > 1 {
+                let reduced_cap = (cfg.max_concurrent * (num_instances - 1)) as f64;
+                if m.load_m15 < a.scale_down_at * reduced_cap {
+                    let victim = self.pick_least_loaded(model_name);
+                    if let Some(handle) = victim {
+                        info!(
+                            model = %model_name,
+                            load_m15 = %m.load_m15,
+                            threshold = %(a.scale_down_at * reduced_cap),
+                            "autoscale: scaling down"
+                        );
+                        self.remove_instance(model_name, &handle).await;
+                        self.last_scale_action.write().unwrap()
+                            .insert(model_name.clone(), now);
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Return the instance handle with the fewest in-flight requests for
+    /// `model_name`, if any exist.
+    fn pick_least_loaded(&self, model_name: &str) -> Option<InstanceHandle> {
+        let instances = self.instances.read().unwrap();
+        let list = instances.get(model_name)?;
+        list.iter()
+            .min_by_key(|h| h.inner().lock().unwrap().in_flight)
+            .cloned()
     }
 }

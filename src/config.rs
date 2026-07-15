@@ -291,6 +291,12 @@ pub struct ModelConfig {
     /// as one JSON object per line.
     #[serde(default)]
     pub debug_log: Option<PathBuf>,
+
+    /// Optional load-based autoscaling configuration.
+    /// When set and enabled, instance spawn/despawn decisions use the
+    /// load EMA metrics instead of purely instantaneous saturation.
+    #[serde(default)]
+    pub autoscale: Option<AutoscaleConfig>,
 }
 
 fn default_max_instances() -> usize {
@@ -305,6 +311,45 @@ fn default_idle_ttl() -> u64 {
 fn default_queue_depth() -> usize {
     10
 }
+
+// ── Autoscale configuration ──────────────────────────────────────────────────
+
+/// Load-based autoscaling for a model.
+///
+/// When enabled, instance spawn/despawn decisions use hysteresis on the
+/// per-model load EMA metrics (`load_m5` for scale-up, `load_m15` for
+/// scale-down) instead of purely instantaneous saturation + fixed idle TTL.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AutoscaleConfig {
+    /// Enable load-based autoscaling for this model.
+    pub enabled: bool,
+
+    /// Fraction of `max_concurrent × current_instances` above which a new
+    /// instance is spawned.  Uses `load_m5` (5-minute EMA).
+    /// Example: 0.7 means spawn when sustained load exceeds 70% of capacity.
+    #[serde(default = "default_autoscale_up")]
+    pub scale_up_at: f64,
+
+    /// Fraction of `max_concurrent × (current_instances − 1)` below which
+    /// an instance is despawned.  Uses `load_m15` (15-minute EMA).
+    /// Example: 0.4 means despawn when the reduced instance count could
+    /// handle the load at under 40% of their capacity.
+    #[serde(default = "default_autoscale_down")]
+    pub scale_down_at: f64,
+
+    /// Minimum seconds between any scale action (up or down).
+    #[serde(default = "default_autoscale_cooldown")]
+    pub cooldown_secs: u64,
+
+    /// Seconds between autoscale evaluations.
+    #[serde(default = "default_autoscale_interval")]
+    pub interval_secs: u64,
+}
+
+fn default_autoscale_up() -> f64 { 0.7 }
+fn default_autoscale_down() -> f64 { 0.4 }
+fn default_autoscale_cooldown() -> u64 { 120 }
+fn default_autoscale_interval() -> u64 { 30 }
 
 // ---------------------------------------------------------------------------
 // Device mapping

@@ -147,6 +147,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Spawn the autoscaler background task.
+    // Periodically evaluates per-model load metrics and scales instances
+    // up or down with hysteresis to avoid reacting to brief bursts.
+    tokio::spawn({
+        let mgr = Arc::clone(&manager);
+        async move {
+            loop {
+                mgr.evaluate_autoscale().await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        }
+    });
+
     // Shared state for hot-reload.
     let shared_cfg = Arc::new(RwLock::new(cfg));
     let shared_apikeys = Arc::new(RwLock::new(apikeys));
