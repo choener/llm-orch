@@ -38,6 +38,10 @@ pub struct ModelMetrics {
     /// Total completed requests since daemon start.
     pub completions_total: u64,
 
+    /// Wall-clock time of the most recent activity (acquire, release, or
+    /// non-zero in-flight).  Used by the autoscaler for idle-TTL despawn.
+    pub last_activity: Instant,
+
     last_update: Instant,
     last_active: usize,
 }
@@ -52,6 +56,7 @@ impl Default for ModelMetrics {
             req_rate_m5: 0.0,
             req_rate_m15: 0.0,
             completions_total: 0,
+            last_activity: Instant::now(),
             last_update: Instant::now(),
             last_active: 0,
         }
@@ -65,6 +70,11 @@ impl ModelMetrics {
     /// The load averages decay with the *old* active count (which was present
     /// during the Δt interval), then record the new count for the next tick.
     fn tick(&mut self, now: Instant, active: usize, completions_delta: u64) {
+        // Bump last_activity on any non-zero load or completion.
+        if active > 0 || completions_delta > 0 {
+            self.last_activity = now;
+        }
+
         let dt = now.duration_since(self.last_update).as_secs_f64();
         if dt <= 0.0 {
             self.last_active = active;
@@ -859,21 +869,6 @@ impl InstanceManager {
             .collect();
 
         for (model_name, cfg) in &configs {
-            let a = match &cfg.autoscale {
-                Some(a) if a.enabled => a,
-                _ => continue,
-            };
-
-            // ── Cooldown ──────────────────────────────────────────
-            {
-                let last = self.last_scale_action.read().unwrap();
-                if let Some(t) = last.get(model_name) {
-                    if now.duration_since(*t).as_secs() < a.cooldown_secs {
-                        continue;
-                    }
-                }
-            }
-
             let num_instances = {
                 self.instances.read().unwrap()
                     .get(model_name)
@@ -888,6 +883,45 @@ impl InstanceManager {
                 Some(m) => m,
                 None => continue,
             };
+
+            // ── Final despawn (n → 0): idle-TTL on the last instance ────
+            // Always checked — does not require autoscale to be enabled.
+            // Despawns when: only one instance exists, load_m1 has decayed
+            // below 0.01 (no activity for several minutes), and wall-clock
+            // time since last activity exceeds idle_ttl.
+            if num_instances == 1
+                && m.load_m1 < 0.01
+                && now.duration_since(m.last_activity).as_secs() > cfg.idle_ttl
+            {
+                let handle = self.pick_least_loaded(model_name);
+                if let Some(h) = handle {
+                    let idle_secs = now.duration_since(m.last_activity).as_secs();
+                    info!(
+                        model = %model_name,
+                        idle_secs = %idle_secs,
+                        ttl = cfg.idle_ttl,
+                        "idle TTL expired, despawning last instance"
+                    );
+                    self.remove_instance(model_name, &h).await;
+                }
+                continue;
+            }
+
+            // ── Autoscale (n ↔ n±1): requires autoscale.enabled ────────
+            let a = match &cfg.autoscale {
+                Some(a) if a.enabled => a,
+                _ => continue,
+            };
+
+            // ── Cooldown ──────────────────────────────────────────
+            {
+                let last = self.last_scale_action.read().unwrap();
+                if let Some(t) = last.get(model_name) {
+                    if now.duration_since(*t).as_secs() < a.cooldown_secs {
+                        continue;
+                    }
+                }
+            }
 
             // ── Scale-up (n → n+1) ─────────────────────────────
             // Proactive: spawn when sustained load exceeds threshold,
