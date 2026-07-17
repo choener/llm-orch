@@ -49,12 +49,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing_subscriber::fmt()
             .json()
             .with_env_filter(env_filter)
-            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
             .init();
     } else {
         tracing_subscriber::fmt()
             .with_env_filter(env_filter)
-            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
             .init();
     }
 
