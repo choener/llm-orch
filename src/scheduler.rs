@@ -146,6 +146,9 @@ pub struct InstanceManager {
     /// Vulkan device index → PCI slot mapping (from config).
     vulkan_slots: HashMap<usize, String>,
 
+    /// Vulkan device index → VRAM limit in bytes (from config, optional).
+    vram_limits: HashMap<usize, u64>,
+
     /// GPU keep-alive manager (None if not configured).
     keepalive: Option<Arc<KeepAliveManager>>,
 
@@ -158,8 +161,10 @@ pub struct InstanceManager {
     /// Per-model EMA metrics (load & request rate).
     model_metrics: RwLock<HashMap<String, ModelMetrics>>,
 
-    /// Per-model semaphores to serialize `try_spawn` attempts.
-    spawn_semaphores: tokio::sync::Mutex<HashMap<String, Arc<Semaphore>>>,
+    /// Global semaphore to serialize all spawn attempts across models.
+    /// Prevents concurrent model loads from thrashing the SSD and
+    /// interleaving VRAM allocations.
+    spawn_semaphore: Arc<Semaphore>,
 
     /// Per-model timestamp of the last autoscale action (cooldown enforcement).
     last_scale_action: RwLock<HashMap<String, Instant>>,
@@ -195,6 +200,17 @@ impl InstanceManager {
             .map(|d| d.vulkan.clone())
             .unwrap_or_default();
 
+        let vram_limits: HashMap<usize, u64> = config
+            .devices
+            .as_ref()
+            .map(|d| {
+                d.vram_limit_mb
+                    .iter()
+                    .map(|(k, v)| (*k, *v * 1024 * 1024))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let (release_tx, release_rx) = mpsc::unbounded_channel();
 
         let mgr = Self {
@@ -208,11 +224,12 @@ impl InstanceManager {
             blocked: RwLock::new(HashMap::new()),
             gpu_snapshot,
             vulkan_slots,
+            vram_limits,
             keepalive,
             crash_limit: 3,
             spawn_timeout: Duration::from_secs(120),
             model_metrics: RwLock::new(HashMap::new()),
-            spawn_semaphores: tokio::sync::Mutex::new(HashMap::new()),
+            spawn_semaphore: Arc::new(Semaphore::new(1)),
             last_scale_action: RwLock::new(HashMap::new()),
             release_tx,
         };
@@ -365,14 +382,9 @@ impl InstanceManager {
     /// Attempt to spawn a new instance for `model`.  Returns `None` if the
     /// per-model instance cap has been reached.
     async fn try_spawn(&self, model_name: &str, cfg: &ModelConfig) -> Option<InstanceHandle> {
-        // Serialize spawn attempts per model.
-        let spawn_semaphore = {
-            let mut guard = self.spawn_semaphores.lock().await;
-            guard.entry(model_name.to_owned())
-                 .or_insert_with(|| Arc::new(Semaphore::new(1)))
-                 .clone()
-        };
-        let _permit = spawn_semaphore.acquire_owned().await.ok()?;
+        // Serialize all spawn attempts globally — prevents concurrent
+        // model loads from thrashing the SSD and interleaving VRAM.
+        let _permit = self.spawn_semaphore.clone().acquire_owned().await.ok()?;
 
         // Inside the semaphore: check instance cap.
         {
@@ -417,6 +429,21 @@ impl InstanceManager {
             .await
             .into_iter()
             .collect();
+
+        // Safety: when vulkan_devices is configured but no suitable GPU
+        // was found, fail the spawn instead of launching without GPU
+        // restriction (which would make the new instance compete on GPUs
+        // already occupied by existing instances).
+        if !cfg.vulkan_devices.is_empty() && gpu_indices.is_empty() {
+            warn!(
+                model = %model_name,
+                vulkan_devices = ?cfg.vulkan_devices,
+                "no suitable GPU available — refusing to spawn without GPU restriction"
+            );
+            self.ports.lock().await.free(port);
+            return None;
+        }
+
         let mut args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
         args.extend(self.backend.gpu_args(&gpu_indices));
         let envs = self.backend.gpu_env(&gpu_indices);
@@ -582,10 +609,17 @@ impl InstanceManager {
             };
 
             let used = vram_used.get(&vulkan_idx).copied().unwrap_or(0);
-            let free = gpu.vram_total_bytes.saturating_sub(used);
+            // Cap effective VRAM at the configured limit (if any) or the
+            // sysfs-reported total, whichever is smaller.
+            let capacity = self.vram_limits.get(&vulkan_idx)
+                .copied()
+                .map(|limit| limit.min(gpu.vram_total_bytes))
+                .unwrap_or(gpu.vram_total_bytes);
+            let free = capacity.saturating_sub(used);
             debug!(
                 model = %model_cfg.name, vulkan = vulkan_idx, slot = pci_slot,
                 vram_total_mb = gpu.vram_total_bytes / (1024 * 1024),
+                vram_limit_mb = capacity / (1024 * 1024),
                 vram_used_mb = used / (1024 * 1024),
                 vram_free_mb = free / (1024 * 1024),
                 model_mb = model_cfg.vram,

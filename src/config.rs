@@ -365,6 +365,12 @@ pub struct DevicesConfig {
     /// Vulkan device index → PCI slot name.
     #[serde(default)]
     pub vulkan: HashMap<usize, String>,
+
+    /// Optional per-GPU VRAM limit in MB.
+    /// Caps the usable VRAM below the sysfs-reported total, leaving
+    /// headroom for driver overhead.  When unset, sysfs total is used.
+    #[serde(default)]
+    pub vram_limit_mb: HashMap<usize, u64>,
 }
 
 /// List PCI slot names from `/sys/class/drm/card*/device/uevent`.
