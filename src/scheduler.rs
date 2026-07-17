@@ -816,7 +816,7 @@ impl InstanceManager {
 
     // ── Metrics ──────────────────────────────────────────────────────
 
-    fn queue_depth(&self, model_name: &str) -> usize {
+    pub fn queue_depth(&self, model_name: &str) -> usize {
         self.queues
             .read()
             .unwrap()

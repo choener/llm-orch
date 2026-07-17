@@ -156,7 +156,7 @@ pub async fn info_endpoint(
                 context_length: m.context_length,
                 instance_count: instance_counts.get(&m.name).copied().unwrap_or(0),
                 max_instances: m.max_instances,
-                queue_depth_used: 0, // TODO: expose from manager
+                queue_depth_used: state.manager.queue_depth(&m.name),
                 queue_depth_max: m.queue_depth,
                 blocked: state.manager.is_blocked(&m.name),
                 load_m1: mets.map(|x| x.load_m1).unwrap_or(0.0),
