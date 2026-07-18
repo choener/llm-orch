@@ -146,6 +146,9 @@ pub async fn info_endpoint(
     // ── 4. Read metrics snapshot. ──────────────────────────────────────
     let metrics_snapshot = state.manager.model_metrics_snapshot();
 
+    // ── 4b. Read recent completion records. ────────────────────────────
+    let recent_completions = state.manager.recent_completions_snapshot();
+
     // ── 5. Build response. ──────────────────────────────────────────────
     let model_infos: Vec<ModelInfo> = models
         .iter()
@@ -166,6 +169,10 @@ pub async fn info_endpoint(
                 req_rate_m5: mets.map(|x| x.req_rate_m5).unwrap_or(0.0),
                 req_rate_m15: mets.map(|x| x.req_rate_m15).unwrap_or(0.0),
                 completions_total: mets.map(|x| x.completions_total).unwrap_or(0),
+                recent_completions: recent_completions
+                    .get(&m.name)
+                    .cloned()
+                    .unwrap_or_default(),
             }
         })
         .collect();
@@ -236,7 +243,7 @@ pub async fn info_endpoint(
 /// **No lock guard crosses an `.await` boundary.**
 pub async fn chat_completions(
     State(state): State<AppState>,
-    _key: ApiKey,
+    key: ApiKey,
     Json(mut request): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -381,6 +388,35 @@ pub async fn chat_completions(
         }
 
         log_completion(&response_body, &model_name, &instance_id, elapsed);
+
+        // Record in per-model ring buffer for /admin/status.
+        {
+            let prompt_tokens = response_body
+                .pointer("/usage/prompt_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let gen_tokens = response_body
+                .pointer("/usage/completion_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let cached_tokens = response_body
+                .pointer("/usage/prompt_tokens_details/cached_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            state.manager.record_completion(
+                &model_name,
+                crate::types::CompletionRecord {
+                    ts: crate::debug_log::ts_now(),
+                    request_id: request_id.clone(),
+                    instance_id: instance_id.clone(),
+                    api_user: key.label.clone(),
+                    prompt_tokens,
+                    generated_tokens: gen_tokens,
+                    cached_tokens,
+                    duration_ms: elapsed.as_millis() as u64,
+                },
+            );
+        }
 
         Ok(Json(response_body).into_response())
     }

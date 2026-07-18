@@ -266,6 +266,9 @@ pub struct ModelInfo {
     pub req_rate_m15: f64,
     /// Total completed requests since daemon start.
     pub completions_total: u64,
+    /// Last N completion records (ring buffer, newest first).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recent_completions: Vec<CompletionRecord>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -358,6 +361,22 @@ pub struct AdminModelAction {
 pub struct AdminResponse {
     pub status: String,
     pub message: String,
+}
+
+// ── Completion tracking (for /admin/status) ──────────────────────────────────
+
+/// A single completed request, stored in a per-model ring buffer.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletionRecord {
+    /// Unix timestamp with milliseconds.
+    pub ts: String,
+    pub request_id: String,
+    pub instance_id: String,
+    pub api_user: String,
+    pub prompt_tokens: u64,
+    pub generated_tokens: u64,
+    pub cached_tokens: u64,
+    pub duration_ms: u64,
 }
 
 // ── Serialization helpers ────────────────────────────────────────────────────

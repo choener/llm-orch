@@ -6,6 +6,7 @@
 use crate::backend::{shutdown_child, spawn_process, mark_instance_ready, Backend, LlamaCppBackend};
 use crate::config::ModelConfig;
 use crate::gpu::GpuMetrics;
+use crate::types::CompletionRecord;
 use crate::http_client;
 use crate::instance::{Instance, InstanceHandle, InstanceState};
 use crate::keepalive::KeepAliveManager;
@@ -169,6 +170,9 @@ pub struct InstanceManager {
     /// Per-model timestamp of the last autoscale action (cooldown enforcement).
     last_scale_action: RwLock<HashMap<String, Instant>>,
 
+    /// Per-model ring buffer of recent completion records (newest first).
+    recent_completions: RwLock<HashMap<String, Vec<CompletionRecord>>>,
+
     /// Sender side of the release-notification channel.
     /// Cloned into every `Instance` so `release_slot` can notify the
     /// background release-processing task without holding any locks.
@@ -231,6 +235,7 @@ impl InstanceManager {
             model_metrics: RwLock::new(HashMap::new()),
             spawn_semaphore: Arc::new(Semaphore::new(1)),
             last_scale_action: RwLock::new(HashMap::new()),
+            recent_completions: RwLock::new(HashMap::new()),
             release_tx,
         };
         (mgr, release_rx)
@@ -882,6 +887,31 @@ impl InstanceManager {
 
     pub fn model_metrics_snapshot(&self) -> HashMap<String, ModelMetrics> {
         self.model_metrics.read().unwrap().clone()
+    }
+
+    /// Record a completed request in the per-model ring buffer.
+    /// Keeps at most 5 entries per model, newest first.
+    pub fn record_completion(
+        &self,
+        model_name: &str,
+        record: CompletionRecord,
+    ) {
+        let mut completions = self.recent_completions.write().unwrap();
+        let entries = completions.entry(model_name.to_owned()).or_default();
+        entries.insert(0, record);
+        entries.truncate(5);
+    }
+
+    /// Snapshot of recent completions per model for the info endpoint.
+    pub fn recent_completions_snapshot(
+        &self,
+    ) -> HashMap<String, Vec<CompletionRecord>> {
+        self.recent_completions
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     // ── Autoscaler ────────────────────────────────────────────────────
