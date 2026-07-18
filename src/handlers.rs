@@ -38,12 +38,14 @@ use axum::{
 use futures_util::stream::Stream;
 use std::convert::Infallible;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tracing::{debug, info, warn};
 
 use crate::config::AliasConfig;
 use crate::debug_log::{DebugLogEntry, DebugStreamContext, ts_now};
 use crate::instance::InstanceHandle;
+use crate::scheduler::InstanceManager;
 use crate::server::{ApiKey, ApiError, AppState};
 use crate::types::*;
 use tracing::Instrument;
@@ -148,6 +150,9 @@ pub async fn info_endpoint(
 
     // ── 4b. Read recent completion records. ────────────────────────────
     let recent_completions = state.manager.recent_completions_snapshot();
+    for (name, recs) in &recent_completions {
+        debug!(model = %name, count = recs.len(), "recent completions");
+    }
 
     // ── 5. Build response. ──────────────────────────────────────────────
     let model_infos: Vec<ModelInfo> = models
@@ -343,6 +348,7 @@ pub async fn chat_completions(
             model_name: model_name.clone(),
             alias: Some(request_model.clone()),
             instance_id: instance_id.clone(),
+            api_user: key.label.clone(),
             t0: std::time::Instant::now(),
         });
         let stream = build_sse_stream(
@@ -353,6 +359,9 @@ pub async fn chat_completions(
             model_name.clone(),
             instance_id.clone(),
             debug_ctx,
+            state.manager.clone(),
+            key.label.clone(),
+            request_id.clone(),
         )
         .await
         .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
@@ -500,6 +509,9 @@ pub async fn completions(
             model_name.clone(),
             instance_id.clone(),
             None,
+            state.manager.clone(),
+            String::new(),
+            String::new(),
         )
         .await
         .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
@@ -880,6 +892,9 @@ async fn build_sse_stream(
     model_name: String,
     instance_id: String,
     debug: Option<DebugStreamContext>,
+    manager: Arc<InstanceManager>,
+    api_user: String,
+    request_id: String,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>, reqwest::Error> {
     let resp = client
         .post(&backend_url)
@@ -930,7 +945,7 @@ async fn build_sse_stream(
 
     // Success — forward the byte stream as SSE events.
     let byte_stream = resp.bytes_stream();
-    let sse_stream = SseForwarder::new(byte_stream, handle, model_name, instance_id, debug);
+    let sse_stream = SseForwarder::new(byte_stream, handle, model_name, instance_id, debug, manager, api_user, request_id);
 
     Ok(Box::pin(sse_stream))
 }
@@ -949,9 +964,14 @@ struct SseForwarder<S> {
     /// Debug log context + accumulated SSE data chunks (logged on Drop).
     debug: Option<DebugStreamContext>,
     chunks: Vec<String>,
+    /// Used to record completion stats on stream end.
+    manager: Arc<InstanceManager>,
+    model_name: String,
+    api_user: String,
+    request_id: String,
+    t0: std::time::Instant,
     /// Kept alive until the stream ends.
     _handle: InstanceHandle,
-    model_name: String,
     instance_id: String,
 }
 
@@ -959,15 +979,19 @@ impl<S> SseForwarder<S>
 where
     S: Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
 {
-    fn new(stream: S, handle: InstanceHandle, model_name: String, instance_id: String, debug: Option<DebugStreamContext>) -> Self {
+    fn new(stream: S, handle: InstanceHandle, model_name: String, instance_id: String, debug: Option<DebugStreamContext>, manager: Arc<InstanceManager>, api_user: String, request_id: String) -> Self {
         debug!("SseForwarder::new: model={} inst={}", model_name, instance_id);
         Self {
             inner: Some(stream),
             buffer: Vec::new(),
             debug,
             chunks: Vec::new(),
-            _handle: handle,
+            manager,
             model_name,
+            api_user,
+            request_id,
+            t0: std::time::Instant::now(),
+            _handle: handle,
             instance_id,
         }
     }
@@ -990,8 +1014,8 @@ where
         loop {
             // Try to extract a complete event from the buffer.
             if let Some((event, data)) = extract_sse_event(&mut self.buffer) {
-                // Accumulate raw data for debug logging.
-                if self.debug.is_some() && !data.is_empty() && data != "[DONE]" {
+                // Accumulate raw data for completion recording and debug logging.
+                if !data.is_empty() && data != "[DONE]" {
                     self.chunks.push(data);
                 }
                 return Poll::Ready(Some(Ok(event)));
@@ -1037,6 +1061,44 @@ where
 impl<S> Drop for SseForwarder<S> {
     fn drop(&mut self) {
         debug!("SseForwarder::drop: model={} inst={}", self.model_name, self.instance_id);
+
+        // Record completion from streaming chunks: parse the last chunk
+        // for usage data and write to the ring buffer.
+        let mut prompt_tokens = 0u64;
+        let mut gen_tokens = 0u64;
+        let mut cached_tokens = 0u64;
+        for chunk in self.chunks.iter().rev() {
+            if chunk == "[DONE]" {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(chunk) {
+                if let Some(usage) = v.get("usage") {
+                    prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    gen_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    cached_tokens = usage
+                        .pointer("/prompt_tokens_details/cached_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    break;
+                }
+            }
+        }
+        let duration_ms = self.t0.elapsed().as_millis() as u64;
+
+        self.manager.record_completion(
+            &self.model_name,
+            crate::types::CompletionRecord {
+                ts: crate::debug_log::ts_now(),
+                request_id: self.request_id.clone(),
+                instance_id: self.instance_id.clone(),
+                api_user: self.api_user.clone(),
+                prompt_tokens,
+                generated_tokens: gen_tokens,
+                cached_tokens,
+                duration_ms,
+            },
+        );
+
         // Debug log: streaming response (logged on drop so we capture partial
         // output even on client disconnect).
         if let Some(ctx) = self.debug.take() {
@@ -1051,7 +1113,7 @@ impl<S> Drop for SseForwarder<S> {
                 stream: Some(true),
                 body: Some(body),
                 usage: None,
-                duration_ms: Some(ctx.t0.elapsed().as_millis() as u64),
+                duration_ms: Some(duration_ms),
                 error: None,
             });
         }

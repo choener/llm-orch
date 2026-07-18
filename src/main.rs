@@ -168,6 +168,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Start HTTP server §7 ───────────────────────────────────────────
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "llm-orch starting (types-idempotent, debug-log, autoscale)"
+    );
     let debug_loggers = Arc::new(debug_log::DebugLoggers::new());
     let app_state = server::AppState {
         config: Arc::clone(&shared_cfg),

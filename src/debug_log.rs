@@ -107,7 +107,7 @@ pub struct DebugLogEntry {
 // ── Stream context ───────────────────────────────────────────────────────────
 
 /// Carried into a streaming response so the accumulated chunks can be logged
-/// when the stream ends (in `Drop`).
+/// when the stream ends (in `Drop`) and completion records can be written.
 pub struct DebugStreamContext {
     pub loggers: Arc<DebugLoggers>,
     pub path: PathBuf,
@@ -115,6 +115,7 @@ pub struct DebugStreamContext {
     pub model_name: String,
     pub alias: Option<String>,
     pub instance_id: String,
+    pub api_user: String,
     pub t0: Instant,
 }
 

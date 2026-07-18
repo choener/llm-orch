@@ -896,6 +896,15 @@ impl InstanceManager {
         model_name: &str,
         record: CompletionRecord,
     ) {
+        info!(
+            model = %model_name,
+            user = %record.api_user,
+            prompt = record.prompt_tokens,
+            generated = record.generated_tokens,
+            cached = record.cached_tokens,
+            duration_ms = record.duration_ms,
+            "completion recorded"
+        );
         let mut completions = self.recent_completions.write().unwrap();
         let entries = completions.entry(model_name.to_owned()).or_default();
         entries.insert(0, record);
