@@ -573,7 +573,7 @@ impl InstanceManager {
             let mut used = HashMap::new();
             for (model_name, list) in instances.iter() {
                 let model_vram = self.model_configs.get(model_name)
-                    .map(|c| c.vram)
+                    .map(|c| c.vram * 1024 * 1024)
                     .unwrap_or(0);
                 for handle in list {
                     let inst = handle.inner().lock().unwrap();
