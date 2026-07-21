@@ -96,44 +96,54 @@ pub async fn spawn_process(
 
 // ── Readiness detection ──────────────────────────────────────────────────────
 
-/// Poll a backend instance's `/health` endpoint until it returns 200 or the
-/// timeout expires.
-pub async fn wait_until_ready(
-    client: &Client,
-    health_url: &str,
-    timeout: Duration,
-) -> bool {
-    let start = tokio::time::Instant::now();
-    loop {
-        if start.elapsed() >= timeout {
-            return false;
-        }
-        match client.get(health_url).send().await {
-            Ok(resp) if resp.status().is_success() => return true,
-            _ => tokio::time::sleep(Duration::from_millis(200)).await,
-        }
-    }
+/// Outcome of a readiness poll phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadyOutcome {
+    /// `/health` returned success — the instance was marked `Ready`.
+    Ready,
+    /// The child process exited before becoming healthy.
+    ChildExited,
+    /// Neither ready nor dead within the deadline.
+    TimedOut,
 }
 
-/// Poll the instance's health endpoint and update its state accordingly.
-/// Returns `true` if the instance became ready.
-pub async fn mark_instance_ready(
+/// Poll the instance's `/health` endpoint until it returns 200, the child
+/// process exits, or the timeout expires.
+///
+/// Checking `try_wait` on every iteration fails the spawn fast when the
+/// backend dies instantly (bad command, port collision, missing model
+/// file) instead of waiting out the full timeout.
+pub async fn poll_readiness(
     handle: &InstanceHandle,
     client: &Client,
     backend: &dyn Backend,
     timeout: Duration,
-) -> bool {
+) -> ReadyOutcome {
     let url = {
         let inst = handle.inner().lock().unwrap();
         backend.health_url(inst.port)
     };
-
-    if wait_until_ready(client, &url, timeout).await {
-        handle.inner().lock().unwrap().mark_ready();
-        true
-    } else {
-        handle.inner().lock().unwrap().mark_failed();
-        false
+    let start = tokio::time::Instant::now();
+    loop {
+        if start.elapsed() >= timeout {
+            return ReadyOutcome::TimedOut;
+        }
+        // Early exit: is the process already dead?
+        {
+            let mut inst = handle.inner().lock().unwrap();
+            if let Some(child) = inst.child.as_mut() {
+                if !matches!(child.try_wait(), Ok(None)) {
+                    return ReadyOutcome::ChildExited;
+                }
+            }
+        }
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                handle.inner().lock().unwrap().mark_ready();
+                return ReadyOutcome::Ready;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
     }
 }
 
@@ -179,5 +189,53 @@ pub async fn shutdown_child(child: &mut tokio::process::Child, drain_timeout: Du
             // Wait with a timeout — stuck D-state processes may never exit.
             let _ = tokio::time::timeout(Duration::from_secs(10), child.wait()).await;
         }
+    }
+}
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::instance::Instance;
+
+    #[tokio::test]
+    async fn poll_readiness_detects_instant_child_exit() {
+        // A child that exits immediately must fail readiness fast —
+        // not after the full spawn timeout.
+        let child = spawn_process("true", &[], &[]).await.unwrap();
+        let mut inst = Instance::new("m", vec![], 9, None);
+        inst.child = Some(child);
+        let handle = InstanceHandle::new(inst);
+        let client = Client::new();
+        let backend = LlamaCppBackend;
+
+        let t0 = std::time::Instant::now();
+        let outcome =
+            poll_readiness(&handle, &client, &backend, Duration::from_secs(30)).await;
+        assert_eq!(outcome, ReadyOutcome::ChildExited);
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "instant child exit must be detected fast, took {:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_readiness_times_out_for_unresponsive_backend() {
+        // A live child that never serves /health must time out, not be
+        // mistaken for a crash.
+        let child = spawn_process("sleep", &["30".into()], &[]).await.unwrap();
+        let mut inst = Instance::new("m", vec![], 9, None);
+        inst.child = Some(child);
+        let handle = InstanceHandle::new(inst);
+        let client = Client::builder()
+            .connect_timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let backend = LlamaCppBackend;
+
+        let outcome =
+            poll_readiness(&handle, &client, &backend, Duration::from_millis(600)).await;
+        assert_eq!(outcome, ReadyOutcome::TimedOut);
     }
 }

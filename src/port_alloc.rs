@@ -184,10 +184,17 @@ mod tests {
     #[test]
     fn port_is_free_detects_used_port() {
         // Bind a port, check it's not free, then release it.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        assert!(!port_is_free(port));
-        drop(listener);
-        assert!(port_is_free(port));
+        // Retry the free-check: parallel tests race on the ephemeral port
+        // space — another test may grab our port between drop and check.
+        for _ in 0..10 {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            assert!(!port_is_free(port));
+            drop(listener);
+            if port_is_free(port) {
+                return;
+            }
+        }
+        panic!("port_is_free never observed the released port as free");
     }
 }

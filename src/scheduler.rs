@@ -3,7 +3,7 @@
 // Central scheduler: owns the map of model → running instances, handles
 // spawning, slot acquisition, queueing, idle eviction, and shutdown.
 
-use crate::backend::{shutdown_child, spawn_process, mark_instance_ready, Backend, LlamaCppBackend};
+use crate::backend::{poll_readiness, shutdown_child, spawn_process, Backend, LlamaCppBackend, ReadyOutcome};
 use crate::config::ModelConfig;
 use crate::gpu::GpuMetrics;
 use crate::types::CompletionRecord;
@@ -630,18 +630,16 @@ impl InstanceManager {
         // over from a previous despawn — while it is still loading.
         self.touch_activity(model_name);
 
-        // Wait for readiness (with timeout).
-        if !mark_instance_ready(&handle, &self.client, &self.backend, self.spawn_timeout).await {
+        // Wait for readiness (with timeout).  The poll fails fast when
+        // the child exits before becoming healthy instead of waiting out
+        // the full spawn timeout.
+        let outcome =
+            poll_readiness(&handle, &self.client, &self.backend, self.spawn_timeout).await;
+        if outcome != ReadyOutcome::Ready {
             // Distinguish a dead process (pre-output crash — counts toward
             // the model block limit) from a live-but-slow load (no count).
-            let child_exited = {
-                let mut inst_lock = handle.inner().lock().unwrap();
-                match inst_lock.child.as_mut() {
-                    Some(c) => !matches!(c.try_wait(), Ok(None)),
-                    None => false,
-                }
-            };
-            warn!(model = %model_name, port = port, exited = child_exited, "health check timeout — shutting down instance");
+            let child_exited = outcome == ReadyOutcome::ChildExited;
+            warn!(model = %model_name, port = port, exited = child_exited, "instance did not become ready — shutting down");
             let mut child_to_kill = {
                 let mut inst_lock = handle.inner().lock().unwrap();
                 inst_lock.state = InstanceState::Failed;
@@ -659,12 +657,6 @@ impl InstanceManager {
             }
 
             return None;
-        }
-
-        // Mark ready.
-        {
-            let mut inst_lock = handle.inner().lock().unwrap();
-            inst_lock.state = InstanceState::Ready;
         }
 
         // A successful spawn resets the consecutive pre-output crash counter.
