@@ -201,7 +201,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = cli.config.clone();
     let apikeys_path = shared_cfg.read().await.apikeys_file.clone();
     let (reload_tx, mut reload_rx) = broadcast::channel::<watcher::FileChange>(16);
-    let _watcher = match watcher::watch_paths(
+    let watcher_tx = reload_tx.clone();
+    // Behind a lock so the reload task can rebuild the watcher when the
+    // apikeys path changes on reload.  Dropping the handle stops watching.
+    let watch_handle = Arc::new(Mutex::new(None::<watcher::WatchHandle>));
+    *watch_handle.lock().await = match watcher::watch_paths(
         vec![config_path.clone(), apikeys_path.clone()],
         reload_tx,
         Duration::from_secs(2),
@@ -224,12 +228,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let manager = Arc::clone(&manager);
         let last_mtime = Arc::clone(&last_reload_mtime);
         let last_ak_mtime = Arc::clone(&last_apikeys_mtime);
+        let watch_handle = Arc::clone(&watch_handle);
         async move {
+            // The apikeys path currently being watched — updated when a
+            // config reload points us at a different file.
+            let mut watched_apikeys = apikeys_path.clone();
             while let Ok(event) = reload_rx.recv().await {
                 // The watcher already pre-filters to our watched paths.
                 // Determine which file changed by comparing to canonical paths.
                 let cfg_p = config_path.canonicalize().ok();
-                let ak_p = apikeys_path.canonicalize().ok();
+                let ak_p = watched_apikeys.canonicalize().ok();
                 let changed = event.path.canonicalize().ok();
 
                 match (&changed, &cfg_p) {
@@ -245,6 +253,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         handle_apikeys_reload(&event.path, &apikeys, &last_ak_mtime).await;
                     }
                     _ => {}
+                }
+
+                // If a config reload changed the apikeys path, rebuild the
+                // watcher to follow the new file (replacing the handle
+                // drops the old watcher).
+                let current_apikeys = cfg.read().await.apikeys_file.clone();
+                if current_apikeys != watched_apikeys {
+                    match watcher::watch_paths(
+                        vec![config_path.clone(), current_apikeys.clone()],
+                        watcher_tx.clone(),
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    {
+                        Ok(wh) => {
+                            info!(
+                                "apikeys path changed — now watching {}",
+                                current_apikeys.display()
+                            );
+                            *watch_handle.lock().await = Some(wh);
+                            watched_apikeys = current_apikeys;
+                        }
+                        Err(e) => {
+                            warn!("watcher rebuild failed (keeping old watch set): {}", e);
+                        }
+                    }
                 }
             }
         }
@@ -300,7 +334,7 @@ async fn handle_config_reload(
     path: &std::path::Path,
     cfg: &Arc<RwLock<config::Config>>,
     apikeys: &Arc<RwLock<apikeys::ApikeysStore>>,
-    _manager: &Arc<scheduler::InstanceManager>,
+    manager: &Arc<scheduler::InstanceManager>,
     last_mtime: &Arc<Mutex<Option<std::time::SystemTime>>>,
 ) {
     // Skip if the file's mtime hasn't changed since our last reload.
@@ -336,14 +370,18 @@ async fn handle_config_reload(
                 }
             }
 
+            // Reconcile the instance manager (model defs, cmd aliases,
+            // device maps, port range, keep-alive, crash blocks) before
+            // swapping the shared config that handlers validate against.
+            manager.reconcile_config(&new_cfg).await;
+
             // Atomic swap.
             let model_count = new_cfg.models.len();
             *cfg.write().await = new_cfg;
             info!(
-                "config reloaded successfully — {} model(s), server config may have changed",
+                "config reloaded successfully — {} model(s)",
                 model_count
             );
-            // TODO: reconcile InstanceManager model list changes.
         }
         Err(e) => {
             error!("config reload rejected (keeping old): {}", e);

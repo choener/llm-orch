@@ -97,6 +97,17 @@ impl PortAllocator {
         self.used.remove(&port);
     }
 
+    /// Update the configured allocation strategy (config hot-reload).
+    /// Currently-used ports stay tracked; the sequential scan restarts
+    /// from the new range's start.
+    pub fn set_range(&mut self, range: PortRange) {
+        self.next = match &range {
+            PortRange::Range { start, .. } => *start,
+            PortRange::EphemeralWord(_) => 0,
+        };
+        self.range = range;
+    }
+
     /// Number of ports currently in use.
     #[allow(dead_code)]
     pub fn used_count(&self) -> usize {

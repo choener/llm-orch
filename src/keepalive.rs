@@ -110,6 +110,13 @@ impl KeepAliveManager {
         }
     }
 
+    /// Whether this manager was built from the same keep-alive config
+    /// (used to decide whether a config reload requires a rebuild).
+    pub fn matches(&self, cfg: &Option<KeepAliveConfig>) -> bool {
+        let amd = cfg.as_ref().and_then(|k| k.amd.as_ref());
+        amd == Some(&self.cfg)
+    }
+
     /// Stop all keep-alive tasks.
     pub fn stop_all(&self) {
         let tasks: Vec<_> = {

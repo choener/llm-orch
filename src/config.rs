@@ -405,7 +405,7 @@ pub struct KeepAliveConfig {
     pub amd: Option<GpuKeepAlive>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct GpuKeepAlive {
     /// Command to run.  `{index}` is substituted with the GPU index.
     pub cmd: String,

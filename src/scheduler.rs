@@ -136,10 +136,11 @@ pub struct InstanceManager {
     ports: Mutex<PortAllocator>,
 
     /// Per-model configuration, indexed by model name.
-    model_configs: HashMap<String, ModelConfig>,
+    /// Swapped on config hot-reload (`reconcile_config`).
+    model_configs: RwLock<HashMap<String, ModelConfig>>,
 
     /// Named `{key}` → value fragments from `cmd_aliases`.
-    cmd_aliases: HashMap<String, String>,
+    cmd_aliases: RwLock<HashMap<String, String>>,
 
     /// Running instances, keyed by model name.
     instances: RwLock<HashMap<String, Vec<InstanceHandle>>>,
@@ -160,13 +161,14 @@ pub struct InstanceManager {
     gpu_snapshot: Arc<tokio::sync::RwLock<Vec<GpuMetrics>>>,
 
     /// Vulkan device index → PCI slot mapping (from config).
-    vulkan_slots: HashMap<usize, String>,
+    vulkan_slots: RwLock<HashMap<usize, String>>,
 
     /// Vulkan device index → VRAM limit in bytes (from config, optional).
-    vram_limits: HashMap<usize, u64>,
+    vram_limits: RwLock<HashMap<usize, u64>>,
 
     /// GPU keep-alive manager (None if not configured).
-    keepalive: Option<Arc<KeepAliveManager>>,
+    /// Rebuilt on config hot-reload when the keep-alive section changes.
+    keepalive: RwLock<Option<Arc<KeepAliveManager>>>,
 
     /// Crash limit before a model is blocked.
     crash_limit: usize,
@@ -254,16 +256,16 @@ impl InstanceManager {
             client: http_client::build(),
             backend: LlamaCppBackend,
             ports: Mutex::new(PortAllocator::new(config.server.port_range.clone())),
-            model_configs,
-            cmd_aliases: config.cmd_aliases.clone(),
+            model_configs: RwLock::new(model_configs),
+            cmd_aliases: RwLock::new(config.cmd_aliases.clone()),
             instances: RwLock::new(HashMap::new()),
             queues: RwLock::new(HashMap::new()),
             next_queue_id: AtomicU64::new(0),
             blocked: RwLock::new(HashMap::new()),
             gpu_snapshot,
-            vulkan_slots,
-            vram_limits,
-            keepalive,
+            vulkan_slots: RwLock::new(vulkan_slots),
+            vram_limits: RwLock::new(vram_limits),
+            keepalive: RwLock::new(keepalive),
             crash_limit: 3,
             spawn_timeout: Duration::from_secs(120),
             model_metrics: RwLock::new(HashMap::new()),
@@ -291,7 +293,10 @@ impl InstanceManager {
             return None;
         }
 
-        let cfg = self.model_configs.get(model_name)?;
+        // Clone the model config out of the lock — it may be swapped by a
+        // config reload at any time, and the guard must not be held across
+        // the awaits below.
+        let cfg = self.model_configs.read().unwrap().get(model_name).cloned()?;
         let max_concurrent = cfg.max_concurrent;
 
         // Fast path: find a ready instance with spare capacity.
@@ -340,7 +345,7 @@ impl InstanceManager {
 
         // Slow path: try to spawn a new instance.
         if should_spawn {
-            if let Some(handle) = self.try_spawn(model_name, cfg).await {
+            if let Some(handle) = self.try_spawn(model_name, &cfg).await {
                 if let Some(guard) = handle.try_acquire(max_concurrent) {
                     self.record_metrics_event(model_name, 0);
                     // Serve a parked waiter with any leftover capacity —
@@ -450,7 +455,7 @@ impl InstanceManager {
 
     /// Wake the first queued waiter for `model_name` if an instance is available.
     pub(crate) fn wake_one(&self, model_name: &str) {
-        let cfg = match self.model_configs.get(model_name) {
+        let cfg = match self.model_configs.read().unwrap().get(model_name).cloned() {
             Some(c) => c,
             None => return,
         };
@@ -647,13 +652,15 @@ impl InstanceManager {
         info!(model = %model_name, inst = %instance_id, port = port, "spawn succeeded");
 
         // Start keep-alive for the GPU(s) this instance occupies.
-        if let Some(ref ka) = self.keepalive {
+        let keepalive = self.keepalive.read().unwrap().clone();
+        if let Some(ref ka) = keepalive {
             let gpus = {
                 let inst = handle.inner().lock().unwrap();
                 inst.gpu_indices.clone()
             };
+            let vulkan_slots = self.vulkan_slots.read().unwrap();
             for vulkan_idx in &gpus {
-                if let Some(slot) = self.vulkan_slots.get(vulkan_idx) {
+                if let Some(slot) = vulkan_slots.get(vulkan_idx) {
                     ka.ensure_running(slot);
                 }
             }
@@ -665,7 +672,8 @@ impl InstanceManager {
     /// Resolve `cmd_aliases` and `{port}` in the model's command string.
     fn resolve_cmd(&self, cfg: &ModelConfig, port: u16) -> String {
         let mut resolved = cfg.cmd.clone();
-        for (key, value) in &self.cmd_aliases {
+        let cmd_aliases = self.cmd_aliases.read().unwrap();
+        for (key, value) in cmd_aliases.iter() {
             let placeholder = format!("{{{}}}", key);
             resolved = resolved.replace(&placeholder, value);
         }
@@ -675,10 +683,14 @@ impl InstanceManager {
     /// Pick a Vulkan device for a new instance from the model's `vulkan_devices` pool.
     async fn select_gpu_for_model(&self, model_cfg: &ModelConfig) -> Option<usize> {
         let vulkan_devices = &model_cfg.vulkan_devices;
-        if vulkan_devices.is_empty() || self.vulkan_slots.is_empty() {
+        // Clone the (tiny) device maps — std RwLock guards are !Send and
+        // must not live across the gpu_snapshot await below.
+        let vulkan_slots = self.vulkan_slots.read().unwrap().clone();
+        if vulkan_devices.is_empty() || vulkan_slots.is_empty() {
             debug!(model = %model_cfg.name, "no vulkan_devices configured");
             return None;
         }
+        let vram_limits = self.vram_limits.read().unwrap().clone();
 
         let gpus = self.gpu_snapshot.read().await;
         debug!(
@@ -707,7 +719,7 @@ impl InstanceManager {
             let instances = self.instances.read().unwrap();
             let mut used = HashMap::new();
             for (model_name, list) in instances.iter() {
-                let model_vram = self.model_configs.get(model_name)
+                let model_vram = self.model_configs.read().unwrap().get(model_name)
                     .map(|c| c.vram * 1024 * 1024)
                     .unwrap_or(0);
                 for handle in list {
@@ -728,7 +740,7 @@ impl InstanceManager {
                 continue;
             }
 
-            let pci_slot = match self.vulkan_slots.get(&vulkan_idx) {
+            let pci_slot = match vulkan_slots.get(&vulkan_idx) {
                 Some(s) => s.as_str(),
                 None => {
                     debug!(model = %model_cfg.name, vulkan = vulkan_idx, "slot not in device map");
@@ -746,7 +758,7 @@ impl InstanceManager {
             let used = vram_used.get(&vulkan_idx).copied().unwrap_or(0);
             // Cap effective VRAM at the configured limit (if any) or the
             // sysfs-reported total, whichever is smaller.
-            let capacity = self.vram_limits.get(&vulkan_idx)
+            let capacity = vram_limits.get(&vulkan_idx)
                 .copied()
                 .map(|limit| limit.min(gpu.vram_total_bytes))
                 .unwrap_or(gpu.vram_total_bytes);
@@ -827,6 +839,8 @@ impl InstanceManager {
             for (model, list) in instances.iter() {
                 let ttl = self
                     .model_configs
+                    .read()
+                    .unwrap()
                     .get(model.as_str())
                     .map(|c| c.idle_ttl)
                     .unwrap_or(300);
@@ -890,7 +904,8 @@ impl InstanceManager {
         }
         self.drain_queue_if_no_instances(model_name);
 
-        if let Some(ref ka) = self.keepalive {
+        let keepalive = self.keepalive.read().unwrap().clone();
+        if let Some(ref ka) = keepalive {
             for vulkan_idx in gpu_indices {
                 let still_in_use = {
                     let instances = self.instances.read().unwrap();
@@ -900,8 +915,9 @@ impl InstanceManager {
                     })
                 };
                 if !still_in_use {
-                    if let Some(slot) = self.vulkan_slots.get(vulkan_idx) {
-                        ka.stop(slot);
+                    let slot = self.vulkan_slots.read().unwrap().get(vulkan_idx).cloned();
+                    if let Some(slot) = slot {
+                        ka.stop(&slot);
                     }
                 }
             }
@@ -1032,8 +1048,107 @@ impl InstanceManager {
             self.remove_instance(&model_name, &handle).await;
         }
 
-        if let Some(ref ka) = self.keepalive {
+        let keepalive = self.keepalive.read().unwrap().clone();
+        if let Some(ref ka) = keepalive {
             ka.stop_all();
+        }
+    }
+
+    // ── config hot-reload ────────────────────────────────────────────────
+
+    /// Reconcile the manager with a reloaded config.
+    ///
+    /// Swaps all config-derived state (model configs, cmd aliases, device
+    /// maps, port range, keep-alive), unloads instances of models that no
+    /// longer exist, and clears blocked flags + crash counters — a reload
+    /// is the operator's way to recover a model after fixing the underlying
+    /// problem (§5).  Running instances of surviving models are kept: a
+    /// running process cannot change its command line, so `cmd` changes
+    /// only affect future spawns.
+    pub async fn reconcile_config(&self, config: &crate::config::Config) {
+        let new_model_configs: HashMap<String, ModelConfig> = config
+            .models
+            .iter()
+            .map(|m| (m.name.clone(), m.clone()))
+            .collect();
+
+        // ── Unload instances of removed models ───────────────────────
+        let removed: Vec<String> = {
+            let instances = self.instances.read().unwrap();
+            instances
+                .keys()
+                .filter(|m| !new_model_configs.contains_key(*m))
+                .cloned()
+                .collect()
+        };
+        for model in &removed {
+            info!(model = %model, "model removed from config — unloading instances");
+            self.unload_model(model).await;
+        }
+
+        // ── Swap config-derived fields ───────────────────────────────
+        *self.model_configs.write().unwrap() = new_model_configs;
+        *self.cmd_aliases.write().unwrap() = config.cmd_aliases.clone();
+        *self.vulkan_slots.write().unwrap() = config
+            .devices
+            .as_ref()
+            .map(|d| d.vulkan.clone())
+            .unwrap_or_default();
+        *self.vram_limits.write().unwrap() = config
+            .devices
+            .as_ref()
+            .map(|d| {
+                d.vram_limit_mb
+                    .iter()
+                    .map(|(k, v)| (*k, *v * 1024 * 1024))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.ports
+            .lock()
+            .await
+            .set_range(config.server.port_range.clone());
+
+        // ── Keep-alive: rebuild when the config changed ──────────────
+        let rebuild = match &*self.keepalive.read().unwrap() {
+            Some(ka) => !ka.matches(&config.keep_alive),
+            None => config.keep_alive.is_some(),
+        };
+        if rebuild {
+            {
+                let mut slot = self.keepalive.write().unwrap();
+                if let Some(old) = slot.take() {
+                    old.stop_all();
+                }
+                *slot = KeepAliveManager::new(&config.keep_alive).map(Arc::new);
+            }
+            // Restart keep-alive for GPUs with running instances — the
+            // fresh manager starts with no tasks.
+            let keepalive = self.keepalive.read().unwrap().clone();
+            if let Some(ref ka) = keepalive {
+                let in_use_slots: std::collections::HashSet<String> = {
+                    let instances = self.instances.read().unwrap();
+                    let vulkan_slots = self.vulkan_slots.read().unwrap();
+                    instances
+                        .values()
+                        .flatten()
+                        .flat_map(|h| h.inner().lock().unwrap().gpu_indices.clone())
+                        .filter_map(|idx| vulkan_slots.get(&idx).cloned())
+                        .collect()
+                };
+                for slot in in_use_slots {
+                    ka.ensure_running(&slot);
+                }
+            }
+            info!("keep-alive manager rebuilt after config reload");
+        }
+
+        // ── Clear crash blocks (§5) ──────────────────────────────────
+        let had_blocked = !self.blocked.read().unwrap().is_empty();
+        self.blocked.write().unwrap().clear();
+        self.crash_counts.lock().unwrap().clear();
+        if had_blocked {
+            info!("crash-blocked models cleared by config reload");
         }
     }
 
@@ -1174,6 +1289,8 @@ impl InstanceManager {
         // Snapshot configs for the iteration (cheap clone, small structs).
         let configs: Vec<(String, ModelConfig)> = self
             .model_configs
+            .read()
+            .unwrap()
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
@@ -1668,6 +1785,60 @@ models:
             !mgr.is_blocked("m"),
             "counter reset on unblock — two fresh crashes must not reach the limit"
         );
+    }
+
+    const TEST_CONFIG_YAML_B: &str = r#"
+server: {}
+apikeys_file: apikeys.txt
+models:
+  - name: n
+    context_length: 4096
+    cmd: "sleep 3600"
+    idle_ttl: 60
+"#;
+
+    #[tokio::test]
+    async fn reconcile_unloads_removed_models_and_swaps_configs() {
+        // Hot-reload must reach the manager: removed models are unloaded,
+        // the new model config becomes spawnable, crash blocks are cleared.
+        let mgr = test_manager();
+        let handle = make_handle(InstanceState::Ready, 0, Duration::ZERO);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle);
+        mgr.block_model("m");
+
+        let cfg_b: crate::config::Config =
+            serde_yaml_ng::from_str(TEST_CONFIG_YAML_B).unwrap();
+        mgr.reconcile_config(&cfg_b).await;
+
+        assert_eq!(instance_count(&mgr), 0, "removed model's instances must be unloaded");
+        assert!(!mgr.model_configs.read().unwrap().contains_key("m"));
+        assert!(mgr.model_configs.read().unwrap().contains_key("n"));
+        assert!(!mgr.is_blocked("m"), "reload must clear blocked flags");
+    }
+
+    #[tokio::test]
+    async fn reconcile_keeps_surviving_models_instances() {
+        // Models still present in the reloaded config keep their running
+        // instances (a running process cannot change its command line).
+        let mgr = test_manager();
+        let handle = make_handle(InstanceState::Ready, 0, Duration::ZERO);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle);
+
+        let cfg: crate::config::Config =
+            serde_yaml_ng::from_str(TEST_CONFIG_YAML).unwrap();
+        mgr.reconcile_config(&cfg).await;
+
+        assert_eq!(instance_count(&mgr), 1, "surviving model's instance must be kept");
     }
 
     #[test]
