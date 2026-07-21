@@ -586,7 +586,7 @@ impl InstanceManager {
 
         let mut inst = Instance::new(
             model_name,
-            gpu_indices,
+            gpu_indices.clone(),
             port,
             Some(self.release_tx.clone()),
         );
@@ -607,6 +607,22 @@ impl InstanceManager {
                 .entry(model_name.to_owned())
                 .or_default()
                 .push(handle.clone());
+        }
+
+        // Keep-alive: acquire one reference per occupied GPU.  Released
+        // exactly once in unregister_instance, which every instance
+        // removal funnels through — refcounting makes concurrent
+        // spawn/remove interleavings safe.
+        {
+            let keepalive = self.keepalive.read().unwrap().clone();
+            if let Some(ref ka) = keepalive {
+                let vulkan_slots = self.vulkan_slots.read().unwrap();
+                for vulkan_idx in &gpu_indices {
+                    if let Some(slot) = vulkan_slots.get(vulkan_idx) {
+                        ka.acquire(slot);
+                    }
+                }
+            }
         }
 
         // Spawn intent counts as activity: reset the idle-TTL clock so the
@@ -634,17 +650,9 @@ impl InstanceManager {
             if let Some(ref mut child) = child_to_kill {
                 shutdown_child(child, Duration::from_secs(5)).await;
             }
-            self.ports.lock().await.free(port);
-
-            {
-                let mut instances = self.instances.write().unwrap();
-                if let Some(list) = instances.get_mut(model_name) {
-                    // Compare handle identity, not the id string — base IDs
-                    // collide for same-GPU/CPU instances of one model.
-                    list.retain(|h| !Arc::ptr_eq(h.inner(), handle.inner()));
-                }
-            }
-            self.drain_queue_if_no_instances(model_name);
+            // Port free, registry removal, queue drain, keep-alive release.
+            self.unregister_instance(model_name, &handle, &gpu_indices)
+                .await;
 
             if child_exited {
                 self.note_pre_output_crash(model_name);
@@ -673,21 +681,6 @@ impl InstanceManager {
             inst.id.clone()
         };
         info!(model = %model_name, inst = %instance_id, port = port, "spawn succeeded");
-
-        // Start keep-alive for the GPU(s) this instance occupies.
-        let keepalive = self.keepalive.read().unwrap().clone();
-        if let Some(ref ka) = keepalive {
-            let gpus = {
-                let inst = handle.inner().lock().unwrap();
-                inst.gpu_indices.clone()
-            };
-            let vulkan_slots = self.vulkan_slots.read().unwrap();
-            for vulkan_idx in &gpus {
-                if let Some(slot) = vulkan_slots.get(vulkan_idx) {
-                    ka.ensure_running(slot);
-                }
-            }
-        }
 
         Some(handle)
     }
@@ -1013,21 +1006,16 @@ impl InstanceManager {
         }
         self.drain_queue_if_no_instances(model_name);
 
+        // Keep-alive: release this instance's per-GPU reference (acquired
+        // at spawn registration).  The task stops when the last instance
+        // leaves the GPU — refcounting makes this safe against concurrent
+        // spawns landing on the same GPU.
         let keepalive = self.keepalive.read().unwrap().clone();
         if let Some(ref ka) = keepalive {
+            let vulkan_slots = self.vulkan_slots.read().unwrap();
             for vulkan_idx in gpu_indices {
-                let still_in_use = {
-                    let instances = self.instances.read().unwrap();
-                    instances.values().flatten().any(|h| {
-                        let inst = h.inner().lock().unwrap();
-                        inst.gpu_indices.contains(vulkan_idx)
-                    })
-                };
-                if !still_in_use {
-                    let slot = self.vulkan_slots.read().unwrap().get(vulkan_idx).cloned();
-                    if let Some(slot) = slot {
-                        ka.stop(&slot);
-                    }
+                if let Some(slot) = vulkan_slots.get(vulkan_idx) {
+                    ka.release(slot);
                 }
             }
         }
@@ -1245,11 +1233,12 @@ impl InstanceManager {
                 }
                 *slot = KeepAliveManager::new(&config.keep_alive).map(Arc::new);
             }
-            // Restart keep-alive for GPUs with running instances — the
-            // fresh manager starts with no tasks.
+            // Re-acquire keep-alive for GPUs with running instances — the
+            // fresh manager starts with no tasks and zero refcounts, so
+            // acquire once per instance-GPU pair to rebuild the counts.
             let keepalive = self.keepalive.read().unwrap().clone();
             if let Some(ref ka) = keepalive {
-                let in_use_slots: std::collections::HashSet<String> = {
+                let in_use_slots: Vec<String> = {
                     let instances = self.instances.read().unwrap();
                     let vulkan_slots = self.vulkan_slots.read().unwrap();
                     instances
@@ -1260,7 +1249,7 @@ impl InstanceManager {
                         .collect()
                 };
                 for slot in in_use_slots {
-                    ka.ensure_running(&slot);
+                    ka.acquire(&slot);
                 }
             }
             info!("keep-alive manager rebuilt after config reload");

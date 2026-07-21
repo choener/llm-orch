@@ -12,9 +12,17 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 /// Manages per-GPU keep-alive background tasks.
+///
+/// Usage is refcounted per PCI slot: every instance occupying a GPU holds
+/// one `acquire`, released exactly once when the instance is unregistered.
+/// The task runs while the count is > 0.  Refcounting makes concurrent
+/// spawn/remove interleavings safe — a stop can never take effect while a
+/// new instance has just landed on the GPU.
 pub struct KeepAliveManager {
     /// Active tasks keyed by PCI slot.
     tasks: Mutex<HashMap<String, (JoinHandle<()>, CancellationToken)>>,
+    /// Number of instances currently occupying each GPU (by PCI slot).
+    refcounts: Mutex<HashMap<String, usize>>,
     /// PCI slot → sysfs card index (built at construction).
     slot_to_card: HashMap<String, usize>,
     /// Config.
@@ -32,15 +40,55 @@ impl KeepAliveManager {
         let slot_to_card = build_slot_map();
         Some(Self {
             tasks: Mutex::new(HashMap::new()),
+            refcounts: Mutex::new(HashMap::new()),
             slot_to_card,
             cfg: amd,
         })
     }
 
-    /// Start keep-alive for the GPU at `pci_slot` if not already running.
+    /// Register an instance on the GPU at `pci_slot`.  Starts the
+    /// keep-alive task when the first instance lands on the GPU.
     ///
-    /// Safe to call multiple times — subsequent calls are no-ops.
-    pub fn ensure_running(&self, pci_slot: &str) {
+    /// Must be paired with exactly one `release` call per acquire.
+    pub fn acquire(&self, pci_slot: &str) {
+        let first = {
+            let mut counts = self.refcounts.lock().unwrap();
+            let count = counts.entry(pci_slot.to_owned()).or_insert(0);
+            *count += 1;
+            *count == 1
+        };
+        if first {
+            self.start_task(pci_slot);
+        }
+    }
+
+    /// Unregister an instance from the GPU at `pci_slot`.  Stops the
+    /// keep-alive task when the last instance leaves the GPU.
+    pub fn release(&self, pci_slot: &str) {
+        let last = {
+            let mut counts = self.refcounts.lock().unwrap();
+            match counts.get_mut(pci_slot) {
+                Some(count) if *count > 1 => {
+                    *count -= 1;
+                    false
+                }
+                Some(_) => {
+                    counts.remove(pci_slot);
+                    true
+                }
+                None => {
+                    warn!(slot = pci_slot, "keep-alive: release without acquire");
+                    return;
+                }
+            }
+        };
+        if last {
+            self.stop_task(pci_slot);
+        }
+    }
+
+    /// Start keep-alive for the GPU at `pci_slot` if not already running.
+    fn start_task(&self, pci_slot: &str) {
         let card_index = match self.slot_to_card.get(pci_slot) {
             Some(&idx) => idx,
             None => {
@@ -102,7 +150,7 @@ impl KeepAliveManager {
     }
 
     /// Stop keep-alive for the GPU at `pci_slot`.
-    pub fn stop(&self, pci_slot: &str) {
+    fn stop_task(&self, pci_slot: &str) {
         let mut tasks = self.tasks.lock().unwrap();
         if let Some((_handle, cancel)) = tasks.remove(pci_slot) {
             cancel.cancel();
@@ -117,7 +165,7 @@ impl KeepAliveManager {
         amd == Some(&self.cfg)
     }
 
-    /// Stop all keep-alive tasks.
+    /// Stop all keep-alive tasks and reset refcounts (shutdown / rebuild).
     pub fn stop_all(&self) {
         let tasks: Vec<_> = {
             let mut guard = self.tasks.lock().unwrap();
@@ -126,6 +174,7 @@ impl KeepAliveManager {
         for cancel in tasks {
             cancel.cancel();
         }
+        self.refcounts.lock().unwrap().clear();
         debug!("all keep-alive tasks cancelled");
     }
 }
