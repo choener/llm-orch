@@ -14,10 +14,16 @@ use crate::port_alloc::PortAllocator;
 
 use reqwest::Client;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex, Semaphore, oneshot};
 use tracing::{debug, info, warn};
+
+/// Maximum time a request may wait in the queue for a slot before failing.
+/// Without a bound, a lost wakeup (or simply sustained saturation) would
+/// park the HTTP request forever.
+const QUEUE_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 // ── Model metrics (tickless EMA) ────────────────────────────────────────────
 
@@ -135,8 +141,13 @@ pub struct InstanceManager {
     instances: RwLock<HashMap<String, Vec<InstanceHandle>>>,
 
     /// Per-model wait queues.  When all instances are at capacity, requests
-    /// park on a oneshot channel until a slot frees up or the queue is full.
-    queues: RwLock<HashMap<String, VecDeque<oneshot::Sender<InstanceHandle>>>>,
+    /// park on a oneshot channel until a slot frees up, the queue is full,
+    /// or the wait times out.  Each entry carries a unique id so timed-out
+    /// waiters can remove themselves from the queue.
+    queues: RwLock<HashMap<String, VecDeque<(u64, oneshot::Sender<InstanceHandle>)>>>,
+
+    /// Unique id source for queue entries (used for timeout self-removal).
+    next_queue_id: AtomicU64,
 
     /// Per-model blocked flag.  A blocked model refuses all requests.
     blocked: RwLock<HashMap<String, bool>>,
@@ -225,6 +236,7 @@ impl InstanceManager {
             cmd_aliases: config.cmd_aliases.clone(),
             instances: RwLock::new(HashMap::new()),
             queues: RwLock::new(HashMap::new()),
+            next_queue_id: AtomicU64::new(0),
             blocked: RwLock::new(HashMap::new()),
             gpu_snapshot,
             vulkan_slots,
@@ -322,9 +334,9 @@ impl InstanceManager {
 
     /// Enqueue the caller, waiting for an instance slot to free up.
     /// Returns `None` if the queue is at capacity (caller should return 429),
-    /// or if no instance exists (or is loading) — in that case no release or
+    /// if no instance exists (or is loading) — in that case no release or
     /// spawn event could ever wake the parked waiter, so fail fast instead
-    /// of hanging forever.
+    /// of hanging forever — or if the wait exceeds `QUEUE_WAIT_TIMEOUT`.
     /// Acquires the slot on the received handle before returning.
     async fn enqueue(
         &self,
@@ -332,35 +344,64 @@ impl InstanceManager {
         max_depth: usize,
         max_concurrent: usize,
     ) -> Option<SlotGuard> {
-        let has_instances = self
-            .instances
-            .read()
-            .unwrap()
-            .get(model_name)
-            .map(|l| !l.is_empty())
-            .unwrap_or(false);
-        if !has_instances {
-            return None;
-        }
-
         let (tx, rx) = oneshot::channel();
+        let id = self.next_queue_id.fetch_add(1, Ordering::Relaxed);
 
         {
+            // Hold the instances read lock across the check *and* the queue
+            // push.  remove_instance takes the instances write lock to remove
+            // the last instance and only then drains the queue — so either
+            // our push lands before the drain (and is cleared by it) or after
+            // the removal (and the check fails).  Without this, a removal
+            // could slip in between check and push and park us forever.
+            let instances = self.instances.read().unwrap();
+            let has_instances = instances
+                .get(model_name)
+                .map(|l| !l.is_empty())
+                .unwrap_or(false);
+            if !has_instances {
+                return None;
+            }
+
             let mut queues = self.queues.write().unwrap();
             let queue = queues.entry(model_name.to_owned()).or_default();
             if queue.len() >= max_depth {
                 return None;
             }
-            queue.push_back(tx);
+            queue.push_back((id, tx));
         }
 
-        let handle = rx.await.ok()?;
+        // Close the lost-wakeup race: a slot may have been released between
+        // the capacity check in get_or_spawn and our queue push, with its
+        // wake_one finding an empty queue.  Re-signal now that we are
+        // parked — if capacity exists, the head waiter gets served.
+        self.wake_one(model_name);
+
+        let handle = match tokio::time::timeout(QUEUE_WAIT_TIMEOUT, rx).await {
+            Ok(Ok(handle)) => handle,
+            // Queue drained (last instance removed) — fail fast.
+            Ok(Err(_)) => return None,
+            Err(_) => {
+                // Timed out — remove our entry if it is still parked.
+                // (If wake_one already popped us, the handle it sent is
+                // dropped with the receiver; handle drop is a no-op.)
+                self.remove_queued(model_name, id);
+                return None;
+            }
+        };
 
         if let Some(guard) = handle.try_acquire(max_concurrent) {
             self.record_metrics_event(model_name, 0);
             Some(guard)
         } else {
             None
+        }
+    }
+
+    /// Remove a specific queued waiter (used after a queue-wait timeout).
+    fn remove_queued(&self, model_name: &str, id: u64) {
+        if let Some(q) = self.queues.write().unwrap().get_mut(model_name) {
+            q.retain(|(entry_id, _)| *entry_id != id);
         }
     }
 
@@ -395,7 +436,7 @@ impl InstanceManager {
         if let Some(h) = handle {
             let mut queues = self.queues.write().unwrap();
             if let Some(queue) = queues.get_mut(model_name) {
-                while let Some(tx) = queue.pop_front() {
+                while let Some((_id, tx)) = queue.pop_front() {
                     if tx.send(h.clone()).is_ok() {
                         return;
                     }
@@ -1287,7 +1328,7 @@ models:
             .unwrap()
             .entry("m".to_owned())
             .or_default()
-            .push_back(tx);
+            .push_back((0, tx));
 
         mgr.remove_instance("m", &handle).await;
 
@@ -1316,7 +1357,7 @@ models:
             .unwrap()
             .entry("m".to_owned())
             .or_default()
-            .push_back(tx);
+            .push_back((0, tx));
 
         mgr.remove_instance("m", &h1).await;
 
@@ -1325,6 +1366,46 @@ models:
             !rx.is_terminated(),
             "waiter must stay parked while instances remain"
         );
+    }
+
+    #[tokio::test]
+    async fn enqueue_self_wakes_when_capacity_already_free() {
+        // Lost-wakeup regression: capacity freed *before* the waiter parks
+        // must still serve it — the post-push wake_one re-signals instead
+        // of leaving the waiter parked on a free slot.
+        let mgr = test_manager();
+        let handle = make_handle(InstanceState::Ready, 0, Duration::ZERO);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle.clone());
+
+        let guard = mgr.enqueue("m", 8, 1).await;
+        assert!(guard.is_some(), "waiter must be served by the post-push wake");
+        assert_eq!(handle.inner().lock().unwrap().in_flight, 1);
+    }
+
+    #[tokio::test]
+    async fn remove_queued_drops_only_the_matching_entry() {
+        // Timeout path: a timed-out waiter removes its own entry by id;
+        // other parked waiters must stay in place.
+        let mgr = test_manager();
+        let (tx1, rx1) = oneshot::channel::<InstanceHandle>();
+        let (tx2, rx2) = oneshot::channel::<InstanceHandle>();
+        {
+            let mut queues = mgr.queues.write().unwrap();
+            let q = queues.entry("m".to_owned()).or_default();
+            q.push_back((1, tx1));
+            q.push_back((2, tx2));
+        }
+
+        mgr.remove_queued("m", 1);
+
+        assert!(rx1.await.is_err(), "removed waiter's sender must be dropped");
+        assert!(!rx2.is_terminated(), "other waiter must stay parked");
+        assert_eq!(mgr.queue_depth("m"), 1);
     }
 
     #[test]
