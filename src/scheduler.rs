@@ -838,38 +838,7 @@ impl InstanceManager {
         self.crash_counts.lock().unwrap().remove(model_name);
     }
 
-    // ── idle eviction ────────────────────────────────────────────────────
-
-    pub async fn unload_idle(&self) {
-        let to_evict: Vec<(String, InstanceHandle)> = {
-            let instances = self.instances.read().unwrap();
-            let mut candidates = Vec::new();
-            for (model, list) in instances.iter() {
-                let ttl = self
-                    .model_configs
-                    .read()
-                    .unwrap()
-                    .get(model.as_str())
-                    .map(|c| c.idle_ttl)
-                    .unwrap_or(300);
-                for handle in list {
-                    if handle.inner().lock().unwrap().is_idle_expired(ttl) {
-                        candidates.push((model.clone(), handle.clone()));
-                    }
-                }
-            }
-            candidates
-        };
-
-        let mut evicted_by_model: HashMap<String, usize> = HashMap::new();
-        for (model_name, handle) in to_evict {
-            *evicted_by_model.entry(model_name.clone()).or_default() += 1;
-            self.remove_instance(&model_name, &handle).await;
-        }
-        for (model, count) in &evicted_by_model {
-            info!(model = %model, count = *count, "unloaded via TTL idle eviction");
-        }
-    }
+    // ── instance removal ─────────────────────────────────────────────────
 
     /// Remove an instance **if it is idle** (autoscale / TTL eviction).
     ///
@@ -1421,42 +1390,56 @@ impl InstanceManager {
 
             // ── Final despawn (n → 0): idle-TTL on the last instance ────
             // Always checked — does not require autoscale to be enabled.
-            // Despawns when: only one instance exists, load_m1 has decayed
-            // below 0.01 (no activity for several minutes), and wall-clock
-            // time since last activity exceeds idle_ttl.
-            if num_instances == 1
-                && m.load_m1 < 0.01
-                && now.duration_since(m.last_activity).as_secs() > cfg.idle_ttl
-            {
-                let handle = self.pick_least_loaded(model_name);
-                if let Some(h) = handle {
-                    // Re-check the victim instance itself before killing it.
-                    // is_idle_expired requires Ready + no in-flight requests
-                    // + instance-level idle past TTL, which excludes:
-                    //   - Loading instances (spawn in progress — their
-                    //     last_active is fresh and state != Ready),
-                    //   - instances that acquired a request after the
-                    //     metrics snapshot above was taken.
-                    let expired = h.inner().lock().unwrap().is_idle_expired(cfg.idle_ttl);
-                    if !expired {
-                        continue;
+            // The instance-level check is authoritative: Ready, no
+            // in-flight requests, and last_active at least idle_ttl ago —
+            // the configured TTL is honored exactly, independent of load
+            // EMA decay timescales.  Loading instances (spawn in progress)
+            // are excluded because their state != Ready and their
+            // last_active is fresh; remove_instance is atomic w.r.t. slot
+            // acquisition, so a request racing the despawn is a no-op.
+            if num_instances == 1 {
+                let mut despawned = false;
+                if let Some(h) = self.pick_least_loaded(model_name) {
+                    if h.inner().lock().unwrap().is_idle_expired(cfg.idle_ttl) {
+                        info!(
+                            model = %model_name,
+                            ttl = cfg.idle_ttl,
+                            "idle TTL expired, despawning last instance"
+                        );
+                        despawned = self.remove_instance(model_name, &h).await;
                     }
-                    let idle_secs = now.duration_since(m.last_activity).as_secs();
-                    info!(
-                        model = %model_name,
-                        idle_secs = %idle_secs,
-                        ttl = cfg.idle_ttl,
-                        "idle TTL expired, despawning last instance"
-                    );
-                    self.remove_instance(model_name, &h).await;
                 }
-                continue;
+                if despawned {
+                    continue;
+                }
+                // Fall through: autoscale scale-up may still apply.
             }
 
             // ── Autoscale (n ↔ n±1): requires autoscale.enabled ────────
             let a = match &cfg.autoscale {
                 Some(a) if a.enabled => a,
-                _ => continue,
+                _ => {
+                    // No autoscale: TTL-evict surplus idle instances down
+                    // to one (the n → 0 despawn is handled above).
+                    let mut n = num_instances;
+                    for handle in self.instances_by_load(model_name) {
+                        if n <= 1 {
+                            break;
+                        }
+                        if handle.inner().lock().unwrap().is_idle_expired(cfg.idle_ttl) {
+                            info!(
+                                model = %model_name,
+                                inst = %handle.id(),
+                                ttl = cfg.idle_ttl,
+                                "idle TTL expired, evicting surplus instance"
+                            );
+                            if self.remove_instance(model_name, &handle).await {
+                                n -= 1;
+                            }
+                        }
+                    }
+                    continue;
+                }
             };
 
             // ── Cooldown ──────────────────────────────────────────
@@ -1988,6 +1971,80 @@ models:
         let list = &instances["m"];
         assert_eq!(list.len(), 1, "only the targeted instance may be removed");
         assert!(Arc::ptr_eq(list[0].inner(), h2.inner()));
+    }
+
+    #[tokio::test]
+    async fn short_idle_ttl_is_honored_for_last_instance() {
+        // Regression: the old despawn condition required load_m1 < 0.01,
+        // which with τ=60 s takes ~5 min to decay regardless of the
+        // configured TTL — an idle_ttl of 30 s was silently clamped.
+        // The instance-level idle check honors the TTL exactly.
+        let mgr = test_manager(); // idle_ttl = 60 in TEST_CONFIG_YAML
+        let handle = make_handle(InstanceState::Ready, 0, Duration::from_secs(120));
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle);
+        // Fresh metrics with a recent high load would have blocked the
+        // old condition; the TTL-based check must not care.
+        mgr.touch_activity("m");
+        {
+            let mut metrics = mgr.model_metrics.write().unwrap();
+            let m = metrics.entry("m".to_owned()).or_default();
+            m.load_m1 = 42.0;
+        }
+
+        mgr.evaluate_autoscale().await;
+
+        assert_eq!(
+            instance_count(&mgr),
+            0,
+            "instance idle past its TTL must be despawned regardless of load EMAs"
+        );
+    }
+
+    #[tokio::test]
+    async fn surplus_idle_instances_evicted_without_autoscale() {
+        // Models without autoscale config must still scale down: idle
+        // surplus instances are TTL-evicted, one instance is kept.
+        let mgr = test_manager();
+        let idle = make_handle_on_gpus(vec![0], InstanceState::Ready, 0, Duration::from_secs(3600));
+        let busy = make_handle_on_gpus(vec![1], InstanceState::Ready, 1, Duration::ZERO);
+        {
+            let mut instances = mgr.instances.write().unwrap();
+            let list = instances.entry("m".to_owned()).or_default();
+            list.push(idle.clone());
+            list.push(busy.clone());
+        }
+
+        mgr.evaluate_autoscale().await;
+
+        assert_eq!(instance_count(&mgr), 1, "idle surplus instance must be evicted");
+        let instances = mgr.instances.read().unwrap();
+        assert!(
+            Arc::ptr_eq(instances["m"][0].inner(), busy.inner()),
+            "the busy instance must be the survivor"
+        );
+    }
+
+    #[tokio::test]
+    async fn surplus_fresh_instances_kept_without_autoscale() {
+        // Surplus instances that are NOT idle past TTL must be kept.
+        let mgr = test_manager();
+        let h1 = make_handle_on_gpus(vec![0], InstanceState::Ready, 0, Duration::ZERO);
+        let h2 = make_handle_on_gpus(vec![1], InstanceState::Ready, 0, Duration::ZERO);
+        {
+            let mut instances = mgr.instances.write().unwrap();
+            let list = instances.entry("m".to_owned()).or_default();
+            list.push(h1);
+            list.push(h2);
+        }
+
+        mgr.evaluate_autoscale().await;
+
+        assert_eq!(instance_count(&mgr), 2, "fresh instances must be kept");
     }
 
     #[tokio::test]
