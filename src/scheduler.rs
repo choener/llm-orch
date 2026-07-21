@@ -154,6 +154,11 @@ pub struct InstanceManager {
     /// Unique id source for queue entries (used for timeout self-removal).
     next_queue_id: AtomicU64,
 
+    /// Sequence number appended to instance IDs (`model@gpu#N`) so every
+    /// instance gets a unique ID even when the base `model@gpus` collides
+    /// (e.g. multiple CPU instances of one model).
+    instance_seq: AtomicU64,
+
     /// Per-model blocked flag.  A blocked model refuses all requests.
     blocked: RwLock<HashMap<String, bool>>,
 
@@ -261,6 +266,7 @@ impl InstanceManager {
             instances: RwLock::new(HashMap::new()),
             queues: RwLock::new(HashMap::new()),
             next_queue_id: AtomicU64::new(0),
+            instance_seq: AtomicU64::new(0),
             blocked: RwLock::new(HashMap::new()),
             gpu_snapshot,
             vulkan_slots: RwLock::new(vulkan_slots),
@@ -576,6 +582,13 @@ impl InstanceManager {
             port,
             Some(self.release_tx.clone()),
         );
+        // Guarantee a unique ID even when the base `model@gpus` collides
+        // (multiple CPU instances of the same model).
+        inst.id = format!(
+            "{}#{}",
+            inst.id,
+            self.instance_seq.fetch_add(1, Ordering::Relaxed)
+        );
         inst.child = Some(child);
         let handle = InstanceHandle::new(inst);
 
@@ -618,7 +631,9 @@ impl InstanceManager {
             {
                 let mut instances = self.instances.write().unwrap();
                 if let Some(list) = instances.get_mut(model_name) {
-                    list.retain(|h| h.id() != handle.id());
+                    // Compare handle identity, not the id string — base IDs
+                    // collide for same-GPU/CPU instances of one model.
+                    list.retain(|h| !Arc::ptr_eq(h.inner(), handle.inner()));
                 }
             }
             self.drain_queue_if_no_instances(model_name);
@@ -899,7 +914,9 @@ impl InstanceManager {
         {
             let mut instances = self.instances.write().unwrap();
             if let Some(list) = instances.get_mut(model_name) {
-                list.retain(|h| h.id() != handle.id());
+                // Compare handle identity, not the id string — base IDs
+                // collide for same-GPU/CPU instances of one model.
+                list.retain(|h| !Arc::ptr_eq(h.inner(), handle.inner()));
             }
         }
         self.drain_queue_if_no_instances(model_name);
@@ -1839,6 +1856,30 @@ models:
         mgr.reconcile_config(&cfg).await;
 
         assert_eq!(instance_count(&mgr), 1, "surviving model's instance must be kept");
+    }
+
+    #[tokio::test]
+    async fn removing_one_of_two_same_id_instances_keeps_the_other() {
+        // Base IDs collide for GPU-less models (model@cpu) — removal must
+        // be by handle identity, never by id string, or evicting one CPU
+        // instance would evict all of them.
+        let mgr = test_manager();
+        let h1 = make_handle_on_gpus(vec![], InstanceState::Ready, 0, Duration::ZERO);
+        let h2 = make_handle_on_gpus(vec![], InstanceState::Ready, 0, Duration::ZERO);
+        assert_eq!(h1.id(), h2.id(), "test setup requires colliding base ids");
+        {
+            let mut instances = mgr.instances.write().unwrap();
+            let list = instances.entry("m".to_owned()).or_default();
+            list.push(h1.clone());
+            list.push(h2.clone());
+        }
+
+        mgr.remove_instance("m", &h1).await;
+
+        let instances = mgr.instances.read().unwrap();
+        let list = &instances["m"];
+        assert_eq!(list.len(), 1, "only the targeted instance may be removed");
+        assert!(Arc::ptr_eq(list[0].inner(), h2.inner()));
     }
 
     #[test]

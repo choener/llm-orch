@@ -23,7 +23,11 @@ pub enum InstanceState {
 /// Wrapped in `Arc<Mutex<…>>` so an `InstanceHandle` can share ownership.
 /// In-flight slot lifecycle is tied to `SlotGuard`, not to handle clones.
 pub struct Instance {
-    /// Deterministic ID, e.g. `"qwen3-32b@0,1"`.
+    /// Base ID, e.g. `"qwen3-32b@0,1"` (`"model@gpus"`).
+    ///
+    /// Not unique on its own — GPU-less models all get `"model@cpu"`.
+    /// The manager appends a `#seq` suffix at spawn time to make it
+    /// unique; removal paths compare handle identity, never the id string.
     pub id: String,
 
     /// The model this instance serves.
