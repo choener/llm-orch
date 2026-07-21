@@ -120,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 5. Create the instance manager.
-    let (manager, release_rx) = scheduler::InstanceManager::new(
+    let (manager, release_rx, crash_rx) = scheduler::InstanceManager::new(
         &cfg,
         Arc::clone(&gpu_snapshot),
         keepalive,
@@ -141,6 +141,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             while let Some(model_name) = rx.recv().await {
                 mgr.record_metrics_event(&model_name, 1);
                 mgr.wake_one(&model_name);
+            }
+        }
+    });
+
+    // Spawn the background crash-processing task.
+    // Per-instance monitor tasks report unexpected child exits here; the
+    // manager unregisters the crashed instance and blocks the model after
+    // too many consecutive pre-output crashes.
+    tokio::spawn({
+        let mgr = Arc::clone(&manager);
+        async move {
+            let mut rx = crash_rx;
+            while let Some(handle) = rx.recv().await {
+                mgr.handle_crash(handle).await;
             }
         }
     });

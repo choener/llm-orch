@@ -18,12 +18,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex, Semaphore, oneshot};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Maximum time a request may wait in the queue for a slot before failing.
 /// Without a bound, a lost wakeup (or simply sustained saturation) would
 /// park the HTTP request forever.
 const QUEUE_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A parked waiter: unique id (for timeout self-removal) plus the channel
+/// used to deliver an instance handle once a slot frees up.
+type WaitQueue = VecDeque<(u64, oneshot::Sender<InstanceHandle>)>;
 
 // ── Model metrics (tickless EMA) ────────────────────────────────────────────
 
@@ -144,7 +148,7 @@ pub struct InstanceManager {
     /// park on a oneshot channel until a slot frees up, the queue is full,
     /// or the wait times out.  Each entry carries a unique id so timed-out
     /// waiters can remove themselves from the queue.
-    queues: RwLock<HashMap<String, VecDeque<(u64, oneshot::Sender<InstanceHandle>)>>>,
+    queues: RwLock<HashMap<String, WaitQueue>>,
 
     /// Unique id source for queue entries (used for timeout self-removal).
     next_queue_id: AtomicU64,
@@ -188,21 +192,38 @@ pub struct InstanceManager {
     /// Cloned into every `Instance` so `release_slot` can notify the
     /// background release-processing task without holding any locks.
     release_tx: mpsc::UnboundedSender<String>,
+
+    /// Sender side of the crash-notification channel.
+    /// Cloned into per-instance monitor tasks so an unexpected child exit
+    /// can be reported to the background crash-processing task.
+    crash_tx: mpsc::UnboundedSender<InstanceHandle>,
+
+    /// Consecutive pre-output crashes per model.  Reset on successful
+    /// spawn and on unblock; reaching `crash_limit` blocks the model.
+    crash_counts: std::sync::Mutex<HashMap<String, usize>>,
 }
 
 impl InstanceManager {
-    /// Create a new manager and the receiver for the release channel.
+    /// Create a new manager plus the receivers for the release channel and
+    /// the crash channel.
     ///
-    /// The caller must spawn a background task that drains `release_rx`
-    /// and calls `record_metrics_event` + `wake_one` on the manager for
-    /// each model name received.  This task runs with no locks held, so
-    /// it can safely acquire `instances.read()` → `metrics.write()`
-    /// without deadlocking with the request-completion Drop path.
+    /// The caller must spawn background tasks that drain both receivers:
+    ///
+    /// - `release_rx` → `record_metrics_event` + `wake_one` per model name;
+    /// - `crash_rx` → `handle_crash` per instance handle.
+    ///
+    /// Both tasks run with no locks held, so they can safely acquire
+    /// `instances.read()` → `metrics.write()` without deadlocking with the
+    /// request-completion Drop path.
     pub fn new(
         config: &crate::config::Config,
         gpu_snapshot: Arc<tokio::sync::RwLock<Vec<GpuMetrics>>>,
         keepalive: Option<Arc<KeepAliveManager>>,
-    ) -> (Self, mpsc::UnboundedReceiver<String>) {
+    ) -> (
+        Self,
+        mpsc::UnboundedReceiver<String>,
+        mpsc::UnboundedReceiver<InstanceHandle>,
+    ) {
         let model_configs: HashMap<_, _> = config
             .models
             .iter()
@@ -227,6 +248,7 @@ impl InstanceManager {
             .unwrap_or_default();
 
         let (release_tx, release_rx) = mpsc::unbounded_channel();
+        let (crash_tx, crash_rx) = mpsc::unbounded_channel();
 
         let mgr = Self {
             client: http_client::build(),
@@ -249,8 +271,10 @@ impl InstanceManager {
             last_scale_action: RwLock::new(HashMap::new()),
             recent_completions: RwLock::new(HashMap::new()),
             release_tx,
+            crash_tx,
+            crash_counts: std::sync::Mutex::new(HashMap::new()),
         };
-        (mgr, release_rx)
+        (mgr, release_rx, crash_rx)
     }
 
     // ── get-or-spawn ──────────────────────────────────────────────────────
@@ -566,7 +590,16 @@ impl InstanceManager {
 
         // Wait for readiness (with timeout).
         if !mark_instance_ready(&handle, &self.client, &self.backend, self.spawn_timeout).await {
-            warn!(model = %model_name, port = port, "health check timeout — shutting down instance");
+            // Distinguish a dead process (pre-output crash — counts toward
+            // the model block limit) from a live-but-slow load (no count).
+            let child_exited = {
+                let mut inst_lock = handle.inner().lock().unwrap();
+                match inst_lock.child.as_mut() {
+                    Some(c) => !matches!(c.try_wait(), Ok(None)),
+                    None => false,
+                }
+            };
+            warn!(model = %model_name, port = port, exited = child_exited, "health check timeout — shutting down instance");
             let mut child_to_kill = {
                 let mut inst_lock = handle.inner().lock().unwrap();
                 inst_lock.state = InstanceState::Failed;
@@ -585,6 +618,10 @@ impl InstanceManager {
             }
             self.drain_queue_if_no_instances(model_name);
 
+            if child_exited {
+                self.note_pre_output_crash(model_name);
+            }
+
             return None;
         }
 
@@ -593,6 +630,15 @@ impl InstanceManager {
             let mut inst_lock = handle.inner().lock().unwrap();
             inst_lock.state = InstanceState::Ready;
         }
+
+        // A successful spawn resets the consecutive pre-output crash counter.
+        self.crash_counts.lock().unwrap().remove(model_name);
+
+        // Monitor the child for unexpected exits (crash → unregister/block).
+        tokio::spawn(monitor_instance_exit(
+            handle.clone(),
+            self.crash_tx.clone(),
+        ));
 
         let instance_id = {
             let inst = handle.inner().lock().unwrap();
@@ -760,7 +806,6 @@ impl InstanceManager {
             .unwrap_or(false)
     }
 
-    #[allow(dead_code)]
     pub fn block_model(&self, model_name: &str) {
         self.blocked
             .write()
@@ -768,9 +813,9 @@ impl InstanceManager {
             .insert(model_name.to_owned(), true);
     }
 
-    #[allow(dead_code)]
     pub fn unblock_model(&self, model_name: &str) {
         self.blocked.write().unwrap().remove(model_name);
+        self.crash_counts.lock().unwrap().remove(model_name);
     }
 
     // ── idle eviction ────────────────────────────────────────────────────
@@ -819,6 +864,21 @@ impl InstanceManager {
             shutdown_child(c, Duration::from_secs(5)).await;
         }
 
+        self.unregister_instance(model_name, handle, &gpu_indices).await;
+    }
+
+    /// Remove an instance from the registry: free its port, fail parked
+    /// waiters if it was the last instance, and stop keep-alive on GPUs
+    /// that are no longer in use.
+    ///
+    /// The caller must already have terminated (or reaped) the child
+    /// process and marked the instance `Failed`.
+    async fn unregister_instance(
+        &self,
+        model_name: &str,
+        handle: &InstanceHandle,
+        gpu_indices: &[usize],
+    ) {
         let port = handle.inner().lock().unwrap().port;
         self.ports.lock().await.free(port);
 
@@ -831,7 +891,7 @@ impl InstanceManager {
         self.drain_queue_if_no_instances(model_name);
 
         if let Some(ref ka) = self.keepalive {
-            for vulkan_idx in &gpu_indices {
+            for vulkan_idx in gpu_indices {
                 let still_in_use = {
                     let instances = self.instances.read().unwrap();
                     instances.values().flatten().any(|h| {
@@ -845,6 +905,79 @@ impl InstanceManager {
                     }
                 }
             }
+        }
+    }
+
+    // ── crash handling ───────────────────────────────────────────────────
+
+    /// Handle an unexpected backend exit reported by a monitor task.
+    ///
+    /// The instance is unregistered (port freed, parked waiters failed,
+    /// keep-alive stopped).  A pre-output crash (instance never reached
+    /// `Ready`) counts toward the per-model crash limit; reaching it blocks
+    /// the model so subsequent requests fail fast.  Post-output crashes do
+    /// not count — the model has proven functional and is respawned on
+    /// demand (plan §Backends).
+    pub async fn handle_crash(&self, handle: InstanceHandle) {
+        let (model_name, was_ready, gpu_indices) = {
+            let mut inst = handle.inner().lock().unwrap();
+            if inst.state == InstanceState::Failed {
+                // Already handled by a managed removal path (admin unload,
+                // TTL eviction, health-timeout cleanup, shutdown).
+                return;
+            }
+            let was_ready = inst.state == InstanceState::Ready;
+            inst.state = InstanceState::Failed;
+            // The monitor already reaped the process via try_wait.
+            let _ = inst.child.take();
+            (
+                inst.model_name.clone(),
+                was_ready,
+                inst.gpu_indices.clone(),
+            )
+        };
+        let (id, port) = {
+            let inst = handle.inner().lock().unwrap();
+            (inst.id.clone(), inst.port)
+        };
+        warn!(
+            model = %model_name,
+            inst = %id,
+            port = port,
+            was_ready = was_ready,
+            "backend instance exited unexpectedly"
+        );
+
+        self.unregister_instance(&model_name, &handle, &gpu_indices).await;
+
+        if !was_ready {
+            self.note_pre_output_crash(&model_name);
+        }
+    }
+
+    /// Increment the consecutive pre-output crash counter for `model_name`
+    /// and block the model when `crash_limit` is reached.
+    fn note_pre_output_crash(&self, model_name: &str) {
+        let count = {
+            let mut counts = self.crash_counts.lock().unwrap();
+            let c = counts.entry(model_name.to_owned()).or_insert(0);
+            *c += 1;
+            *c
+        };
+        if count >= self.crash_limit {
+            error!(
+                model = %model_name,
+                crashes = count,
+                "model blocked after repeated pre-output crashes"
+            );
+            self.block_model(model_name);
+        } else {
+            warn!(
+                model = %model_name,
+                crashes = count,
+                limit = self.crash_limit,
+                "pre-output crash"
+            );
         }
     }
 
@@ -1166,6 +1299,47 @@ impl InstanceManager {
     }
 }
 
+// ── Crash monitoring ─────────────────────────────────────────────────────────
+
+/// Poll interval for the per-instance child-exit monitor.
+const CRASH_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Watch an instance's child process; on unexpected exit, forward the handle
+/// to the manager's crash-processing task via `crash_tx`.
+///
+/// Exits quietly when the instance is going through a managed removal (state
+/// set to `Failed` / child taken by `remove_instance` or shutdown), so only
+/// *unexpected* exits are reported.  Managed removal races the report: the
+/// crash handler re-checks the state and ignores already-`Failed` instances.
+async fn monitor_instance_exit(
+    handle: InstanceHandle,
+    crash_tx: mpsc::UnboundedSender<InstanceHandle>,
+) {
+    loop {
+        tokio::time::sleep(CRASH_POLL_INTERVAL).await;
+        let exited = {
+            let mut inst = handle.inner().lock().unwrap();
+            if inst.state == InstanceState::Failed {
+                return;
+            }
+            match inst.child.as_mut() {
+                None => return,
+                Some(child) => match child.try_wait() {
+                    Ok(Some(_status)) => true,
+                    Ok(None) => false,
+                    // Wait error — treat as exit; erring toward unregistering
+                    // keeps a wedged instance out of the routing pool.
+                    Err(_) => true,
+                },
+            }
+        };
+        if exited {
+            let _ = crash_tx.send(handle);
+            return;
+        }
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1186,7 +1360,8 @@ models:
         let config: crate::config::Config =
             serde_yaml_ng::from_str(TEST_CONFIG_YAML).unwrap();
         let gpu_snapshot = Arc::new(tokio::sync::RwLock::new(Vec::new()));
-        let (mgr, _release_rx) = InstanceManager::new(&config, gpu_snapshot, None);
+        let (mgr, _release_rx, _crash_rx) =
+            InstanceManager::new(&config, gpu_snapshot, None);
         mgr
     }
 
@@ -1406,6 +1581,93 @@ models:
         assert!(rx1.await.is_err(), "removed waiter's sender must be dropped");
         assert!(!rx2.is_terminated(), "other waiter must stay parked");
         assert_eq!(mgr.queue_depth("m"), 1);
+    }
+
+    #[tokio::test]
+    async fn pre_output_crashes_block_model_after_limit() {
+        // crash_limit = 3 consecutive pre-output crashes → model blocked
+        // and the crashed instances unregistered.
+        let mgr = test_manager();
+        for _ in 0..3 {
+            let handle = make_handle(InstanceState::Loading, 0, Duration::ZERO);
+            mgr.instances
+                .write()
+                .unwrap()
+                .entry("m".to_owned())
+                .or_default()
+                .push(handle.clone());
+            mgr.handle_crash(handle).await;
+        }
+        assert!(mgr.is_blocked("m"), "model must be blocked after 3 pre-output crashes");
+        assert_eq!(instance_count(&mgr), 0, "crashed instances must be unregistered");
+    }
+
+    #[tokio::test]
+    async fn post_output_crashes_do_not_block_model() {
+        // Instances that reached Ready before crashing must not count
+        // toward the crash-block limit (plan §Backends).
+        let mgr = test_manager();
+        for _ in 0..5 {
+            let handle = make_handle(InstanceState::Ready, 0, Duration::ZERO);
+            mgr.instances
+                .write()
+                .unwrap()
+                .entry("m".to_owned())
+                .or_default()
+                .push(handle.clone());
+            mgr.handle_crash(handle).await;
+        }
+        assert!(!mgr.is_blocked("m"), "post-output crashes must not block the model");
+        assert_eq!(instance_count(&mgr), 0, "crashed instances must be unregistered");
+    }
+
+    #[tokio::test]
+    async fn crash_of_already_failed_instance_is_ignored() {
+        // A monitor report racing a managed removal (state already Failed)
+        // must be a no-op — no unregister, no crash count.
+        let mgr = test_manager();
+        let handle = make_handle(InstanceState::Failed, 0, Duration::ZERO);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle.clone());
+        mgr.handle_crash(handle).await;
+        assert!(!mgr.is_blocked("m"));
+        assert_eq!(instance_count(&mgr), 1, "already-failed instance must be left alone");
+    }
+
+    #[tokio::test]
+    async fn unblock_resets_crash_counter() {
+        // Two crashes, unblock (resets the counter), two more crashes —
+        // with limit 3 the model must not be blocked.
+        let mgr = test_manager();
+        for _ in 0..2 {
+            let handle = make_handle(InstanceState::Loading, 0, Duration::ZERO);
+            mgr.instances
+                .write()
+                .unwrap()
+                .entry("m".to_owned())
+                .or_default()
+                .push(handle.clone());
+            mgr.handle_crash(handle).await;
+        }
+        mgr.unblock_model("m");
+        for _ in 0..2 {
+            let handle = make_handle(InstanceState::Loading, 0, Duration::ZERO);
+            mgr.instances
+                .write()
+                .unwrap()
+                .entry("m".to_owned())
+                .or_default()
+                .push(handle.clone());
+            mgr.handle_crash(handle).await;
+        }
+        assert!(
+            !mgr.is_blocked("m"),
+            "counter reset on unblock — two fresh crashes must not reach the limit"
+        );
     }
 
     #[test]

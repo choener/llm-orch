@@ -47,10 +47,6 @@ pub struct Instance {
     /// Timestamp of the last request completion (for TTL tracking).
     pub last_active: Instant,
 
-    /// How many times this instance has crashed *before* producing output.
-    /// Reset on first successful health check.
-    pub crash_count: usize,
-
     /// Channel sender for notifying the manager on slot release.
     /// `None` in tests or after shutdown.
     pub release_tx: Option<mpsc::UnboundedSender<String>>,
@@ -74,7 +70,6 @@ impl Instance {
             child: None,
             in_flight: 0,
             last_active: Instant::now(),
-            crash_count: 0,
             release_tx,
         }
     }
@@ -82,7 +77,6 @@ impl Instance {
     /// Mark this instance as ready (health check passed).
     pub fn mark_ready(&mut self) {
         self.state = InstanceState::Ready;
-        self.crash_count = 0;
     }
 
     /// Mark this instance as failed.
@@ -117,19 +111,6 @@ impl Instance {
     /// Whether this instance has spare capacity for another request.
     pub fn has_capacity(&self, max_concurrent: usize) -> bool {
         self.state == InstanceState::Ready && self.in_flight < max_concurrent
-    }
-
-    /// Called after the child process exits.  Returns `true` if this was a
-    /// "zero-output crash" — the instance never reached Ready, so the crash
-    /// counter should be incremented and the model potentially blocked.
-    pub fn on_exit(&mut self) -> bool {
-        self.state = InstanceState::Failed;
-        if self.crash_count == 0 && self.child.is_some() {
-            false
-        } else {
-            self.crash_count += 1;
-            true
-        }
     }
 
     /// Whether the instance has been idle longer than `ttl_seconds`.
