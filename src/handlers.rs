@@ -776,6 +776,9 @@ fn apply_alias_prompts(
                     role: "system".into(),
                     content: Some(MessageContent::Text(sp)),
                     name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    extra: serde_json::Map::new(),
                 },
             );
         }

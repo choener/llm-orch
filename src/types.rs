@@ -17,6 +17,18 @@ pub struct ChatMessage {
     /// Optional name for the participant (used for multi-party conversations).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Tool calls issued by the assistant. Kept as a raw `Value` — modelling
+    /// the inner tool_call structure would just be another lossy trap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Value>,
+    /// Links a `role:"tool"` result message back to its tool call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Pass through any other message-level fields verbatim
+    /// (`reasoning_content`, `tool_responses`, `refusal`, and anything future).
+    /// Without this, the proxy silently drops them and breaks tool calling.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Message content — can be a plain string or an array of content parts
@@ -36,6 +48,11 @@ pub enum ContentPart {
     Text { text: String },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: ImageUrl },
+    /// Catch-all for content part types we don't model explicitly
+    /// (`input_audio`, video, ...). Passed through verbatim so an unknown
+    /// part type can't fail deserialization of the entire request.
+    #[serde(untagged)]
+    Other(Map<String, Value>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -429,6 +446,57 @@ mod tests {
         let req: ChatCompletionRequest = serde_json::from_str(input).unwrap();
         let output = serde_json::to_string(&req).unwrap();
         assert!(output.contains("\"stream\":true"), "stream=true must be present: {}", output);
+    }
+
+    #[test]
+    fn chat_request_preserves_message_level_tool_fields() {
+        // Regression test: tool calling used to break because ChatMessage
+        // silently dropped `tool_calls`, `tool_call_id`, and any other
+        // message-level field during the deserialize/re-serialize round-trip.
+        let tool_calls = serde_json::json!([{
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "bash", "arguments": "{\"cmd\":\"ls\"}"}
+        }]);
+        let input = serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "list files"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": tool_calls,
+                    "reasoning_content": "I should run ls"
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "file1.txt"}
+            ]
+        });
+        let req: ChatCompletionRequest =
+            serde_json::from_value(input.clone()).unwrap();
+        let output = serde_json::to_value(&req).unwrap();
+        // Every message-level field must survive verbatim.
+        assert_eq!(output, input, "message-level fields were lost in round-trip");
+    }
+
+    #[test]
+    fn chat_request_tolerates_unknown_content_part_types() {
+        // Regression test: an unknown content part type (e.g. input_audio)
+        // must not fail deserialization of the entire request, and must be
+        // passed through verbatim.
+        let input = serde_json::json!({
+            "model": "m",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "transcribe"},
+                    {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}
+                ]
+            }]
+        });
+        let req: ChatCompletionRequest =
+            serde_json::from_value(input.clone()).unwrap();
+        let output = serde_json::to_value(&req).unwrap();
+        assert_eq!(output, input, "unknown content part was lost in round-trip");
     }
 
     #[test]
