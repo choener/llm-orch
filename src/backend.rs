@@ -141,15 +141,30 @@ pub async fn mark_instance_ready(
 
 /// Gracefully shut down a backend child process.
 ///
-/// Sends SIGTERM, waits up to `drain_timeout`, then sends SIGKILL if the
-/// process is still alive.  Returns once the process has exited.
+/// Sends SIGTERM, waits up to `drain_timeout`, then escalates to SIGKILL
+/// if the process is still alive.  Returns once the process has exited.
+///
+/// Note: `tokio::process::Child::start_kill()` is SIGKILL on Unix — the
+/// graceful phase must go through `libc::kill` directly.
 pub async fn shutdown_child(child: &mut tokio::process::Child, drain_timeout: Duration) {
-    let pid = child.id().unwrap_or(0);
+    // child.id() returns None once the process has been reaped.  Never
+    // default to 0 here: kill(0, …) would signal our *own* process group.
+    let pid = match child.id() {
+        Some(pid) => pid,
+        None => return, // already reaped
+    };
 
-    // Try graceful shutdown.
-    if let Err(e) = child.start_kill() {
-        tracing::warn!(pid, error = %e, "SIGTERM failed");
-        return; // process already gone
+    // Graceful phase: SIGTERM on Unix; on other platforms start_kill is
+    // the only option (it maps to TerminateProcess / SIGKILL).
+    #[cfg(unix)]
+    let term_sent = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } == 0;
+    #[cfg(not(unix))]
+    let term_sent = child.start_kill().is_ok();
+
+    if !term_sent {
+        // Process likely already gone — reap it and bail out.
+        let _ = tokio::time::timeout(drain_timeout, child.wait()).await;
+        return;
     }
 
     let result = tokio::time::timeout(drain_timeout, child.wait()).await;
