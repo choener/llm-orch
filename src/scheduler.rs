@@ -29,6 +29,18 @@ const QUEUE_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// used to deliver an instance handle once a slot frees up.
 type WaitQueue = VecDeque<(u64, oneshot::Sender<InstanceHandle>)>;
 
+/// How instance removal treats an instance with in-flight requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemovalMode {
+    /// Skip busy instances entirely (autoscale / TTL eviction).
+    IfIdle,
+    /// Mark busy instances draining (unroutable) and finish removal later
+    /// via `reap_drained` (admin unload, config removal).
+    Drain,
+    /// Kill even busy instances (shutdown, reaping).
+    Force,
+}
+
 // ── Model metrics (tickless EMA) ────────────────────────────────────────────
 
 /// Per-model exponentially-weighted moving averages for load and request rate.
@@ -878,7 +890,43 @@ impl InstanceManager {
         }
     }
 
-    async fn remove_instance(&self, model_name: &str, handle: &InstanceHandle) {
+    /// Remove an instance **if it is idle** (autoscale / TTL eviction).
+    ///
+    /// A busy instance is left completely untouched — still routable — and
+    /// the caller simply tries again on a later cycle.  Returns `true` when
+    /// the instance was removed.
+    async fn remove_instance(&self, model_name: &str, handle: &InstanceHandle) -> bool {
+        self.remove_instance_impl(model_name, handle, RemovalMode::IfIdle)
+            .await
+    }
+
+    /// Remove an instance, **draining** it when busy (admin unload, config
+    /// removal).
+    ///
+    /// A busy instance is marked `Failed` so no new requests are routed to
+    /// it, but its child keeps running until the in-flight requests finish;
+    /// `reap_drained` then completes the removal.  Returns `true` when the
+    /// instance was removed immediately.
+    async fn drain_instance(&self, model_name: &str, handle: &InstanceHandle) -> bool {
+        self.remove_instance_impl(model_name, handle, RemovalMode::Drain)
+            .await
+    }
+
+    /// Forcibly remove an instance, killing it even with in-flight
+    /// requests.  Only used by shutdown (after the HTTP drain) and by
+    /// `reap_drained` — normal removal paths must never interrupt client
+    /// requests.
+    async fn force_remove_instance(&self, model_name: &str, handle: &InstanceHandle) {
+        self.remove_instance_impl(model_name, handle, RemovalMode::Force)
+            .await;
+    }
+
+    async fn remove_instance_impl(
+        &self,
+        model_name: &str,
+        handle: &InstanceHandle,
+        mode: RemovalMode,
+    ) -> bool {
         let gpu_indices: Vec<usize> = {
             let inst = handle.inner().lock().unwrap();
             inst.gpu_indices.clone()
@@ -886,6 +934,26 @@ impl InstanceManager {
 
         let mut child = {
             let mut inst = handle.inner().lock().unwrap();
+            if inst.in_flight > 0 {
+                match mode {
+                    // Leave the instance fully intact and routable.
+                    RemovalMode::IfIdle => return false,
+                    // Mark unroutable but keep the child serving the
+                    // in-flight requests; reap_drained finishes the job.
+                    RemovalMode::Drain => {
+                        if inst.state != InstanceState::Failed {
+                            debug!(
+                                inst = %inst.id,
+                                in_flight = inst.in_flight,
+                                "instance busy — marked draining"
+                            );
+                            inst.state = InstanceState::Failed;
+                        }
+                        return false;
+                    }
+                    RemovalMode::Force => {}
+                }
+            }
             inst.state = InstanceState::Failed;
             inst.child.take()
         };
@@ -894,6 +962,34 @@ impl InstanceManager {
         }
 
         self.unregister_instance(model_name, handle, &gpu_indices).await;
+        true
+    }
+
+    /// Finish removing draining instances whose requests have completed.
+    ///
+    /// Draining instances are marked `Failed` but keep their child alive
+    /// until their in-flight count reaches zero.  Called on every slot
+    /// release (and periodically from the autoscaler) for `model_name`.
+    pub async fn reap_drained(&self, model_name: &str) {
+        let drained: Vec<InstanceHandle> = {
+            let instances = self.instances.read().unwrap();
+            instances
+                .get(model_name)
+                .map(|list| {
+                    list.iter()
+                        .filter(|h| {
+                            let inst = h.inner().lock().unwrap();
+                            inst.state == InstanceState::Failed && inst.in_flight == 0
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for handle in drained {
+            debug!(model = %model_name, inst = %handle.id(), "reaping drained instance");
+            self.force_remove_instance(model_name, &handle).await;
+        }
     }
 
     /// Remove an instance from the registry: free its port, fail parked
@@ -1026,7 +1122,13 @@ impl InstanceManager {
         &self.client
     }
 
-    pub async fn unload_model(&self, model_name: &str) {
+    /// Unload all instances of a model (admin unload, config removal).
+    ///
+    /// Idle instances are removed immediately; busy ones are marked
+    /// draining (unroutable) and finished by `reap_drained` once their
+    /// in-flight requests complete — client requests are never
+    /// interrupted.  Returns `(removed, draining)`.
+    pub async fn unload_model(&self, model_name: &str) -> (usize, usize) {
         let handles: Vec<InstanceHandle> = {
             let instances = self.instances.read().unwrap();
             instances
@@ -1035,13 +1137,19 @@ impl InstanceManager {
                 .unwrap_or_default()
         };
 
-        let count = handles.len();
+        let mut removed = 0;
+        let mut draining = 0;
         for handle in &handles {
-            self.remove_instance(model_name, handle).await;
+            if self.drain_instance(model_name, handle).await {
+                removed += 1;
+            } else {
+                draining += 1;
+            }
         }
-        if count > 0 {
-            info!(model = %model_name, count = count, "unloaded via admin");
+        if removed > 0 || draining > 0 {
+            info!(model = %model_name, removed, draining, "model unload requested");
         }
+        (removed, draining)
     }
 
     // ── shutdown ─────────────────────────────────────────────────────────
@@ -1062,7 +1170,9 @@ impl InstanceManager {
                 let mut inst = handle.inner().lock().unwrap();
                 inst.release_tx = None;
             }
-            self.remove_instance(&model_name, &handle).await;
+            // Shutdown: the HTTP server has already drained, but kill even
+            // busy instances rather than leaking backend processes.
+            self.force_remove_instance(&model_name, &handle).await;
         }
 
         let keepalive = self.keepalive.read().unwrap().clone();
@@ -1313,6 +1423,10 @@ impl InstanceManager {
             .collect();
 
         for (model_name, cfg) in &configs {
+            // Safety net: finish removals of draining instances whose
+            // in-flight requests have completed.
+            self.reap_drained(model_name).await;
+
             let num_instances = {
                 self.instances.read().unwrap()
                     .get(model_name)
@@ -1404,19 +1518,24 @@ impl InstanceManager {
             if num_instances > 1 {
                 let reduced_cap = (cfg.max_concurrent * (num_instances - 1)) as f64;
                 if m.load_m15 < a.scale_down_at * reduced_cap {
-                    let victim = self.pick_least_loaded(model_name);
-                    if let Some(handle) = victim {
-                        info!(
-                            model = %model_name,
-                            load_m15 = %m.load_m15,
-                            threshold = %(a.scale_down_at * reduced_cap),
-                            "autoscale: scaling down"
-                        );
-                        self.remove_instance(model_name, &handle).await;
-                        self.last_scale_action.write().unwrap()
-                            .insert(model_name.clone(), now);
-                        continue;
+                    // Prefer the least-loaded instance, but skip busy ones
+                    // entirely — in-flight requests must never be
+                    // interrupted.  remove_instance is atomic with respect
+                    // to slot acquisition, so a lost race is a no-op.
+                    for handle in self.instances_by_load(model_name) {
+                        if self.remove_instance(model_name, &handle).await {
+                            info!(
+                                model = %model_name,
+                                load_m15 = %m.load_m15,
+                                threshold = %(a.scale_down_at * reduced_cap),
+                                "autoscale: scaled down"
+                            );
+                            self.last_scale_action.write().unwrap()
+                                .insert(model_name.clone(), now);
+                            break;
+                        }
                     }
+                    continue;
                 }
             }
         }
@@ -1430,6 +1549,18 @@ impl InstanceManager {
         list.iter()
             .min_by_key(|h| h.inner().lock().unwrap().in_flight)
             .cloned()
+    }
+
+    /// Instance handles for `model_name`, sorted by in-flight count
+    /// (ascending).
+    fn instances_by_load(&self, model_name: &str) -> Vec<InstanceHandle> {
+        let instances = self.instances.read().unwrap();
+        let mut list: Vec<InstanceHandle> = instances
+            .get(model_name)
+            .map(|l| l.iter().cloned().collect())
+            .unwrap_or_default();
+        list.sort_by_key(|h| h.inner().lock().unwrap().in_flight);
+        list
     }
 }
 
@@ -1880,6 +2011,55 @@ models:
         let list = &instances["m"];
         assert_eq!(list.len(), 1, "only the targeted instance may be removed");
         assert!(Arc::ptr_eq(list[0].inner(), h2.inner()));
+    }
+
+    #[tokio::test]
+    async fn busy_instance_is_drained_not_killed() {
+        // Admin unload of a busy instance must not interrupt the in-flight
+        // request: the instance is marked draining (unroutable) and only
+        // removed once the request completes.
+        let mgr = test_manager();
+        let handle = make_handle(InstanceState::Ready, 1, Duration::ZERO);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle.clone());
+
+        let (removed, draining) = mgr.unload_model("m").await;
+        assert_eq!((removed, draining), (0, 1));
+        assert_eq!(instance_count(&mgr), 1, "busy instance must survive");
+        assert_eq!(
+            handle.inner().lock().unwrap().state,
+            InstanceState::Failed,
+            "busy instance must be marked unroutable"
+        );
+        // No new slots may be acquired on a draining instance.
+        assert!(handle.try_acquire(4).is_none());
+
+        // The in-flight request completes → reap finishes the removal.
+        handle.inner().lock().unwrap().in_flight = 0;
+        mgr.reap_drained("m").await;
+        assert_eq!(instance_count(&mgr), 0, "drained instance must be reaped");
+    }
+
+    #[tokio::test]
+    async fn if_idle_removal_leaves_busy_instance_untouched() {
+        // Autoscale/TTL removal must be a pure no-op for busy instances —
+        // no state change, no draining mark, instance stays routable.
+        let mgr = test_manager();
+        let handle = make_handle(InstanceState::Ready, 1, Duration::ZERO);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle.clone());
+
+        assert!(!mgr.remove_instance("m", &handle).await);
+        assert_eq!(instance_count(&mgr), 1);
+        assert_eq!(handle.inner().lock().unwrap().state, InstanceState::Ready);
     }
 
     #[test]

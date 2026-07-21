@@ -696,11 +696,14 @@ pub async fn admin_unload(
         }
     }
 
-    state.manager.unload_model(&body.model).await;
+    let (removed, draining) = state.manager.unload_model(&body.model).await;
 
     Ok(Json(AdminResponse {
         status: "ok".into(),
-        message: format!("all instances of model '{}' unloaded", body.model),
+        message: format!(
+            "model '{}': {} instance(s) unloaded, {} draining (busy — removed when idle)",
+            body.model, removed, draining
+        ),
     }))
     }.instrument(span).await
 }

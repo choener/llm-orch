@@ -141,6 +141,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             while let Some(model_name) = rx.recv().await {
                 mgr.record_metrics_event(&model_name, 1);
                 mgr.wake_one(&model_name);
+                // Finish removing draining instances whose last in-flight
+                // request just completed.
+                mgr.reap_drained(&model_name).await;
             }
         }
     });
