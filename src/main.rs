@@ -233,7 +233,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The apikeys path currently being watched — updated when a
             // config reload points us at a different file.
             let mut watched_apikeys = apikeys_path.clone();
-            while let Ok(event) = reload_rx.recv().await {
+            loop {
+                let event = match reload_rx.recv().await {
+                    Ok(event) => event,
+                    // Bursty edits overflowed the broadcast channel — some
+                    // events were lost.  Reloads are idempotent and
+                    // mtime-gated, so resync both files and keep going
+                    // instead of silently killing hot-reload for the rest
+                    // of the process lifetime.
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(skipped = n, "reload events lagged — resyncing watched files");
+                        handle_config_reload(
+                            &config_path, &cfg, &apikeys, &manager, &last_mtime,
+                        ).await;
+                        handle_apikeys_reload(&watched_apikeys, &apikeys, &last_ak_mtime).await;
+                        continue;
+                    }
+                    // All senders dropped — watcher is gone (shutdown).
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
                 // The watcher already pre-filters to our watched paths.
                 // Determine which file changed by comparing to canonical paths.
                 let cfg_p = config_path.canonicalize().ok();
@@ -281,6 +299,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+            debug!("reload event channel closed — reload task exiting");
         }
     });
 
