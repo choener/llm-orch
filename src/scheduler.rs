@@ -739,9 +739,9 @@ impl InstanceManager {
             let instances = self.instances.read().unwrap();
             if let Some(list) = instances.get(&model_cfg.name) {
                 list.iter()
-                    .filter_map(|h| {
+                    .flat_map(|h| {
                         let inst = h.inner().lock().unwrap();
-                        inst.gpu_indices.first().copied()
+                        inst.gpu_indices.clone()
                     })
                     .collect()
             } else {
@@ -758,7 +758,10 @@ impl InstanceManager {
                     .unwrap_or(0);
                 for handle in list {
                     let inst = handle.inner().lock().unwrap();
-                    if let Some(&vulkan_idx) = inst.gpu_indices.first() {
+                    // Attribute the full declared VRAM to *every* occupied
+                    // GPU — conservative, but prevents oversubscription
+                    // when a multi-device instance spans several GPUs.
+                    for &vulkan_idx in &inst.gpu_indices {
                         *used.entry(vulkan_idx).or_default() += model_vram;
                     }
                 }
@@ -823,7 +826,7 @@ impl InstanceManager {
             for list in instances.values() {
                 for handle in list {
                     let inst = handle.inner().lock().unwrap();
-                    if let Some(&vulkan_idx) = inst.gpu_indices.first() {
+                    for &vulkan_idx in &inst.gpu_indices {
                         *counts.entry(vulkan_idx).or_default() += 1;
                     }
                 }
