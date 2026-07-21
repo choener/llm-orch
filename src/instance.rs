@@ -20,8 +20,8 @@ pub enum InstanceState {
 
 /// A running backend process managed by the scheduler.
 ///
-/// Wrapped in `Arc<Mutex<…>>` so an `InstanceHandle` can share ownership and
-/// release the in-flight slot on drop.
+/// Wrapped in `Arc<Mutex<…>>` so an `InstanceHandle` can share ownership.
+/// In-flight slot lifecycle is tied to `SlotGuard`, not to handle clones.
 pub struct Instance {
     /// Deterministic ID, e.g. `"qwen3-32b@0,1"`.
     pub id: String,
@@ -96,7 +96,7 @@ impl Instance {
         self.last_active = Instant::now();
     }
 
-    /// Decrement the in-flight counter.  Called by `InstanceHandle::drop()`.
+    /// Decrement the in-flight counter.  Called by `SlotGuard::drop()`.
     ///
     /// Sends a release notification on the metrics channel only when this
     /// release actually freed a slot (`in_flight` was > 0 before decrement).
@@ -144,8 +144,10 @@ impl Instance {
 
 /// A cloneable, reference-counted handle to a running instance.
 ///
-/// When the last handle referring to a particular request context is dropped,
-/// `release_slot()` is called automatically, preventing leaked in-flight counts.
+/// Handles are freely cloneable and their `Drop` is a **no-op** — internal
+/// copies (instance lists, queues, scheduler temporaries) must never affect
+/// slot accounting.  In-flight slots are owned by `SlotGuard`, created only
+/// by `try_acquire`, which releases the slot exactly once on drop.
 #[derive(Clone)]
 pub struct InstanceHandle {
     inner: Arc<Mutex<Instance>>,
@@ -163,20 +165,16 @@ impl InstanceHandle {
         self.inner.lock().unwrap().id.clone()
     }
 
-    /// Acquire a slot on the instance.  Returns `true` if capacity was available.
-    pub fn try_acquire(&self, max_concurrent: usize) -> bool {
+    /// Acquire a slot on the instance.  Returns a RAII guard that releases
+    /// the slot on drop, or `None` if no capacity was available.
+    pub fn try_acquire(&self, max_concurrent: usize) -> Option<SlotGuard> {
         let mut inst = self.inner.lock().unwrap();
         if inst.has_capacity(max_concurrent) {
             inst.acquire_slot();
-            true
+            Some(SlotGuard::new(self.clone()))
         } else {
-            false
+            None
         }
-    }
-
-    /// Release the in-flight slot explicitly (normally done by Drop).
-    pub fn release(&self) {
-        self.inner.lock().unwrap().release_slot();
     }
 
     /// Return a clone of the inner `Arc` for sharing across tasks.
@@ -190,9 +188,33 @@ impl InstanceHandle {
     }
 }
 
-impl Drop for InstanceHandle {
+// ── Slot guard (RAII slot ownership) ─────────────────────────────────────────
+
+/// RAII guard representing one acquired in-flight slot on an instance.
+///
+/// Created exclusively by `InstanceHandle::try_acquire` — exactly one guard
+/// per acquired slot.  Dropping the guard releases the slot.  The guard is
+/// deliberately **not** `Clone`: a guard models unique ownership of a slot,
+/// so slot releases stay balanced with acquisitions no matter how often the
+/// underlying `InstanceHandle` is cloned.
+pub struct SlotGuard {
+    handle: InstanceHandle,
+}
+
+impl SlotGuard {
+    fn new(handle: InstanceHandle) -> Self {
+        Self { handle }
+    }
+
+    /// Access the underlying instance handle (e.g. to read id/port).
+    pub fn handle(&self) -> &InstanceHandle {
+        &self.handle
+    }
+}
+
+impl Drop for SlotGuard {
     fn drop(&mut self) {
-        if let Ok(mut inst) = self.inner.lock() {
+        if let Ok(mut inst) = self.handle.inner.lock() {
             inst.release_slot();
         }
     }
@@ -235,12 +257,12 @@ mod tests {
         let mut inst = Instance::new("test", vec![0], 9003, None);
         inst.mark_ready();
         let handle = InstanceHandle::new(inst);
-        assert!(handle.try_acquire(4));
+        let guard = handle.try_acquire(4).expect("slot available");
         {
             let inst = handle.inner.lock().unwrap();
             assert_eq!(inst.in_flight, 1);
         }
-        handle.release();
+        drop(guard);
         {
             let inst = handle.inner.lock().unwrap();
             assert_eq!(inst.in_flight, 0);
@@ -253,8 +275,29 @@ mod tests {
         inst.mark_ready();
         let handle = InstanceHandle::new(inst);
         // max_concurrent = 1, acquire one slot
-        assert!(handle.try_acquire(1));
+        let _guard = handle.try_acquire(1).expect("first slot available");
         // second acquire should fail
-        assert!(!handle.try_acquire(1));
+        assert!(handle.try_acquire(1).is_none());
+    }
+
+    #[test]
+    fn handle_clone_drop_does_not_release_slot() {
+        // Regression test: handle clones (instance lists, queues, scheduler
+        // temporaries) must never affect slot accounting.  Only dropping the
+        // SlotGuard releases the slot.
+        let mut inst = Instance::new("test", vec![0], 9005, None);
+        inst.mark_ready();
+        let handle = InstanceHandle::new(inst);
+        let guard = handle.try_acquire(4).expect("slot available");
+        for _ in 0..10 {
+            let clone = handle.clone();
+            drop(clone);
+        }
+        assert_eq!(handle.inner.lock().unwrap().in_flight, 1);
+        let probe = handle.clone();
+        drop(handle);
+        assert_eq!(probe.inner.lock().unwrap().in_flight, 1);
+        drop(guard);
+        assert_eq!(probe.inner.lock().unwrap().in_flight, 0);
     }
 }

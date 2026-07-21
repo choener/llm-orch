@@ -44,7 +44,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::AliasConfig;
 use crate::debug_log::{DebugLogEntry, DebugStreamContext, ts_now};
-use crate::instance::InstanceHandle;
+use crate::instance::SlotGuard;
 use crate::scheduler::InstanceManager;
 use crate::server::{ApiKey, ApiError, AppState};
 use crate::types::*;
@@ -286,8 +286,8 @@ pub async fn chat_completions(
         }
     }; // cfg read guard dropped
 
-    // ── 4. Acquire an instance (or queue). ──────────────────────────────
-    let handle = state
+    // ── 4. Acquire an instance slot (or queue). ─────────────────────────
+    let guard = state
         .manager
         .get_or_spawn(&model_name)
         .await
@@ -302,17 +302,17 @@ pub async fn chat_completions(
             }
         })?;
 
-    // Capture instance ID now that we have the handle.
+    // Capture instance ID now that we hold the slot guard.
     let instance_id = {
-        let inst = handle.inner().lock().unwrap();
+        let inst = guard.handle().inner().lock().unwrap();
         inst.id.clone()
-    }; // inner lock dropped — `handle` itself is still alive (Arc)
+    }; // inner lock dropped — `guard` itself is still alive
 
     // ── 5. Read the port from the instance. ────────────────────────────
     let port = {
-        let inst = handle.inner().lock().unwrap();
+        let inst = guard.handle().inner().lock().unwrap();
         inst.port
-    }; // inner lock dropped — `handle` itself is still alive (Arc)
+    }; // inner lock dropped — `guard` itself is still alive
 
     let backend_url = format!("http://127.0.0.1:{}/v1/chat/completions", port);
 
@@ -338,7 +338,7 @@ pub async fn chat_completions(
 
     if request.stream {
         // Streaming mode: forward SSE stream from backend to client.
-        // The `InstanceHandle` is moved into the stream wrapper so the
+        // The `SlotGuard` is moved into the stream wrapper so the
         // in-flight slot is released when the stream ends (Drop).
         info!("stream start model={} inst={}", model_name, instance_id);
         let debug_ctx = debug_log_path.map(|path| DebugStreamContext {
@@ -355,7 +355,7 @@ pub async fn chat_completions(
             state.client.clone(),
             backend_url,
             request_body,
-            handle,
+            guard,
             model_name.clone(),
             instance_id.clone(),
             debug_ctx,
@@ -468,8 +468,8 @@ pub async fn completions(
         }
     }
 
-    // ── 3. Acquire instance. ────────────────────────────────────────────
-    let handle = state
+    // ── 3. Acquire instance slot. ───────────────────────────────────────
+    let guard = state
         .manager
         .get_or_spawn(&model_name)
         .await
@@ -484,15 +484,15 @@ pub async fn completions(
             }
         })?;
 
-    // Capture instance ID now that we have the handle.
+    // Capture instance ID now that we hold the slot guard.
     let instance_id = {
-        let inst = handle.inner().lock().unwrap();
+        let inst = guard.handle().inner().lock().unwrap();
         inst.id.clone()
     };
 
     // ── 4. Read port. ──────────────────────────────────────────────────
     let port = {
-        let inst = handle.inner().lock().unwrap();
+        let inst = guard.handle().inner().lock().unwrap();
         inst.port
     };
 
@@ -505,7 +505,7 @@ pub async fn completions(
             state.client.clone(),
             backend_url,
             serde_json::to_value(&request).unwrap_or_default(),
-            handle,
+            guard,
             model_name.clone(),
             instance_id.clone(),
             None,
@@ -567,8 +567,8 @@ pub async fn embeddings(
         }
     }
 
-    // ── 3. Acquire instance. ────────────────────────────────────────────
-    let handle = state
+    // ── 3. Acquire instance slot. ───────────────────────────────────────
+    let guard = state
         .manager
         .get_or_spawn(&model_name)
         .await
@@ -585,7 +585,7 @@ pub async fn embeddings(
 
     // ── 4. Read port. ──────────────────────────────────────────────────
     let port = {
-        let inst = handle.inner().lock().unwrap();
+        let inst = guard.handle().inner().lock().unwrap();
         inst.port
     };
 
@@ -606,10 +606,10 @@ pub async fn embeddings(
     let elapsed = t0.elapsed();
 
     let instance_id = {
-        let inst = handle.inner().lock().unwrap();
+        let inst = guard.handle().inner().lock().unwrap();
         inst.id.clone()
     };
-    drop(handle);
+    drop(guard);
 
     let resp: EmbeddingResponse = serde_json::from_value(response_body)
         .map_err(|e| ApiError::Internal(format!("failed to parse backend embedding response: {}", e)))?;
@@ -654,7 +654,7 @@ pub async fn admin_load(
     }
 
     // Spawn an instance (or get an existing one).
-    let _handle = state
+    let guard = state
         .manager
         .get_or_spawn(&body.model)
         .await
@@ -669,9 +669,9 @@ pub async fn admin_load(
             }
         })?;
 
-    // Drop the handle immediately — we just wanted to ensure an instance exists.
-    // The in-flight counter is decremented on drop.
-    drop(_handle);
+    // Drop the slot guard immediately — we just wanted to ensure an
+    // instance exists.  The in-flight slot is released on drop.
+    drop(guard);
 
     Ok(Json(AdminResponse {
         status: "ok".into(),
@@ -885,13 +885,13 @@ async fn forward_request_aggregate(
 /// Returns a `Stream<Item = Result<Event, Infallible>>` suitable for axum's
 /// `Sse` response type.
 ///
-/// The `InstanceHandle` is moved into the returned stream so the in-flight
+/// The `SlotGuard` is moved into the returned stream so the in-flight
 /// slot is released when the stream ends (via `Drop`).
 async fn build_sse_stream(
     client: reqwest::Client,
     backend_url: String,
     body: serde_json::Value,
-    handle: InstanceHandle,
+    guard: SlotGuard,
     model_name: String,
     instance_id: String,
     debug: Option<DebugStreamContext>,
@@ -941,14 +941,14 @@ async fn build_sse_stream(
                 .data(error_sse.to_string())
                 .event("error"))
         });
-        // Keep `handle` alive until the stream is consumed (just one event).
-        let stream = StreamWithHandle::new(Box::pin(stream), handle);
+        // Keep `guard` alive until the stream is consumed (just one event).
+        let stream = StreamWithGuard::new(Box::pin(stream), guard);
         return Ok(Box::pin(stream));
     }
 
     // Success — forward the byte stream as SSE events.
     let byte_stream = resp.bytes_stream();
-    let sse_stream = SseForwarder::new(byte_stream, handle, model_name, instance_id, debug, manager, api_user, request_id);
+    let sse_stream = SseForwarder::new(byte_stream, guard, model_name, instance_id, debug, manager, api_user, request_id);
 
     Ok(Box::pin(sse_stream))
 }
@@ -958,7 +958,7 @@ async fn build_sse_stream(
 /// A wrapper around a byte stream that converts backend SSE chunks into
 /// axum `Event` objects.
 ///
-/// Holds an `InstanceHandle` so the in-flight slot is released when the
+/// Holds a `SlotGuard` so the in-flight slot is released when the
 /// stream is dropped (end of response or client disconnect).
 struct SseForwarder<S> {
     inner: Option<S>,
@@ -974,7 +974,7 @@ struct SseForwarder<S> {
     request_id: String,
     t0: std::time::Instant,
     /// Kept alive until the stream ends.
-    _handle: InstanceHandle,
+    _guard: SlotGuard,
     instance_id: String,
 }
 
@@ -982,7 +982,7 @@ impl<S> SseForwarder<S>
 where
     S: Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
 {
-    fn new(stream: S, handle: InstanceHandle, model_name: String, instance_id: String, debug: Option<DebugStreamContext>, manager: Arc<InstanceManager>, api_user: String, request_id: String) -> Self {
+    fn new(stream: S, guard: SlotGuard, model_name: String, instance_id: String, debug: Option<DebugStreamContext>, manager: Arc<InstanceManager>, api_user: String, request_id: String) -> Self {
         debug!("SseForwarder::new: model={} inst={}", model_name, instance_id);
         Self {
             inner: Some(stream),
@@ -994,7 +994,7 @@ where
             api_user,
             request_id,
             t0: std::time::Instant::now(),
-            _handle: handle,
+            _guard: guard,
             instance_id,
         }
     }
@@ -1188,25 +1188,25 @@ fn detect_separator_len(buf: &[u8]) -> usize {
     }
 }
 
-/// A wrapper that keeps an `InstanceHandle` alive alongside an arbitrary stream.
+/// A wrapper that keeps a `SlotGuard` alive alongside an arbitrary stream.
 ///
-/// Used when we need to return an error stream that still holds the handle
+/// Used when we need to return an error stream that still holds the guard
 /// (so the in-flight slot is released after the single error event is consumed).
-struct StreamWithHandle<S> {
+struct StreamWithGuard<S> {
     inner: S,
-    _handle: InstanceHandle,
+    _guard: SlotGuard,
 }
 
-impl<S> StreamWithHandle<S> {
-    fn new(inner: S, handle: InstanceHandle) -> Self {
+impl<S> StreamWithGuard<S> {
+    fn new(inner: S, guard: SlotGuard) -> Self {
         Self {
             inner,
-            _handle: handle,
+            _guard: guard,
         }
     }
 }
 
-impl<S> Stream for StreamWithHandle<S>
+impl<S> Stream for StreamWithGuard<S>
 where
     S: Stream<Item = Result<Event, Infallible>> + Unpin,
 {

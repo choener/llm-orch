@@ -8,7 +8,7 @@ use crate::config::ModelConfig;
 use crate::gpu::GpuMetrics;
 use crate::types::CompletionRecord;
 use crate::http_client;
-use crate::instance::{Instance, InstanceHandle, InstanceState};
+use crate::instance::{Instance, InstanceHandle, InstanceState, SlotGuard};
 use crate::keepalive::KeepAliveManager;
 use crate::port_alloc::PortAllocator;
 
@@ -243,14 +243,14 @@ impl InstanceManager {
 
     // ── get-or-spawn ──────────────────────────────────────────────────────
 
-    /// Acquire an instance handle for `model_name`, spawning a new instance
+    /// Acquire an instance slot for `model_name`, spawning a new instance
     /// if necessary.  Returns `None` when the model is blocked, all instances
     /// are at capacity, the instance cap is reached and the queue is full.
     ///
-    /// The returned handle already has a slot acquired — the caller must
+    /// The returned guard already owns one in-flight slot — the caller must
     /// not call `try_acquire` again.  The slot is released automatically
-    /// when the handle is dropped.
-    pub async fn get_or_spawn(&self, model_name: &str) -> Option<InstanceHandle> {
+    /// when the guard is dropped.  Use `guard.handle()` to reach the instance.
+    pub async fn get_or_spawn(&self, model_name: &str) -> Option<SlotGuard> {
         if self.is_blocked(model_name) {
             return None;
         }
@@ -260,9 +260,9 @@ impl InstanceManager {
 
         // Fast path: find a ready instance with spare capacity.
         if let Some(handle) = self.find_ready_instance(model_name, max_concurrent) {
-            if handle.try_acquire(max_concurrent) {
+            if let Some(guard) = handle.try_acquire(max_concurrent) {
                 self.record_metrics_event(model_name, 0);
-                return Some(handle);
+                return Some(guard);
             }
         }
 
@@ -305,13 +305,13 @@ impl InstanceManager {
         // Slow path: try to spawn a new instance.
         if should_spawn {
             if let Some(handle) = self.try_spawn(model_name, cfg).await {
-                if handle.try_acquire(max_concurrent) {
+                if let Some(guard) = handle.try_acquire(max_concurrent) {
                     self.record_metrics_event(model_name, 0);
                     // Serve a parked waiter with any leftover capacity —
                     // otherwise queued requests would only be served after
                     // the next release event.
                     self.wake_one(model_name);
-                    return Some(handle);
+                    return Some(guard);
                 }
             }
         }
@@ -331,7 +331,7 @@ impl InstanceManager {
         model_name: &str,
         max_depth: usize,
         max_concurrent: usize,
-    ) -> Option<InstanceHandle> {
+    ) -> Option<SlotGuard> {
         let has_instances = self
             .instances
             .read()
@@ -356,9 +356,9 @@ impl InstanceManager {
 
         let handle = rx.await.ok()?;
 
-        if handle.try_acquire(max_concurrent) {
+        if let Some(guard) = handle.try_acquire(max_concurrent) {
             self.record_metrics_event(model_name, 0);
-            Some(handle)
+            Some(guard)
         } else {
             None
         }
