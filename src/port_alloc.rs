@@ -74,6 +74,23 @@ impl PortAllocator {
         None
     }
 
+    /// Allocate a port according to the configured strategy.
+    ///
+    /// Single entry point so callers hold the allocator lock exactly once.
+    ///
+    /// The returned port is only *likely* free: there is an inherent
+    /// TOCTOU window between the check (range mode: bind probe; ephemeral
+    /// mode: bind+release) and the backend's own `bind()`.  Spawns that
+    /// lose this race exit immediately and are detected by the readiness
+    /// poll, so they fail fast instead of waiting out the spawn timeout.
+    pub async fn allocate(&mut self) -> Option<u16> {
+        if self.is_ephemeral() {
+            self.allocate_ephemeral_async().await
+        } else {
+            self.allocate_range_sync()
+        }
+    }
+
     /// Try to allocate an ephemeral port (async).
     ///
     /// Returns `Some(port)` on success.  Ephemeral ports are not tracked

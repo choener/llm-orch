@@ -526,22 +526,18 @@ impl InstanceManager {
             }
         }
 
-        // Allocate a port.
-        let port = if self.ports.lock().await.is_ephemeral() {
-            let p = self.ports.lock().await.allocate_ephemeral_async().await;
-            if p.is_some() {
-                debug!(model = %model_name, port = p.unwrap(), "allocated ephemeral port");
-            } else {
-                warn!(model = %model_name, "no ephemeral port available");
-            }
-            p?
-        } else {
-            let p = self.ports.lock().await.allocate_range_sync();
-            if p.is_none() {
-                warn!(model = %model_name, "no free ports in range");
-            }
-            p?
-        };
+        // Allocate a port (single lock acquisition).
+        //
+        // The free-port check is inherently TOCTOU — another process can
+        // grab the port between our check and the backend's bind().  The
+        // readiness poll detects the resulting instant child exit and
+        // fails the spawn fast instead of waiting out the spawn timeout.
+        let port = self.ports.lock().await.allocate().await;
+        match port {
+            Some(p) => debug!(model = %model_name, port = p, "allocated port"),
+            None => warn!(model = %model_name, "no port available"),
+        }
+        let port = port?;
 
         // Resolve the command string.
         let model_cmd = self.resolve_cmd(cfg, port);
