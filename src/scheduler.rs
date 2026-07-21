@@ -25,6 +25,13 @@ use tracing::{debug, error, info, warn};
 /// park the HTTP request forever.
 const QUEUE_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long a spawn holds the global spawn semaphore while waiting for
+/// readiness.  Covers process start + initial load — the window where
+/// concurrent loads would thrash the SSD and interleave VRAM allocations.
+/// Slow loads keep waiting *without* the semaphore afterwards so one
+/// slow model cannot head-of-line block spawns of every other model.
+const SPAWN_SERIAL_WINDOW: Duration = Duration::from_secs(15);
+
 /// A parked waiter: unique id (for timeout self-removal) plus the channel
 /// used to deliver an instance handle once a slot frees up.
 type WaitQueue = VecDeque<(u64, oneshot::Sender<InstanceHandle>)>;
@@ -196,9 +203,11 @@ pub struct InstanceManager {
     /// Per-model EMA metrics (load & request rate).
     model_metrics: RwLock<HashMap<String, ModelMetrics>>,
 
-    /// Global semaphore to serialize all spawn attempts across models.
-    /// Prevents concurrent model loads from thrashing the SSD and
-    /// interleaving VRAM allocations.
+    /// Global semaphore to serialize the critical section of spawn
+    /// attempts across models (process start + `SPAWN_SERIAL_WINDOW` of
+    /// readiness).  Prevents concurrent model loads from thrashing the
+    /// SSD and interleaving VRAM allocations without head-of-line
+    /// blocking unrelated models for the full spawn timeout.
     spawn_semaphore: Arc<Semaphore>,
 
     /// Per-model timestamp of the last autoscale action (cooldown enforcement).
@@ -512,8 +521,10 @@ impl InstanceManager {
     /// Attempt to spawn a new instance for `model`.  Returns `None` if the
     /// per-model instance cap has been reached.
     async fn try_spawn(&self, model_name: &str, cfg: &ModelConfig) -> Option<InstanceHandle> {
-        // Serialize all spawn attempts globally — prevents concurrent
-        // model loads from thrashing the SSD and interleaving VRAM.
+        // Serialize the critical section of spawn attempts globally —
+        // prevents concurrent model loads from thrashing the SSD and
+        // interleaving VRAM.  Released after SPAWN_SERIAL_WINDOW of
+        // readiness waiting, not after the full spawn timeout.
         let _permit = self.spawn_semaphore.clone().acquire_owned().await.ok()?;
 
         // Inside the semaphore: check instance cap.
@@ -630,11 +641,26 @@ impl InstanceManager {
         // over from a previous despawn — while it is still loading.
         self.touch_activity(model_name);
 
-        // Wait for readiness (with timeout).  The poll fails fast when
+        // Wait for readiness in two phases.  The poll fails fast when
         // the child exits before becoming healthy instead of waiting out
         // the full spawn timeout.
-        let outcome =
-            poll_readiness(&handle, &self.client, &self.backend, self.spawn_timeout).await;
+        //
+        // Phase 1 (serialized): process start + initial load — fast
+        // backends become ready here, dead-on-arrival ones are detected
+        // here too.
+        let phase1 =
+            poll_readiness(&handle, &self.client, &self.backend, SPAWN_SERIAL_WINDOW).await;
+        // Release the global spawn lock before the long tail so a slow
+        // model can't head-of-line block spawns of every other model.
+        drop(_permit);
+        // Phase 2 (unserialized): wait out the remaining timeout.
+        let outcome = match phase1 {
+            ReadyOutcome::TimedOut => {
+                let remaining = self.spawn_timeout.saturating_sub(SPAWN_SERIAL_WINDOW);
+                poll_readiness(&handle, &self.client, &self.backend, remaining).await
+            }
+            other => other,
+        };
         if outcome != ReadyOutcome::Ready {
             // Distinguish a dead process (pre-output crash — counts toward
             // the model block limit) from a live-but-slow load (no count).
