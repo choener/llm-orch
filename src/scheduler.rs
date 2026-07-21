@@ -307,6 +307,10 @@ impl InstanceManager {
             if let Some(handle) = self.try_spawn(model_name, cfg).await {
                 if handle.try_acquire(max_concurrent) {
                     self.record_metrics_event(model_name, 0);
+                    // Serve a parked waiter with any leftover capacity —
+                    // otherwise queued requests would only be served after
+                    // the next release event.
+                    self.wake_one(model_name);
                     return Some(handle);
                 }
             }
@@ -317,7 +321,10 @@ impl InstanceManager {
     }
 
     /// Enqueue the caller, waiting for an instance slot to free up.
-    /// Returns `None` if the queue is at capacity (caller should return 429).
+    /// Returns `None` if the queue is at capacity (caller should return 429),
+    /// or if no instance exists (or is loading) — in that case no release or
+    /// spawn event could ever wake the parked waiter, so fail fast instead
+    /// of hanging forever.
     /// Acquires the slot on the received handle before returning.
     async fn enqueue(
         &self,
@@ -325,6 +332,17 @@ impl InstanceManager {
         max_depth: usize,
         max_concurrent: usize,
     ) -> Option<InstanceHandle> {
+        let has_instances = self
+            .instances
+            .read()
+            .unwrap()
+            .get(model_name)
+            .map(|l| !l.is_empty())
+            .unwrap_or(false);
+        if !has_instances {
+            return None;
+        }
+
         let (tx, rx) = oneshot::channel();
 
         {
@@ -343,6 +361,25 @@ impl InstanceManager {
             Some(handle)
         } else {
             None
+        }
+    }
+
+    /// If no instances remain for `model_name`, drop all parked queue
+    /// senders.  Each waiter's `rx.await` then resolves to `Err`, making the
+    /// request fail fast instead of hanging forever — `wake_one` is only
+    /// called on release events, which require a live instance.
+    fn drain_queue_if_no_instances(&self, model_name: &str) {
+        let none_left = self
+            .instances
+            .read()
+            .unwrap()
+            .get(model_name)
+            .map(|l| l.is_empty())
+            .unwrap_or(true);
+        if none_left
+            && let Some(q) = self.queues.write().unwrap().get_mut(model_name)
+        {
+            q.clear();
         }
     }
 
@@ -505,6 +542,7 @@ impl InstanceManager {
                     list.retain(|h| h.id() != handle.id());
                 }
             }
+            self.drain_queue_if_no_instances(model_name);
 
             return None;
         }
@@ -749,6 +787,7 @@ impl InstanceManager {
                 list.retain(|h| h.id() != handle.id());
             }
         }
+        self.drain_queue_if_no_instances(model_name);
 
         if let Some(ref ka) = self.keepalive {
             for vulkan_idx in &gpu_indices {
@@ -1046,6 +1085,8 @@ impl InstanceManager {
                     if self.try_spawn(model_name, cfg).await.is_some() {
                         self.last_scale_action.write().unwrap()
                             .insert(model_name.clone(), now);
+                        // A proactive scale-up may serve parked waiters.
+                        self.wake_one(model_name);
                         continue;
                     }
                 }
@@ -1109,7 +1150,16 @@ models:
     }
 
     fn make_handle(state: InstanceState, in_flight: usize, idle_for: Duration) -> InstanceHandle {
-        let mut inst = Instance::new("m", vec![], 54321, None);
+        make_handle_on_gpus(vec![0], state, in_flight, idle_for)
+    }
+
+    fn make_handle_on_gpus(
+        gpus: Vec<usize>,
+        state: InstanceState,
+        in_flight: usize,
+        idle_for: Duration,
+    ) -> InstanceHandle {
+        let mut inst = Instance::new("m", gpus, 54321, None);
         inst.state = state;
         inst.in_flight = in_flight;
         inst.last_active = Instant::now() - idle_for;
@@ -1206,6 +1256,74 @@ models:
             instance_count(&mgr),
             0,
             "genuinely idle instance past TTL must be despawned"
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_refused_when_no_instances_exist() {
+        // Spawn failure with zero instances registered must not park the
+        // request forever: nothing would ever wake the waiter.
+        let mgr = test_manager();
+        let result = mgr.enqueue("m", 8, 4).await;
+        assert!(result.is_none(), "enqueue with no instances must fail fast");
+    }
+
+    #[tokio::test]
+    async fn parked_waiter_released_when_last_instance_removed() {
+        // A queued request must fail fast when the last instance goes away
+        // (despawn / crash / admin unload) instead of hanging forever.
+        let mgr = test_manager();
+        let handle = make_handle(InstanceState::Ready, 0, Duration::ZERO);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle.clone());
+
+        let (tx, rx) = oneshot::channel();
+        mgr.queues
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push_back(tx);
+
+        mgr.remove_instance("m", &handle).await;
+
+        assert!(
+            rx.await.is_err(),
+            "waiter must be released when the last instance is removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn parked_waiter_kept_when_other_instances_remain() {
+        // Scale-down (n → n−1) must not disturb queued waiters.
+        let mgr = test_manager();
+        let h1 = make_handle_on_gpus(vec![0], InstanceState::Ready, 0, Duration::ZERO);
+        let h2 = make_handle_on_gpus(vec![1], InstanceState::Ready, 0, Duration::ZERO);
+        {
+            let mut instances = mgr.instances.write().unwrap();
+            let list = instances.entry("m".to_owned()).or_default();
+            list.push(h1.clone());
+            list.push(h2);
+        }
+
+        let (tx, rx) = oneshot::channel::<InstanceHandle>();
+        mgr.queues
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push_back(tx);
+
+        mgr.remove_instance("m", &h1).await;
+
+        assert_eq!(instance_count(&mgr), 1);
+        assert!(
+            !rx.is_terminated(),
+            "waiter must stay parked while instances remain"
         );
     }
 
