@@ -481,6 +481,11 @@ impl InstanceManager {
                 .push(handle.clone());
         }
 
+        // Spawn intent counts as activity: reset the idle-TTL clock so the
+        // autoscaler can't despawn this instance — using stale metrics left
+        // over from a previous despawn — while it is still loading.
+        self.touch_activity(model_name);
+
         // Wait for readiness (with timeout).
         if !mark_instance_ready(&handle, &self.client, &self.backend, self.spawn_timeout).await {
             warn!(model = %model_name, port = port, "health check timeout — shutting down instance");
@@ -854,6 +859,19 @@ impl InstanceManager {
         m.tick(now, active, completions_delta);
     }
 
+    /// Bump `last_activity` for `model_name` without advancing the EMAs.
+    ///
+    /// Called on spawn intent (when a new instance is registered as Loading)
+    /// so the idle-TTL despawn check never acts on a stale timestamp left
+    /// over from a previous despawn→respawn cycle.
+    pub(crate) fn touch_activity(&self, model_name: &str) {
+        let mut metrics_map = self.model_metrics.write().unwrap();
+        metrics_map
+            .entry(model_name.to_owned())
+            .or_default()
+            .last_activity = Instant::now();
+    }
+
     /// Force-refresh metrics for all models to `now`.
     ///
     /// Called by `/v1/info` and `/admin/status` to ensure returned load
@@ -931,6 +949,12 @@ impl InstanceManager {
     /// scale-up decisions and `load_m15` for scale-down, with hysteresis
     /// between the two thresholds and a per-model cooldown.
     pub async fn evaluate_autoscale(&self) {
+        // Advance EMAs to now and bump last_activity for every model with
+        // in-flight or queued requests.  Ticks otherwise only happen on
+        // acquire/release events, so without this a single long-running
+        // request (large context, many minutes) would let last_activity go
+        // stale mid-request and trip the idle-TTL despawn below.
+        self.force_refresh();
         let now = Instant::now();
         let metrics = self.model_metrics_snapshot();
 
@@ -968,6 +992,17 @@ impl InstanceManager {
             {
                 let handle = self.pick_least_loaded(model_name);
                 if let Some(h) = handle {
+                    // Re-check the victim instance itself before killing it.
+                    // is_idle_expired requires Ready + no in-flight requests
+                    // + instance-level idle past TTL, which excludes:
+                    //   - Loading instances (spawn in progress — their
+                    //     last_active is fresh and state != Ready),
+                    //   - instances that acquired a request after the
+                    //     metrics snapshot above was taken.
+                    let expired = h.inner().lock().unwrap().is_idle_expired(cfg.idle_ttl);
+                    if !expired {
+                        continue;
+                    }
                     let idle_secs = now.duration_since(m.last_activity).as_secs();
                     info!(
                         model = %model_name,
@@ -1046,5 +1081,152 @@ impl InstanceManager {
         list.iter()
             .min_by_key(|h| h.inner().lock().unwrap().in_flight)
             .cloned()
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_CONFIG_YAML: &str = r#"
+server: {}
+apikeys_file: apikeys.txt
+models:
+  - name: m
+    context_length: 4096
+    cmd: "sleep 3600"
+    idle_ttl: 60
+"#;
+
+    fn test_manager() -> InstanceManager {
+        let config: crate::config::Config =
+            serde_yaml_ng::from_str(TEST_CONFIG_YAML).unwrap();
+        let gpu_snapshot = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+        let (mgr, _release_rx) = InstanceManager::new(&config, gpu_snapshot, None);
+        mgr
+    }
+
+    fn make_handle(state: InstanceState, in_flight: usize, idle_for: Duration) -> InstanceHandle {
+        let mut inst = Instance::new("m", vec![], 54321, None);
+        inst.state = state;
+        inst.in_flight = in_flight;
+        inst.last_active = Instant::now() - idle_for;
+        InstanceHandle::new(inst)
+    }
+
+    /// Insert a handle and a stale metrics entry (as left over from a
+    /// previous despawn→respawn cycle) for model "m".
+    fn register_with_stale_metrics(mgr: &InstanceManager, handle: &InstanceHandle) {
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle.clone());
+        let stale = Instant::now() - Duration::from_secs(3600);
+        let mut metrics = mgr.model_metrics.write().unwrap();
+        metrics.insert(
+            "m".to_owned(),
+            ModelMetrics {
+                last_activity: stale,
+                ..Default::default()
+            },
+        );
+    }
+
+    fn instance_count(mgr: &InstanceManager) -> usize {
+        mgr.instances
+            .read()
+            .unwrap()
+            .get("m")
+            .map(|l| l.len())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn autoscale_does_not_despawn_loading_instance_with_stale_metrics() {
+        // Regression test for the respawn race: after a TTL despawn, the
+        // metrics entry keeps a stale last_activity.  A respawn triggered by
+        // a new request registers a Loading instance; the autoscaler must
+        // not kill it mid-spawn based on that stale timestamp.
+        let mgr = test_manager();
+        let handle = make_handle(InstanceState::Loading, 0, Duration::ZERO);
+        register_with_stale_metrics(&mgr, &handle);
+
+        mgr.evaluate_autoscale().await;
+
+        assert_eq!(
+            instance_count(&mgr),
+            1,
+            "Loading instance must survive the autoscaler tick"
+        );
+        let inst = handle.inner().lock().unwrap();
+        assert_eq!(inst.state, InstanceState::Loading);
+        assert!(inst.child.is_none() || inst.state != InstanceState::Failed);
+    }
+
+    #[tokio::test]
+    async fn autoscale_keeps_instance_with_in_flight_request_alive() {
+        // A long-running request produces no acquire/release events for many
+        // minutes.  force_refresh at the start of evaluate_autoscale must
+        // bump last_activity (active > 0) so the idle TTL never trips
+        // mid-request.
+        let mgr = test_manager();
+        // Instance itself has been busy on one request for over an hour.
+        let handle = make_handle(InstanceState::Ready, 1, Duration::from_secs(3600));
+        register_with_stale_metrics(&mgr, &handle);
+
+        mgr.evaluate_autoscale().await;
+
+        assert_eq!(
+            instance_count(&mgr),
+            1,
+            "instance with an in-flight request must not be despawned"
+        );
+        let last = mgr.model_metrics.read().unwrap()["m"].last_activity;
+        assert!(
+            last.elapsed().as_secs() < 5,
+            "last_activity must have been refreshed by the in-flight request"
+        );
+    }
+
+    #[tokio::test]
+    async fn autoscale_still_despawns_genuinely_idle_instance() {
+        // The despawn path itself must keep working: Ready, no in-flight,
+        // idle past TTL at both instance and metrics level.
+        let mgr = test_manager();
+        let handle = make_handle(InstanceState::Ready, 0, Duration::from_secs(3600));
+        register_with_stale_metrics(&mgr, &handle);
+
+        mgr.evaluate_autoscale().await;
+
+        assert_eq!(
+            instance_count(&mgr),
+            0,
+            "genuinely idle instance past TTL must be despawned"
+        );
+    }
+
+    #[test]
+    fn touch_activity_resets_idle_clock() {
+        let mgr = test_manager();
+        let stale = Instant::now() - Duration::from_secs(3600);
+        mgr.model_metrics.write().unwrap().insert(
+            "m".to_owned(),
+            ModelMetrics {
+                last_activity: stale,
+                ..Default::default()
+            },
+        );
+
+        mgr.touch_activity("m");
+
+        let last = mgr.model_metrics.read().unwrap()["m"].last_activity;
+        assert!(
+            last.elapsed().as_secs() < 5,
+            "touch_activity must reset last_activity to now"
+        );
     }
 }
