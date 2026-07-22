@@ -57,6 +57,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(handlers::chat_completions))
         .route("/v1/completions", post(handlers::completions))
         .route("/v1/embeddings", post(handlers::embeddings))
+        .route("/v1/rerank", post(handlers::rerank))
         // Admin endpoints.
         .route("/admin/status", get(handlers::admin_status))
         .route("/admin/load", post(handlers::admin_load))

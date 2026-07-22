@@ -367,6 +367,38 @@ pub struct EmbeddingObject {
     pub embedding: EmbeddingVector,
 }
 
+// ── /v1/rerank request ──────────────────────────────────────────────────────
+
+/// A single document in a rerank request.
+///
+/// llama.cpp (Jina-compatible) accepts plain strings as well as arbitrary
+/// objects (e.g. `{"text": "…"}`); objects are serialized before scoring.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum RerankDocument {
+    Text(String),
+    Object(Map<String, Value>),
+}
+
+/// Request body for `POST /v1/rerank`.
+///
+/// Jina-compatible, matching llama.cpp's `/v1/rerank` (also exposed by the
+/// backend as `/rerank` and `/reranking`).  The response is passed through
+/// verbatim as `serde_json::Value` — llama.cpp returns
+/// `{results: [{index, relevance_score, document?}], model, usage?}`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RerankRequest {
+    pub model: String,
+    pub query: String,
+    pub documents: Vec<RerankDocument>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_n: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_documents: Option<bool>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
 // ── Admin actions ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -505,5 +537,32 @@ mod tests {
         let req: CompletionRequest = serde_json::from_str(input).unwrap();
         let output = serde_json::to_string(&req).unwrap();
         assert!(!output.contains("\"stream\":"), "stream should be absent: {}", output);
+    }
+
+    #[test]
+    fn rerank_request_accepts_string_and_object_documents() {
+        // Jina/llama.cpp allow plain strings or arbitrary objects as documents.
+        let input = serde_json::json!({
+            "model": "reranker",
+            "query": "what is rust",
+            "documents": [
+                "a systems language",
+                {"text": "a metal oxide"}
+            ],
+            "top_n": 2,
+            "unknown_future_field": {"nested": true}
+        });
+        let req: RerankRequest = serde_json::from_value(input.clone()).unwrap();
+        let output = serde_json::to_value(&req).unwrap();
+        assert_eq!(output, input, "rerank request fields were lost in round-trip");
+    }
+
+    #[test]
+    fn rerank_request_omits_optional_fields() {
+        let input = r#"{"model":"m","query":"q","documents":["a"]}"#;
+        let req: RerankRequest = serde_json::from_str(input).unwrap();
+        let output = serde_json::to_string(&req).unwrap();
+        assert!(!output.contains("top_n"), "top_n should be absent: {}", output);
+        assert!(!output.contains("return_documents"), "return_documents should be absent: {}", output);
     }
 }

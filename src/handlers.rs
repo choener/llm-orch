@@ -627,6 +627,169 @@ pub async fn embeddings(
     }.instrument(span).await
 }
 
+// ── /v1/rerank ──────────────────────────────────────────────────────────────
+
+/// `POST /v1/rerank` — Jina-compatible reranking endpoint (llama.cpp).
+///
+/// Same alias resolution and instance management as embeddings, always
+/// non-streaming, forwarded to the backend's `/v1/rerank`.  Includes
+/// per-request debug logging (like chat completions) and completion
+/// tracking with `generated_tokens: 0` — reranking has no generation.
+///
+/// It is the user's responsibility to point this at a model launched as a
+/// reranker (llama.cpp `--reranking`); the orchestrator does not validate
+/// the model type.
+pub async fn rerank(
+    State(state): State<AppState>,
+    key: ApiKey,
+    Json(request): Json<RerankRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let span = tracing::info_span!(
+        "rerank",
+        id = %request_id,
+        model = %request.model,
+    );
+    async {
+    // ── 1. Resolve alias. ───────────────────────────────────────────────
+    let (model_name, _alias_system_prompt, _alias_prompt_template) = {
+        let cfg = state.config.read().await;
+        resolve_alias(&cfg.aliases, &request.model)
+    };
+
+    let request_model = request.model.clone();
+
+    // ── 2. Verify model exists and extract debug_log. ───────────────────
+    let debug_log_path: Option<std::path::PathBuf> = {
+        let cfg = state.config.read().await;
+        match cfg.models.iter().find(|m| m.name == model_name) {
+            Some(m) => m.debug_log.clone(),
+            None => return Err(ApiError::ModelNotFound(model_name)),
+        }
+    };
+
+    // ── 3. Acquire instance slot. ───────────────────────────────────────
+    let guard = state
+        .manager
+        .get_or_spawn(&model_name)
+        .await
+        .ok_or_else(|| {
+            if state.manager.is_blocked(&model_name) {
+                ApiError::ModelBlocked(model_name.clone())
+            } else {
+                ApiError::NoCapacity(format!(
+                    "model '{}' is at capacity and the queue is full",
+                    model_name
+                ))
+            }
+        })?;
+
+    // Capture instance ID now that we hold the slot guard.
+    let instance_id = {
+        let inst = guard.handle().inner().lock().unwrap();
+        inst.id.clone()
+    };
+
+    // ── 4. Read port. ──────────────────────────────────────────────────
+    let port = {
+        let inst = guard.handle().inner().lock().unwrap();
+        inst.port
+    };
+
+    let backend_url = format!("http://127.0.0.1:{}/v1/rerank", port);
+
+    // ── 5. Forward request, aggregate, release. ────────────────────────
+    let request_body = serde_json::to_value(&request).unwrap_or_default();
+
+    // Debug log: request (exact body being forwarded).
+    if let Some(ref log_path) = debug_log_path {
+        state.debug_loggers.write_line(log_path, &DebugLogEntry {
+            ts: ts_now(),
+            request_id: request_id.clone(),
+            model: model_name.clone(),
+            alias: Some(request_model.clone()),
+            instance_id: Some(instance_id.clone()),
+            dir: "request".into(),
+            stream: Some(false),
+            body: Some(request_body.clone()),
+            usage: None,
+            duration_ms: None,
+            error: None,
+        });
+    }
+
+    let t0 = std::time::Instant::now();
+    let response_body = forward_request_aggregate(
+        &state.client,
+        &backend_url,
+        &request_body,
+    )
+    .await
+    .map_err(|e| {
+        warn!("rerank backend request failed: {}", e);
+        e
+    })?;
+    let elapsed = t0.elapsed();
+
+    // Debug log: response.
+    if let Some(ref log_path) = debug_log_path {
+        let usage = response_body.pointer("/usage").cloned();
+        state.debug_loggers.write_line(log_path, &DebugLogEntry {
+            ts: ts_now(),
+            request_id: request_id.clone(),
+            model: model_name.clone(),
+            alias: Some(request_model.clone()),
+            instance_id: Some(instance_id.clone()),
+            dir: "response".into(),
+            stream: Some(false),
+            body: Some(response_body.clone()),
+            usage,
+            duration_ms: Some(elapsed.as_millis() as u64),
+            error: None,
+        });
+    }
+
+    // Record in per-model ring buffer for /admin/status.
+    // Rerank responses carry only prompt/total tokens — no generation.
+    {
+        let prompt_tokens = response_body
+            .pointer("/usage/prompt_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        state.manager.record_completion(
+            &model_name,
+            crate::types::CompletionRecord {
+                ts: ts_now(),
+                request_id: request_id.clone(),
+                instance_id: instance_id.clone(),
+                api_user: key.label.clone(),
+                prompt_tokens,
+                generated_tokens: 0,
+                cached_tokens: 0,
+                duration_ms: elapsed.as_millis() as u64,
+            },
+        );
+    }
+
+    let n_results = response_body
+        .pointer("/results")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+
+    info!(
+        "id={} model={} inst={} results={} server_ms={}",
+        request_id,
+        model_name,
+        instance_id,
+        n_results,
+        elapsed.as_millis()
+    );
+
+    Ok(Json(response_body))
+    }.instrument(span).await
+}
+
 // ── Admin endpoints ──────────────────────────────────────────────────────────
 
 /// `GET /admin/status` — detailed runtime status for all models.
