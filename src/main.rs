@@ -327,12 +327,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::select! {
             _ = sigint.recv() => info!("received SIGINT"),
             _ = sigterm.recv() => info!("received SIGTERM"),
+            // A dead server task (bind failure, panic) must not leave the
+            // daemon idling without a listener.
+            res = &mut server_task => {
+                error!("http server exited unexpectedly: {:?}", res);
+                manager.shutdown_all().await;
+                return Err("http server exited unexpectedly".into());
+            }
         }
     }
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c().await.ok();
-        info!("received Ctrl-C");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => info!("received Ctrl-C"),
+            res = &mut server_task => {
+                error!("http server exited unexpectedly: {:?}", res);
+                manager.shutdown_all().await;
+                return Err("http server exited unexpectedly".into());
+            }
+        }
     }
 
     // Signal axum to stop accepting and drain in-flight — bounded by the
@@ -343,7 +356,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let drain_timeout =
         Duration::from_secs(shared_cfg.read().await.server.shutdown_drain_timeout_secs);
     match tokio::time::timeout(drain_timeout, &mut server_task).await {
-        Ok(_) => info!("http server drained"),
+        Ok(Ok(Ok(()))) => info!("http server drained"),
+        Ok(Ok(Err(e))) => warn!("http server stopped with error: {}", e),
+        Ok(Err(e)) => warn!("http server task failed: {}", e),
         Err(_) => {
             warn!(
                 timeout_secs = drain_timeout.as_secs(),
@@ -378,12 +393,11 @@ async fn handle_config_reload(
         Err(_) => return,
     };
     {
-        let mut last = last_mtime.lock().await;
+        let last = last_mtime.lock().await;
         if *last == Some(mtime) {
             debug!("config mtime unchanged, skipping reload");
             return;
         }
-        *last = Some(mtime);
     }
     info!("config file changed, reloading…");
     match config::Config::load(path) {
@@ -391,6 +405,13 @@ async fn handle_config_reload(
             // Reload apikeys if the path changed.
             {
                 let old = cfg.read().await;
+                if new_cfg.server.listen != old.server.listen {
+                    warn!(
+                        old = %old.server.listen,
+                        new = %new_cfg.server.listen,
+                        "server.listen changed — requires a restart, keeping the old listener"
+                    );
+                }
                 if new_cfg.apikeys_file != old.apikeys_file {
                     match apikeys::ApikeysStore::load(&new_cfg.apikeys_file) {
                         Ok(new_keys) => {
@@ -413,6 +434,9 @@ async fn handle_config_reload(
             // Atomic swap.
             let model_count = new_cfg.models.len();
             *cfg.write().await = new_cfg;
+            // Record the mtime only on success — a rejected or failed
+            // reload must be retried on the next file event, not consumed.
+            *last_mtime.lock().await = Some(mtime);
             info!(
                 "config reloaded successfully — {} model(s)",
                 model_count
@@ -435,18 +459,19 @@ async fn handle_apikeys_reload(
         Err(_) => return,
     };
     {
-        let mut last = last_mtime.lock().await;
+        let last = last_mtime.lock().await;
         if *last == Some(mtime) {
             debug!("apikeys mtime unchanged, skipping reload");
             return;
         }
-        *last = Some(mtime);
     }
     info!("apikeys file changed, reloading…");
     match apikeys::ApikeysStore::load(path) {
         Ok(new_keys) => {
             let count = new_keys.len();
             *apikeys.write().await = new_keys;
+            // Record the mtime only on success (see config reload).
+            *last_mtime.lock().await = Some(mtime);
             info!("apikeys reloaded successfully — {} key(s)", count);
         }
         Err(e) => {

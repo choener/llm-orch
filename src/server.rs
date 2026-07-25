@@ -76,7 +76,14 @@ pub fn build_router(state: AppState) -> Router {
 /// The server stops accepting new connections when `shutdown` is triggered
 /// (oneshot sender dropped).  In-flight requests are allowed to drain before
 /// the function returns.
-pub async fn serve(state: AppState, shutdown: tokio::sync::oneshot::Receiver<()>) {
+///
+/// Returns `Err` on an invalid `server.listen` address, bind failure, or a
+/// server error — the caller (main) treats an early exit as fatal instead
+/// of idling forever without a listener.
+pub async fn serve(
+    state: AppState,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> Result<(), String> {
     let addr: SocketAddr = state
         .config
         .read()
@@ -84,18 +91,20 @@ pub async fn serve(state: AppState, shutdown: tokio::sync::oneshot::Receiver<()>
         .server
         .listen
         .parse()
-        .expect("invalid server.listen address");
+        .map_err(|e| format!("invalid server.listen address: {}", e))?;
 
     let router = build_router(state);
 
     info!("listening on {}", addr);
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| format!("failed to bind {}: {}", addr, e))?;
     axum::serve(listener, router)
         .with_graceful_shutdown(async {
             shutdown.await.ok();
         })
         .await
-        .unwrap();
+        .map_err(|e| format!("http server error: {}", e))
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────────

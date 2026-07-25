@@ -85,7 +85,12 @@ impl PortAllocator {
     /// poll, so they fail fast instead of waiting out the spawn timeout.
     pub async fn allocate(&mut self) -> Option<u16> {
         if self.is_ephemeral() {
-            self.allocate_ephemeral_async().await
+            let port = self.allocate_ephemeral_async().await?;
+            // Track ephemeral ports in `used` as well: keeps `free()`
+            // meaningful and makes double-allocations visible instead of
+            // silently leaking.
+            self.used.insert(port);
+            Some(port)
         } else {
             self.allocate_range_sync()
         }
@@ -93,8 +98,9 @@ impl PortAllocator {
 
     /// Try to allocate an ephemeral port (async).
     ///
-    /// Returns `Some(port)` on success.  Ephemeral ports are not tracked
-    /// in the `used` set — the OS manages them.
+    /// Returns `Some(port)` on success.  The caller (`allocate`) records
+    /// the port in `used` — the OS picks the port, but we still own the
+    /// lease bookkeeping.
     ///
     /// Call this **outside** any `MutexGuard` scope — it's async.
     pub async fn allocate_ephemeral_async(&self) -> Option<u16> {
@@ -170,15 +176,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ephemeral_allocates() {
+    async fn ephemeral_allocates_and_is_tracked() {
         let range = PortRange::EphemeralWord("ephemeral".into());
-        let alloc = PortAllocator::new(range);
-        let p = alloc.allocate_ephemeral_async().await.unwrap();
+        let mut alloc = PortAllocator::new(range);
+        let p = alloc.allocate().await.unwrap();
         assert!(p > 0);
-        // Ephemeral ports are not tracked in `used`, so free is a no-op
-        // but shouldn't panic.
-        // (We can't call free without &mut, but that's fine — the test
-        // just verifies the allocation succeeded.)
+        // Ephemeral ports are tracked in `used`, so free works and leaks
+        // are visible.
+        assert_eq!(alloc.used_count(), 1);
+        alloc.free(p);
+        assert_eq!(alloc.used_count(), 0);
     }
 
     #[test]

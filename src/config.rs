@@ -86,6 +86,18 @@ impl Config {
                     m.name
                 )));
             }
+            if m.max_instances == 0 {
+                return Err(ConfigError::Validation(format!(
+                    "model '{}': max_instances must be > 0 (0 would make the model unspawnable)",
+                    m.name
+                )));
+            }
+            if m.max_concurrent == 0 {
+                return Err(ConfigError::Validation(format!(
+                    "model '{}': max_concurrent must be > 0 (0 would reject every request)",
+                    m.name
+                )));
+            }
         }
 
         // --- aliases ---
@@ -125,12 +137,40 @@ impl Config {
         }
 
         // --- port range ---
-        if let PortRange::Range { start, end } = &self.server.port_range {
-            if start > end {
-                return Err(ConfigError::Validation(format!(
-                    "server.port_range: start ({}) must be <= end ({})",
-                    start, end
-                )));
+        match &self.server.port_range {
+            PortRange::Range { start, end } => {
+                if start > end {
+                    return Err(ConfigError::Validation(format!(
+                        "server.port_range: start ({}) must be <= end ({})",
+                        start, end
+                    )));
+                }
+            }
+            // The string form means exactly "ephemeral" — anything else is
+            // a typo that would silently enable ephemeral allocation.
+            PortRange::EphemeralWord(word) => {
+                if word != "ephemeral" {
+                    return Err(ConfigError::Validation(format!(
+                        "server.port_range: unknown value '{}' (expected a start/end range or \"ephemeral\")",
+                        word
+                    )));
+                }
+            }
+        }
+
+        // --- keep-alive ---
+        if let Some(ref ka) = self.keep_alive {
+            if let Some(ref amd) = ka.amd {
+                if amd.sleep == 0 {
+                    return Err(ConfigError::Validation(
+                        "keep_alive.amd.sleep must be > 0 (0 would busy-loop the command)".into(),
+                    ));
+                }
+                if amd.cmd.trim().is_empty() {
+                    return Err(ConfigError::Validation(
+                        "keep_alive.amd.cmd must not be empty".into(),
+                    ));
+                }
             }
         }
 
@@ -465,4 +505,82 @@ pub struct AliasConfig {
     /// Optional prompt template override (e.g. chat format).
     #[serde(default)]
     pub prompt_template: Option<String>,
+}
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: &str = r#"
+server: {}
+apikeys_file: apikeys.txt
+models:
+  - name: m
+    context_length: 4096
+    cmd: "sleep 3600"
+"#;
+
+    fn parse(yaml: &str) -> Result<Config, ConfigError> {
+        let cfg: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn expect_validation_error(yaml: &str, needle: &str) {
+        match parse(yaml) {
+            Err(ConfigError::Validation(msg)) => assert!(
+                msg.contains(needle),
+                "error '{msg}' must contain '{needle}'"
+            ),
+            other => panic!("expected validation error containing '{needle}', got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn base_config_is_valid() {
+        parse(BASE).unwrap();
+    }
+
+    #[test]
+    fn rejects_zero_max_instances() {
+        let yaml = BASE.replace("cmd: \"sleep 3600\"", "cmd: \"sleep 3600\"\n    max_instances: 0");
+        expect_validation_error(&yaml, "max_instances must be > 0");
+    }
+
+    #[test]
+    fn rejects_zero_max_concurrent() {
+        let yaml = BASE.replace("cmd: \"sleep 3600\"", "cmd: \"sleep 3600\"\n    max_concurrent: 0");
+        expect_validation_error(&yaml, "max_concurrent must be > 0");
+    }
+
+    #[test]
+    fn rejects_unknown_port_range_word() {
+        let yaml = BASE.replace("server: {}", "server:\n  port_range: \"ephemral\"");
+        expect_validation_error(&yaml, "unknown value 'ephemral'");
+    }
+
+    #[test]
+    fn accepts_ephemeral_port_range() {
+        let yaml = BASE.replace("server: {}", "server:\n  port_range: \"ephemeral\"");
+        parse(&yaml).unwrap();
+    }
+
+    #[test]
+    fn rejects_zero_keepalive_sleep() {
+        let yaml = BASE.replace(
+            "apikeys_file: apikeys.txt",
+            "apikeys_file: apikeys.txt\nkeep_alive:\n  amd:\n    cmd: \"true\"\n    sleep: 0",
+        );
+        expect_validation_error(&yaml, "keep_alive.amd.sleep must be > 0");
+    }
+
+    #[test]
+    fn rejects_empty_keepalive_cmd() {
+        let yaml = BASE.replace(
+            "apikeys_file: apikeys.txt",
+            "apikeys_file: apikeys.txt\nkeep_alive:\n  amd:\n    cmd: \"  \"\n    sleep: 5",
+        );
+        expect_validation_error(&yaml, "keep_alive.amd.cmd must not be empty");
+    }
 }

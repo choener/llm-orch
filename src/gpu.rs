@@ -109,7 +109,9 @@ pub fn read_all_gpus() -> Vec<GpuMetrics> {
         let card_path = format!("/sys/class/drm/card{}/device", card_index);
         let card = Path::new(&card_path);
         if !card.exists() {
-            break;
+            // Card numbering is not guaranteed contiguous (render nodes,
+            // driver unbinds) — skip missing indices, don't stop scanning.
+            continue;
         }
 
         // Filter for AMD GPUs only (vendor 0x1002).
