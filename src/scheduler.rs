@@ -17,7 +17,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, Mutex, Semaphore, oneshot};
+use tokio::sync::{mpsc, watch, Mutex, Semaphore, oneshot};
 use tracing::{debug, error, info, warn};
 
 /// Maximum time a request may wait in the queue for a slot before failing.
@@ -229,6 +229,14 @@ pub struct InstanceManager {
     /// Consecutive pre-output crashes per model.  Reset on successful
     /// spawn and on unblock; reaching `crash_limit` blocks the model.
     crash_counts: std::sync::Mutex<HashMap<String, usize>>,
+
+    /// Per-model in-flight spawn tasks.  The `watch::Sender` lives in the
+    /// map for the duration of the spawn and is dropped (removing the
+    /// entry) when the spawn task finishes; requests subscribe and await
+    /// the channel closing instead of driving the spawn themselves, so a
+    /// client disconnect can never abort a spawn half-way and strand a
+    /// `Loading` instance that nothing would reap.
+    spawns_in_flight: std::sync::RwLock<HashMap<String, watch::Sender<()>>>,
 }
 
 impl InstanceManager {
@@ -302,6 +310,7 @@ impl InstanceManager {
             release_tx,
             crash_tx,
             crash_counts: std::sync::Mutex::new(HashMap::new()),
+            spawns_in_flight: std::sync::RwLock::new(HashMap::new()),
         };
         (mgr, release_rx, crash_rx)
     }
@@ -315,7 +324,12 @@ impl InstanceManager {
     /// The returned guard already owns one in-flight slot — the caller must
     /// not call `try_acquire` again.  The slot is released automatically
     /// when the guard is dropped.  Use `guard.handle()` to reach the instance.
-    pub async fn get_or_spawn(&self, model_name: &str) -> Option<SlotGuard> {
+    ///
+    /// Spawns run in a detached background task (see `ensure_spawn`); this
+    /// function only *awaits* the spawn's completion.  A client disconnect
+    /// that drops this future therefore cannot abort a spawn half-way and
+    /// strand a `Loading` instance that nothing would ever reap.
+    pub async fn get_or_spawn(self: &Arc<Self>, model_name: &str) -> Option<SlotGuard> {
         if self.is_blocked(model_name) {
             return None;
         }
@@ -327,11 +341,8 @@ impl InstanceManager {
         let max_concurrent = cfg.max_concurrent;
 
         // Fast path: find a ready instance with spare capacity.
-        if let Some(handle) = self.find_ready_instance(model_name, max_concurrent) {
-            if let Some(guard) = handle.try_acquire(max_concurrent) {
-                self.record_metrics_event(model_name, 0);
-                return Some(guard);
-            }
+        if let Some(guard) = self.acquire_ready_slot(model_name, max_concurrent) {
+            return Some(guard);
         }
 
         // Autoscale spawn gate: only spawn if sustained load exceeds
@@ -370,22 +381,80 @@ impl InstanceManager {
             true // no autoscale config — spawn immediately
         };
 
-        // Slow path: try to spawn a new instance.
+        // Slow path: ensure a spawn is running and await its completion.
         if should_spawn {
-            if let Some(handle) = self.try_spawn(model_name, &cfg).await {
-                if let Some(guard) = handle.try_acquire(max_concurrent) {
-                    self.record_metrics_event(model_name, 0);
-                    // Serve a parked waiter with any leftover capacity —
-                    // otherwise queued requests would only be served after
-                    // the next release event.
-                    self.wake_one(model_name);
-                    return Some(guard);
-                }
+            let mut rx = self.ensure_spawn(model_name, &cfg);
+            // Bound the wait: spawn timeout + serialized window + margin for
+            // semaphore queueing and process setup.
+            let budget = self.spawn_timeout + SPAWN_SERIAL_WINDOW + Duration::from_secs(30);
+            // The entry's sender is dropped when the spawn task finishes —
+            // success or failure — which resolves `changed()` with an error.
+            let _ = tokio::time::timeout(budget, rx.changed()).await;
+            // Retry the fast path once: after a successful spawn the fresh
+            // instance is Ready with spare capacity.  On failure (or if
+            // competing requests filled it first) fall through to the
+            // queue — which fails fast when no instance exists at all.
+            if let Some(guard) = self.acquire_ready_slot(model_name, max_concurrent) {
+                return Some(guard);
             }
         }
 
         // Queue path: all instances busy and at cap.
         self.enqueue(model_name, cfg.queue_depth, max_concurrent).await
+    }
+
+    /// Fast path of `get_or_spawn`: acquire a slot on the least-loaded
+    /// ready instance with spare capacity.
+    fn acquire_ready_slot(&self, model_name: &str, max_concurrent: usize) -> Option<SlotGuard> {
+        let handle = self.find_ready_instance(model_name, max_concurrent)?;
+        let guard = handle.try_acquire(max_concurrent)?;
+        self.record_metrics_event(model_name, 0);
+        Some(guard)
+    }
+
+    /// Subscribe to the completion of `model_name`'s in-flight spawn,
+    /// starting the spawn task first if none is running.
+    ///
+    /// The spawn runs in a detached task so its lifecycle is independent of
+    /// any request future.  The returned receiver resolves (with `Err` —
+    /// nothing is ever sent) when the spawn task finishes and drops the
+    /// entry's sender.
+    fn ensure_spawn(self: &Arc<Self>, model_name: &str, cfg: &ModelConfig) -> watch::Receiver<()> {
+        {
+            let spawns = self.spawns_in_flight.read().unwrap();
+            if let Some(tx) = spawns.get(model_name) {
+                return tx.subscribe();
+            }
+        }
+        let (tx, rx) = watch::channel(());
+        {
+            let mut spawns = self.spawns_in_flight.write().unwrap();
+            if let Some(existing) = spawns.get(model_name) {
+                // Lost the race — another caller registered the spawn first.
+                return existing.subscribe();
+            }
+            spawns.insert(model_name.to_owned(), tx);
+        }
+
+        let mgr = Arc::clone(self);
+        let name = model_name.to_owned();
+        let cfg = cfg.clone();
+        tokio::spawn(async move {
+            // Removing the entry drops the sender, waking all awaiters.
+            // The guard runs on normal completion *and* on panic unwind,
+            // so a panicking spawn task can't block future spawns forever.
+            let _entry = SpawnEntryGuard {
+                mgr: Arc::clone(&mgr),
+                model_name: name.clone(),
+            };
+            if mgr.try_spawn(&name, &cfg).await.is_some() {
+                // A fresh instance may be able to serve parked waiters —
+                // otherwise queued requests would only be served after the
+                // next release event.
+                mgr.wake_one(&name);
+            }
+        });
+        rx
     }
 
     /// Enqueue the caller, waiting for an instance slot to free up.
@@ -977,23 +1046,43 @@ impl InstanceManager {
     ///
     /// The caller must already have terminated (or reaped) the child
     /// process and marked the instance `Failed`.
+    ///
+    /// Idempotent: if the handle is no longer registered, nothing happens.
+    /// Port frees and keep-alive releases must happen exactly once per
+    /// instance — the stranded-`Loading` reaper can race the spawn task's
+    /// own failure cleanup for the same handle.
     async fn unregister_instance(
         &self,
         model_name: &str,
         handle: &InstanceHandle,
         gpu_indices: &[usize],
     ) {
+        // Remove from the registry first and bail out if already gone.
+        {
+            let mut instances = self.instances.write().unwrap();
+            let removed = match instances.get_mut(model_name) {
+                Some(list) => {
+                    let before = list.len();
+                    // Compare handle identity, not the id string — base IDs
+                    // collide for same-GPU/CPU instances of one model.
+                    list.retain(|h| !Arc::ptr_eq(h.inner(), handle.inner()));
+                    list.len() != before
+                }
+                None => false,
+            };
+            if !removed {
+                debug!(
+                    model = %model_name,
+                    inst = %handle.id(),
+                    "instance already unregistered — skipping cleanup"
+                );
+                return;
+            }
+        }
+
         let port = handle.inner().lock().unwrap().port;
         self.ports.lock().await.free(port);
 
-        {
-            let mut instances = self.instances.write().unwrap();
-            if let Some(list) = instances.get_mut(model_name) {
-                // Compare handle identity, not the id string — base IDs
-                // collide for same-GPU/CPU instances of one model.
-                list.retain(|h| !Arc::ptr_eq(h.inner(), handle.inner()));
-            }
-        }
         self.drain_queue_if_no_instances(model_name);
 
         // Keep-alive: release this instance's per-GPU reference (acquired
@@ -1378,7 +1467,7 @@ impl InstanceManager {
     /// Called periodically by a background task.  Uses `load_m5` for
     /// scale-up decisions and `load_m15` for scale-down, with hysteresis
     /// between the two thresholds and a per-model cooldown.
-    pub async fn evaluate_autoscale(&self) {
+    pub async fn evaluate_autoscale(self: &Arc<Self>) {
         // Advance EMAs to now and bump last_activity for every model with
         // in-flight or queued requests.  Ticks otherwise only happen on
         // acquire/release events, so without this a single long-running
@@ -1401,6 +1490,36 @@ impl InstanceManager {
             // Safety net: finish removals of draining instances whose
             // in-flight requests have completed.
             self.reap_drained(model_name).await;
+
+            // Safety net: reap instances stranded in `Loading` far beyond
+            // the spawn window (e.g. after a panicked spawn task).  Loading
+            // instances can't hold slots, so `last_active` ≈ registration
+            // time; a legitimately loading instance never exceeds
+            // `spawn_timeout` plus the serialized window by a wide margin.
+            let stranded: Vec<InstanceHandle> = {
+                let instances = self.instances.read().unwrap();
+                instances
+                    .get(model_name)
+                    .map(|list| {
+                        list.iter()
+                            .filter(|h| {
+                                let inst = h.inner().lock().unwrap();
+                                inst.state == InstanceState::Loading
+                                    && inst.last_active.elapsed() > self.spawn_timeout * 2
+                            })
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            for handle in stranded {
+                warn!(
+                    model = %model_name,
+                    inst = %handle.id(),
+                    "reaping instance stranded in Loading state"
+                );
+                self.force_remove_instance(model_name, &handle).await;
+            }
 
             let num_instances = {
                 self.instances.read().unwrap()
@@ -1487,19 +1606,28 @@ impl InstanceManager {
             if num_instances < cfg.max_instances {
                 let capacity = (cfg.max_concurrent * num_instances) as f64;
                 if m.load_m5 > a.scale_up_at * capacity {
+                    // A request-driven spawn may already be in flight —
+                    // don't double-spawn past the cap.
+                    if self.spawns_in_flight.read().unwrap().contains_key(model_name) {
+                        debug!(
+                            model = %model_name,
+                            "autoscale: spawn already in flight, skipping scale-up"
+                        );
+                        continue;
+                    }
                     info!(
                         model = %model_name,
                         load_m5 = %m.load_m5,
                         threshold = %(a.scale_up_at * capacity),
                         "autoscale: scaling up"
                     );
-                    if self.try_spawn(model_name, cfg).await.is_some() {
-                        self.last_scale_action.write().unwrap()
-                            .insert(model_name.clone(), now);
-                        // A proactive scale-up may serve parked waiters.
-                        self.wake_one(model_name);
-                        continue;
-                    }
+                    // Fire-and-forget: the spawn runs in a detached task
+                    // (see `ensure_spawn`) which wakes parked waiters on
+                    // success; requests subscribe to the entry directly.
+                    let _rx = self.ensure_spawn(model_name, cfg);
+                    self.last_scale_action.write().unwrap()
+                        .insert(model_name.clone(), now);
+                    continue;
                 }
             }
 
@@ -1550,6 +1678,26 @@ impl InstanceManager {
             .unwrap_or_default();
         list.sort_by_key(|h| h.inner().lock().unwrap().in_flight);
         list
+    }
+}
+
+// ── Spawn bookkeeping ────────────────────────────────────────────────────────
+
+/// RAII guard that removes a model's in-flight spawn entry on drop, waking
+/// all requests awaiting the spawn's completion.  Lives in the detached
+/// spawn task; runs on normal completion and on panic unwind.
+struct SpawnEntryGuard {
+    mgr: Arc<InstanceManager>,
+    model_name: String,
+}
+
+impl Drop for SpawnEntryGuard {
+    fn drop(&mut self) {
+        self.mgr
+            .spawns_in_flight
+            .write()
+            .unwrap()
+            .remove(&self.model_name);
     }
 }
 
@@ -1671,7 +1819,7 @@ models:
         // metrics entry keeps a stale last_activity.  A respawn triggered by
         // a new request registers a Loading instance; the autoscaler must
         // not kill it mid-spawn based on that stale timestamp.
-        let mgr = test_manager();
+        let mgr = Arc::new(test_manager());
         let handle = make_handle(InstanceState::Loading, 0, Duration::ZERO);
         register_with_stale_metrics(&mgr, &handle);
 
@@ -1693,7 +1841,7 @@ models:
         // minutes.  force_refresh at the start of evaluate_autoscale must
         // bump last_activity (active > 0) so the idle TTL never trips
         // mid-request.
-        let mgr = test_manager();
+        let mgr = Arc::new(test_manager());
         // Instance itself has been busy on one request for over an hour.
         let handle = make_handle(InstanceState::Ready, 1, Duration::from_secs(3600));
         register_with_stale_metrics(&mgr, &handle);
@@ -1716,7 +1864,7 @@ models:
     async fn autoscale_still_despawns_genuinely_idle_instance() {
         // The despawn path itself must keep working: Ready, no in-flight,
         // idle past TTL at both instance and metrics level.
-        let mgr = test_manager();
+        let mgr = Arc::new(test_manager());
         let handle = make_handle(InstanceState::Ready, 0, Duration::from_secs(3600));
         register_with_stale_metrics(&mgr, &handle);
 
@@ -2008,7 +2156,7 @@ models:
         // which with τ=60 s takes ~5 min to decay regardless of the
         // configured TTL — an idle_ttl of 30 s was silently clamped.
         // The instance-level idle check honors the TTL exactly.
-        let mgr = test_manager(); // idle_ttl = 60 in TEST_CONFIG_YAML
+        let mgr = Arc::new(test_manager()); // idle_ttl = 60 in TEST_CONFIG_YAML
         let handle = make_handle(InstanceState::Ready, 0, Duration::from_secs(120));
         mgr.instances
             .write()
@@ -2038,7 +2186,7 @@ models:
     async fn surplus_idle_instances_evicted_without_autoscale() {
         // Models without autoscale config must still scale down: idle
         // surplus instances are TTL-evicted, one instance is kept.
-        let mgr = test_manager();
+        let mgr = Arc::new(test_manager());
         let idle = make_handle_on_gpus(vec![0], InstanceState::Ready, 0, Duration::from_secs(3600));
         let busy = make_handle_on_gpus(vec![1], InstanceState::Ready, 1, Duration::ZERO);
         {
@@ -2061,7 +2209,7 @@ models:
     #[tokio::test]
     async fn surplus_fresh_instances_kept_without_autoscale() {
         // Surplus instances that are NOT idle past TTL must be kept.
-        let mgr = test_manager();
+        let mgr = Arc::new(test_manager());
         let h1 = make_handle_on_gpus(vec![0], InstanceState::Ready, 0, Duration::ZERO);
         let h2 = make_handle_on_gpus(vec![1], InstanceState::Ready, 0, Duration::ZERO);
         {
@@ -2144,5 +2292,93 @@ models:
             last.elapsed().as_secs() < 5,
             "touch_activity must reset last_activity to now"
         );
+    }
+
+    #[tokio::test]
+    async fn autoscale_reaps_instance_stranded_in_loading() {
+        // Safety net: an instance stuck in `Loading` far beyond the spawn
+        // window (e.g. after a panicked spawn task) must be force-removed —
+        // otherwise it wedges the model by counting toward `max_instances`
+        // without ever serving requests.
+        let mgr = Arc::new(test_manager());
+        let handle = make_handle(InstanceState::Loading, 0, Duration::from_secs(3600));
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle);
+
+        mgr.evaluate_autoscale().await;
+
+        assert_eq!(
+            instance_count(&mgr),
+            0,
+            "instance stranded in Loading must be reaped"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_spawn_runs_detached_and_clears_entry() {
+        // The spawn runs in a detached task: subscribers only await the
+        // entry's removal.  `cmd: "true"` exits instantly, so the spawn
+        // fails fast (ChildExited) and the task must clear the entry,
+        // resolving the receiver.
+        let yaml = r#"
+server: {}
+apikeys_file: apikeys.txt
+models:
+  - name: m
+    context_length: 4096
+    cmd: "true"
+    idle_ttl: 60
+"#;
+        let config: crate::config::Config = serde_yaml_ng::from_str(yaml).unwrap();
+        let gpu_snapshot = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+        let (mgr, _release_rx, _crash_rx) =
+            InstanceManager::new(&config, gpu_snapshot, None);
+        let mgr = Arc::new(mgr);
+        let cfg = mgr.model_configs.read().unwrap().get("m").cloned().unwrap();
+
+        let mut rx = mgr.ensure_spawn("m", &cfg);
+        assert!(
+            mgr.spawns_in_flight.read().unwrap().contains_key("m"),
+            "spawn entry must be registered while the spawn runs"
+        );
+
+        tokio::time::timeout(Duration::from_secs(15), rx.changed())
+            .await
+            .expect("spawn entry must be cleared once the spawn task finishes")
+            .expect_err("the sender is dropped without ever sending");
+        assert!(
+            !mgr.spawns_in_flight.read().unwrap().contains_key("m"),
+            "spawn entry must be gone after completion"
+        );
+        assert_eq!(
+            instance_count(&mgr),
+            0,
+            "the failed instance must be unregistered"
+        );
+    }
+
+    #[tokio::test]
+    async fn double_unregister_is_a_no_op() {
+        // The stranded-`Loading` reaper can race the spawn task's own
+        // failure cleanup for the same handle — the second unregister must
+        // not free the port twice or corrupt keep-alive refcounts.
+        let mgr = test_manager();
+        let handle = make_handle(InstanceState::Failed, 0, Duration::ZERO);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle.clone());
+
+        mgr.unregister_instance("m", &handle, &[0]).await;
+        assert_eq!(instance_count(&mgr), 0);
+        // Second call: no panic, no state change.
+        mgr.unregister_instance("m", &handle, &[0]).await;
+        assert_eq!(instance_count(&mgr), 0);
     }
 }
