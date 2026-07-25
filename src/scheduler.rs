@@ -202,6 +202,7 @@ fn fingerprint_with_aliases(cmd_aliases: &HashMap<String, String>, cfg: &ModelCo
     let mut h = std::collections::hash_map::DefaultHasher::new();
     resolved.hash(&mut h);
     devices.hash(&mut h);
+    cfg.gpus.hash(&mut h);
     cfg.vram.hash(&mut h);
     cfg.context_length.hash(&mut h);
     h.finish()
@@ -809,21 +810,20 @@ impl InstanceManager {
         let parts = parts.unwrap();
         debug!(model = %model_name, parts = ?parts, "parsed command");
         let prog = &parts[0];
-        let gpu_indices: Vec<usize> = self
-            .select_gpu_for_model(cfg)
-            .await
-            .into_iter()
-            .collect();
+        let gpu_indices: Vec<usize> = self.select_gpus_for_model(cfg).await;
 
-        // Safety: when vulkan_devices is configured but no suitable GPU
-        // was found, fail the spawn instead of launching without GPU
-        // restriction (which would make the new instance compete on GPUs
-        // already occupied by existing instances).
-        if !cfg.vulkan_devices.is_empty() && gpu_indices.is_empty() {
+        // Safety: when vulkan_devices is configured but the full device
+        // set can't be satisfied, fail the spawn instead of launching
+        // without GPU restriction (competing on GPUs already occupied by
+        // existing instances) or with too few devices (a multi-GPU model
+        // would not fit in memory).
+        if !cfg.vulkan_devices.is_empty() && gpu_indices.len() < cfg.gpus {
             warn!(
                 model = %model_name,
                 vulkan_devices = ?cfg.vulkan_devices,
-                "no suitable GPU available — refusing to spawn without GPU restriction"
+                needed = cfg.gpus,
+                available = gpu_indices.len(),
+                "not enough suitable GPUs — refusing to spawn"
             );
             self.ports.lock().await.free(port);
             return None;
@@ -998,15 +998,18 @@ impl InstanceManager {
         resolved.replace("{port}", &port.to_string())
     }
 
-    /// Pick a Vulkan device for a new instance from the model's `vulkan_devices` pool.
-    async fn select_gpu_for_model(&self, model_cfg: &ModelConfig) -> Option<usize> {
+    /// Pick the Vulkan devices for a new instance from the model's
+    /// `vulkan_devices` pool.  Returns up to `model_cfg.gpus` distinct
+    /// devices (empty when the pool can't satisfy the request — the
+    /// caller decides between CPU fallback and spawn refusal).
+    async fn select_gpus_for_model(&self, model_cfg: &ModelConfig) -> Vec<usize> {
         let vulkan_devices = &model_cfg.vulkan_devices;
         // Clone the (tiny) device maps — std RwLock guards are !Send and
         // must not live across the gpu_snapshot await below.
         let vulkan_slots = self.vulkan_slots.read().unwrap().clone();
         if vulkan_devices.is_empty() || vulkan_slots.is_empty() {
             debug!(model = %model_cfg.name, "no vulkan_devices configured");
-            return None;
+            return Vec::new();
         }
         let vram_limits = self.vram_limits.read().unwrap().clone();
 
@@ -1099,9 +1102,15 @@ impl InstanceManager {
             candidates.push((vulkan_idx, free));
         }
 
-        if candidates.is_empty() {
-            debug!(model = %model_cfg.name, "no GPU candidate — falling back to CPU");
-            return None;
+        let needed = model_cfg.gpus;
+        if candidates.len() < needed {
+            debug!(
+                model = %model_cfg.name,
+                needed,
+                available = candidates.len(),
+                "not enough GPU candidates"
+            );
+            return Vec::new();
         }
 
         let instance_counts: HashMap<usize, usize> = {
@@ -1118,14 +1127,26 @@ impl InstanceManager {
             counts
         };
 
-        let chosen = candidates
-            .into_iter()
-            .min_by_key(|(idx, _)| instance_counts.get(idx).copied().unwrap_or(0));
-
-        if let Some((idx, _)) = &chosen {
-            debug!(model = %model_cfg.name, vulkan = idx, "selected GPU");
-        }
-        chosen.map(|(idx, _)| idx)
+        // Deterministic packing: least-loaded GPU first, then most free
+        // VRAM, then lowest index.  Selection order is also the emission
+        // order into GGML_VK_VISIBLE_DEVICES — kept stable because device
+        // order has semantics in llama.cpp.
+        candidates.sort_by(|(a_idx, a_free), (b_idx, b_free)| {
+            instance_counts
+                .get(a_idx)
+                .copied()
+                .unwrap_or(0)
+                .cmp(&instance_counts.get(b_idx).copied().unwrap_or(0))
+                .then(b_free.cmp(a_free))
+                .then(a_idx.cmp(b_idx))
+        });
+        let chosen: Vec<usize> = candidates
+            .iter()
+            .take(needed)
+            .map(|(idx, _)| *idx)
+            .collect();
+        debug!(model = %model_cfg.name, vulkan = ?chosen, "selected GPUs");
+        chosen
     }
 
     // ── blocked flag ─────────────────────────────────────────────────────
@@ -2702,13 +2723,16 @@ models:
         );
         assert_ne!(base, fingerprint_with_aliases(&no_aliases, &m3));
 
-        // vram / context_length changes → different fingerprint.
+        // vram / context_length / gpus changes → different fingerprint.
         let mut m5 = model.clone();
         m5.vram = 1024;
         assert_ne!(base, fingerprint_with_aliases(&no_aliases, &m5));
         let mut m6 = model.clone();
         m6.context_length = 8192;
         assert_ne!(base, fingerprint_with_aliases(&no_aliases, &m6));
+        let mut m6b = model.clone();
+        m6b.gpus = 2;
+        assert_ne!(base, fingerprint_with_aliases(&no_aliases, &m6b));
 
         // cmd_aliases resolving into the cmd → different fingerprint;
         // unused aliases → same fingerprint.
@@ -2882,6 +2906,127 @@ models:
         assert!(!mgr.remove_instance("m", &handle).await);
         assert_eq!(instance_count(&mgr), 1);
         assert_eq!(handle.inner().lock().unwrap().state, InstanceState::Ready);
+    }
+
+    // ── Multi-GPU placement ────────────────────────────────────────────
+
+    fn gpu_metrics(index: usize, slot: &str, total_mb: u64) -> crate::gpu::GpuMetrics {
+        crate::gpu::GpuMetrics {
+            index,
+            pci_slot: slot.to_owned(),
+            vram_vendor: None,
+            vram_total_bytes: total_mb * 1024 * 1024,
+            vram_used_bytes: 0,
+            temperature_c: None,
+            power_w: None,
+            gpu_busy_pct: None,
+            sclk_mhz: None,
+            mclk_mhz: None,
+        }
+    }
+
+    const MULTI_GPU_YAML: &str = r#"
+server: {}
+apikeys_file: apikeys.txt
+devices:
+  vulkan:
+    0: "0000:01:00.0"
+    1: "0000:02:00.0"
+    2: "0000:03:00.0"
+    3: "0000:04:00.0"
+models:
+  - name: big
+    context_length: 4096
+    cmd: "sleep 3600"
+    idle_ttl: 60
+    vram: 20000
+    gpus: 2
+    vulkan_devices: [0, 1, 2, 3]
+"#;
+
+    fn multi_gpu_manager() -> InstanceManager {
+        let config: crate::config::Config =
+            serde_yaml_ng::from_str(MULTI_GPU_YAML).unwrap();
+        let snapshot = Arc::new(tokio::sync::RwLock::new(vec![
+            gpu_metrics(0, "0000:01:00.0", 48000),
+            gpu_metrics(1, "0000:02:00.0", 48000),
+            gpu_metrics(2, "0000:03:00.0", 48000),
+            gpu_metrics(3, "0000:04:00.0", 48000),
+        ]));
+        let (mgr, _release_rx, _crash_rx) = InstanceManager::new(&config, snapshot, None);
+        mgr
+    }
+
+    fn register_ready(mgr: &InstanceManager, model: &str, gpus: Vec<usize>, port: u16) {
+        let mut inst = Instance::new(model, gpus, port, None);
+        inst.state = InstanceState::Ready;
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry(model.to_owned())
+            .or_default()
+            .push(InstanceHandle::new(inst));
+    }
+
+    #[tokio::test]
+    async fn select_picks_two_distinct_gpus_and_complement_for_second_instance() {
+        let mgr = multi_gpu_manager();
+        let cfg = mgr.model_configs.read().unwrap().get("big").cloned().unwrap();
+
+        let first = mgr.select_gpus_for_model(&cfg).await;
+        assert_eq!(first.len(), 2);
+        assert_ne!(first[0], first[1], "devices must be distinct");
+
+        // The second instance must get the complement (same-model exclusion).
+        register_ready(&mgr, "big", first.clone(), 54321);
+        let second = mgr.select_gpus_for_model(&cfg).await;
+        assert_eq!(second.len(), 2);
+        assert!(
+            second.iter().all(|d| !first.contains(d)),
+            "second instance must avoid devices of the first: {first:?} vs {second:?}"
+        );
+        let mut all: Vec<usize> = first.iter().chain(second.iter()).copied().collect();
+        all.sort_unstable();
+        assert_eq!(all, vec![0, 1, 2, 3], "both instances tile the whole pool");
+
+        // Pool exhausted: a third instance finds no placement.
+        register_ready(&mgr, "big", second.clone(), 54322);
+        assert!(mgr.select_gpus_for_model(&cfg).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn select_respects_per_gpu_vram_shares() {
+        // An instance occupying 2×20000 leaves 28000 free on each of its
+        // GPUs; a 30000 single-GPU model must avoid those two.
+        let mgr = multi_gpu_manager();
+        register_ready(&mgr, "big", vec![0, 1], 54321);
+
+        let small: ModelConfig = serde_yaml_ng::from_str(
+            "name: small\ncontext_length: 4096\ncmd: \"sleep 1\"\nvram: 30000\ngpus: 1\nvulkan_devices: [0, 1, 2, 3]",
+        )
+        .unwrap();
+        let placement = mgr.select_gpus_for_model(&small).await;
+        assert_eq!(placement.len(), 1);
+        assert!(
+            placement[0] == 2 || placement[0] == 3,
+            "must avoid GPUs with only 28000 MB free, got {placement:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_refuses_when_pool_cannot_satisfy_gpus() {
+        // gpus: 2, but one device is occupied by the same model — only one
+        // candidate remains, so there is no valid placement.
+        let mgr = multi_gpu_manager();
+        let cfg = mgr.model_configs.read().unwrap().get("big").cloned().unwrap();
+        register_ready(&mgr, "big", vec![0, 1], 54321);
+        register_ready(&mgr, "big", vec![2], 54322);
+
+        let placement = mgr.select_gpus_for_model(&cfg).await;
+        assert!(
+            placement.is_empty(),
+            "fewer candidates than gpus must yield no placement, got {placement:?}"
+        );
     }
 
     #[test]

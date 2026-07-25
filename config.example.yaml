@@ -95,7 +95,28 @@ models:
         --model /models/qwen3-32b-q4_k_m.gguf
         --ctx-size 32768
 
-  # --- Example 2: a smaller model — runs on CPU ----------------------------
+  # --- Example 2: a model too large for one GPU — spans two ----------------
+  # `gpus: 2` splits the model evenly across two devices (llama.cpp's
+  # default tensor split over GGML_VK_VISIBLE_DEVICES).  `vram` is
+  # reserved on EACH occupied GPU, so this reserves 2×20000 MB; the
+  # orchestrator picks two devices from the pool with enough free VRAM
+  # each.  For asymmetric splits use --tensor-split in cmd and set vram
+  # to the largest per-GPU share.
+  # - name: "qwen3.6-27b-q8"
+  #   context_length: 32768
+  #   max_instances: 1
+  #   max_concurrent: 4
+  #   vram: 20000             # MB reserved per occupied GPU
+  #   gpus: 2                 # devices each instance spans (default 1)
+  #   idle_ttl: 600
+  #   queue_depth: 10
+  #   vulkan_devices: [0, 1, 2, 3]
+  #   cmd: |
+  #     {llama}
+  #       --model /models/qwen3.6-27b-q8_0.gguf
+  #       --ctx-size 32768
+
+  # --- Example 3: a smaller model — runs on CPU ----------------------------
   - name: "deepseek-coder-7b"
     context_length: 16384
     max_instances: 1

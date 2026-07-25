@@ -98,6 +98,28 @@ impl Config {
                     m.name
                 )));
             }
+            if m.gpus == 0 {
+                return Err(ConfigError::Validation(format!(
+                    "model '{}': gpus must be >= 1",
+                    m.name
+                )));
+            }
+            if m.vulkan_devices.is_empty() {
+                // CPU-only model: spanning multiple devices is meaningless.
+                if m.gpus != 1 {
+                    return Err(ConfigError::Validation(format!(
+                        "model '{}': gpus ({}) exceeds vulkan_devices count (0) (CPU-only models must use gpus: 1)",
+                        m.name, m.gpus
+                    )));
+                }
+            } else if m.gpus > m.vulkan_devices.len() {
+                return Err(ConfigError::Validation(format!(
+                    "model '{}': gpus ({}) exceeds vulkan_devices count ({})",
+                    m.name,
+                    m.gpus,
+                    m.vulkan_devices.len()
+                )));
+            }
         }
 
         // --- aliases ---
@@ -341,6 +363,16 @@ pub struct ModelConfig {
     #[serde(default)]
     pub vulkan_devices: Vec<usize>,
 
+    /// Number of Vulkan devices each instance of this model spans.
+    /// The model is split evenly across them (llama.cpp's default tensor
+    /// split over `GGML_VK_VISIBLE_DEVICES`): `vram` is reserved on **each**
+    /// occupied GPU, so `vram: 20000, gpus: 2` reserves 2×20000 MB.
+    /// Asymmetric splits (`--tensor-split` in `cmd`) are possible; then
+    /// `vram` is a conservative per-GPU reservation.  Must be `>= 1` and
+    /// `<= vulkan_devices.len()`.
+    #[serde(default = "default_gpus")]
+    pub gpus: usize,
+
     /// Optional path for per-request debug I/O logging (JSONL).
     /// When set, every request/response pair for this model is appended
     /// as one JSON object per line.
@@ -355,6 +387,9 @@ pub struct ModelConfig {
 }
 
 fn default_max_instances() -> usize {
+    1
+}
+fn default_gpus() -> usize {
     1
 }
 fn default_max_concurrent() -> usize {
@@ -555,6 +590,36 @@ models:
             "apikeys_file: apikeys.txt\nkeep_alive:\n  amd:\n    cmd: \"true\"\n    sleep: 0",
         );
         expect_validation_error(&yaml, "keep_alive.amd.sleep must be > 0");
+    }
+
+    #[test]
+    fn rejects_zero_gpus() {
+        let yaml = BASE.replace("cmd: \"sleep 3600\"", "cmd: \"sleep 3600\"\n    gpus: 0");
+        expect_validation_error(&yaml, "gpus must be >= 1");
+    }
+
+    #[test]
+    fn rejects_gpus_exceeding_device_pool() {
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\n    gpus: 3\n    vulkan_devices: [0, 1]",
+        );
+        expect_validation_error(&yaml, "gpus (3) exceeds vulkan_devices count (2)");
+    }
+
+    #[test]
+    fn rejects_multi_gpu_for_cpu_model() {
+        let yaml = BASE.replace("cmd: \"sleep 3600\"", "cmd: \"sleep 3600\"\n    gpus: 2");
+        expect_validation_error(&yaml, "CPU-only models must use gpus: 1");
+    }
+
+    #[test]
+    fn accepts_multi_gpu_model() {
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\n    gpus: 2\n    vulkan_devices: [0, 1]",
+        );
+        parse(&yaml).unwrap();
     }
 
     #[test]
