@@ -685,7 +685,10 @@ impl InstanceManager {
     /// vanished (timeout racing the wake) are skipped; a waiter that
     /// can't be served because capacity disappeared in between is
     /// re-parked at the head, preserving FIFO order.
-    pub(crate) fn wake_one(&self, model_name: &str) {
+    ///
+    /// Public for the background release-processing task (see
+    /// `InstanceManager::new`).
+    pub fn wake_one(&self, model_name: &str) {
         let cfg = match self.model_configs.read().unwrap().get(model_name).cloned() {
             Some(c) => c,
             None => return,
@@ -1610,10 +1613,12 @@ impl InstanceManager {
     /// `completions_delta` is 0 for acquires, 1 for releases.
     ///
     /// Called from `get_or_spawn` / `enqueue` (acquire path) and from the
-    /// background release-processing task (release path).  In both cases
-    /// the caller holds **no locks**, so we can safely acquire
-    /// `instances.read()` → `model_metrics.write()` without deadlock.
-    pub(crate) fn record_metrics_event(&self, model_name: &str, completions_delta: u64) {
+    /// background release-processing task (release path — the task the
+    /// caller of `InstanceManager::new` must spawn for `release_rx`).
+    /// In both cases the caller holds **no locks**, so we can safely
+    /// acquire `instances.read()` → `model_metrics.write()` without
+    /// deadlock.
+    pub fn record_metrics_event(&self, model_name: &str, completions_delta: u64) {
         let in_flight: usize = self
             .instances
             .read()

@@ -1,24 +1,10 @@
 use clap::Parser;
+use llm_orch::{apikeys, config, debug_log, gpu, keepalive, reload, scheduler, server, watcher};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
-
-mod apikeys;
-mod backend;
-mod config;
-mod debug_log;
-mod gpu;
-mod handlers;
-mod http_client;
-mod instance;
-mod keepalive;
-mod port_alloc;
-mod scheduler;
-mod server;
-mod types;
-mod watcher;
 
 /// LLM Orch — single-host LLM orchestrator.
 #[derive(Parser, Debug)]
@@ -246,10 +232,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // of the process lifetime.
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!(skipped = n, "reload events lagged — resyncing watched files");
-                        handle_config_reload(
+                        reload::handle_config_reload(
                             &config_path, &cfg, &apikeys, &manager, &last_mtime,
                         ).await;
-                        handle_apikeys_reload(&watched_apikeys, &apikeys, &last_ak_mtime).await;
+                        reload::handle_apikeys_reload(&watched_apikeys, &apikeys, &last_ak_mtime).await;
                         continue;
                     }
                     // All senders dropped — watcher is gone (shutdown).
@@ -263,7 +249,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 match (&changed, &cfg_p) {
                     (Some(c), Some(canon)) if c == canon => {
-                        handle_config_reload(
+                        reload::handle_config_reload(
                             &event.path, &cfg, &apikeys, &manager, &last_mtime,
                         ).await;
                     }
@@ -271,7 +257,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 match (&changed, &ak_p) {
                     (Some(c), Some(canon)) if c == canon => {
-                        handle_apikeys_reload(&event.path, &apikeys, &last_ak_mtime).await;
+                        reload::handle_apikeys_reload(&event.path, &apikeys, &last_ak_mtime).await;
                     }
                     _ => {}
                 }
@@ -375,107 +361,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("stopped");
 
     Ok(())
-}
-
-// ── Reload handlers ──────────────────────────────────────────────────────────
-
-/// Atomic config reload: validate first, swap only on success.
-async fn handle_config_reload(
-    path: &std::path::Path,
-    cfg: &Arc<RwLock<config::Config>>,
-    apikeys: &Arc<RwLock<apikeys::ApikeysStore>>,
-    manager: &Arc<scheduler::InstanceManager>,
-    last_mtime: &Arc<Mutex<Option<std::time::SystemTime>>>,
-) {
-    // Skip if the file's mtime hasn't changed since our last reload.
-    let mtime = match std::fs::metadata(path).and_then(|m| m.modified()) {
-        Ok(mt) => mt,
-        Err(_) => return,
-    };
-    {
-        let last = last_mtime.lock().await;
-        if *last == Some(mtime) {
-            debug!("config mtime unchanged, skipping reload");
-            return;
-        }
-    }
-    info!("config file changed, reloading…");
-    match config::Config::load(path) {
-        Ok(new_cfg) => {
-            // Reload apikeys if the path changed.
-            {
-                let old = cfg.read().await;
-                if new_cfg.server.listen != old.server.listen {
-                    warn!(
-                        old = %old.server.listen,
-                        new = %new_cfg.server.listen,
-                        "server.listen changed — requires a restart, keeping the old listener"
-                    );
-                }
-                if new_cfg.apikeys_file != old.apikeys_file {
-                    match apikeys::ApikeysStore::load(&new_cfg.apikeys_file) {
-                        Ok(new_keys) => {
-                            info!("apikeys reloaded: {} key(s)", new_keys.len());
-                            *apikeys.write().await = new_keys;
-                        }
-                        Err(e) => {
-                            error!("apikeys reload failed (keeping old): {}", e);
-                            return;
-                        }
-                    }
-                }
-            }
-
-            // Reconcile the instance manager (model defs, cmd aliases,
-            // device maps, port range, keep-alive, crash blocks) before
-            // swapping the shared config that handlers validate against.
-            manager.reconcile_config(&new_cfg).await;
-
-            // Atomic swap.
-            let model_count = new_cfg.models.len();
-            *cfg.write().await = new_cfg;
-            // Record the mtime only on success — a rejected or failed
-            // reload must be retried on the next file event, not consumed.
-            *last_mtime.lock().await = Some(mtime);
-            info!(
-                "config reloaded successfully — {} model(s)",
-                model_count
-            );
-        }
-        Err(e) => {
-            error!("config reload rejected (keeping old): {}", e);
-        }
-    }
-}
-
-/// Atomic apikeys reload.
-async fn handle_apikeys_reload(
-    path: &std::path::Path,
-    apikeys: &Arc<RwLock<apikeys::ApikeysStore>>,
-    last_mtime: &Arc<Mutex<Option<std::time::SystemTime>>>,
-) {
-    let mtime = match std::fs::metadata(path).and_then(|m| m.modified()) {
-        Ok(mt) => mt,
-        Err(_) => return,
-    };
-    {
-        let last = last_mtime.lock().await;
-        if *last == Some(mtime) {
-            debug!("apikeys mtime unchanged, skipping reload");
-            return;
-        }
-    }
-    info!("apikeys file changed, reloading…");
-    match apikeys::ApikeysStore::load(path) {
-        Ok(new_keys) => {
-            let count = new_keys.len();
-            *apikeys.write().await = new_keys;
-            // Record the mtime only on success (see config reload).
-            *last_mtime.lock().await = Some(mtime);
-            info!("apikeys reloaded successfully — {} key(s)", count);
-        }
-        Err(e) => {
-            error!("apikeys reload rejected (keeping old): {}", e);
-        }
-    }
 }
