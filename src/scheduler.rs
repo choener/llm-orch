@@ -142,6 +142,36 @@ impl ModelMetrics {
     }
 }
 
+// ── Spawn-config fingerprint ────────────────────────────────────────────────
+
+/// Fingerprint of the configuration that defines the spawned backend
+/// process: the alias-resolved command line (`{port}` deliberately
+/// excluded — it differs per instance), the Vulkan device pool, declared
+/// VRAM, and context length.  Routing-only fields (`max_instances`,
+/// `max_concurrent`, `queue_depth`, `idle_ttl`, `autoscale`, `debug_log`,
+/// `priority`, `ram`) are excluded: changing them must not retire running
+/// instances.
+///
+/// Instances whose stored fingerprint no longer matches the current
+/// config are retired on reload (marked `Failed`/draining) and replaced
+/// on demand.  Runtime-only value — never persisted, so `DefaultHasher`'s
+/// version instability is irrelevant.
+fn fingerprint_with_aliases(cmd_aliases: &HashMap<String, String>, cfg: &ModelConfig) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut resolved = cfg.cmd.clone();
+    for (key, value) in cmd_aliases {
+        resolved = resolved.replace(&format!("{{{}}}", key), value);
+    }
+    let mut devices = cfg.vulkan_devices.clone();
+    devices.sort_unstable();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    resolved.hash(&mut h);
+    devices.hash(&mut h);
+    cfg.vram.hash(&mut h);
+    cfg.context_length.hash(&mut h);
+    h.finish()
+}
+
 // ── Manager ──────────────────────────────────────────────────────────────────
 
 pub struct InstanceManager {
@@ -351,9 +381,21 @@ impl InstanceManager {
             if !a.enabled {
                 true
             } else {
+                // Retiring (`Failed`) instances don't count: from a routing
+                // perspective the model has zero instances, so a config
+                // change that retired the only instance triggers a cold-start
+                // replacement spawn instead of queueing behind the drain.
                 let num_existing = {
                     self.instances.read().unwrap()
-                        .get(model_name).map(|l| l.len()).unwrap_or(0)
+                        .get(model_name)
+                        .map(|l| {
+                            l.iter()
+                                .filter(|h| {
+                                    h.inner().lock().unwrap().state != InstanceState::Failed
+                                })
+                                .count()
+                        })
+                        .unwrap_or(0)
                 };
                 if num_existing == 0 {
                     true // cold start — always spawn immediately
@@ -480,9 +522,17 @@ impl InstanceManager {
             // the removal (and the check fails).  Without this, a removal
             // could slip in between check and push and park us forever.
             let instances = self.instances.read().unwrap();
+            // Only routable instances count: when every remaining instance
+            // is retiring (`Failed` — draining or config-retired), no
+            // release event can ever serve a parked waiter (retiring
+            // instances accept no new slots), so fail fast instead of
+            // parking until the reap drains the queue.
             let has_instances = instances
                 .get(model_name)
-                .map(|l| !l.is_empty())
+                .map(|l| {
+                    l.iter()
+                        .any(|h| h.inner().lock().unwrap().state != InstanceState::Failed)
+                })
                 .unwrap_or(false);
             if !has_instances {
                 return None;
@@ -596,11 +646,21 @@ impl InstanceManager {
         // readiness waiting, not after the full spawn timeout.
         let _permit = self.spawn_semaphore.clone().acquire_owned().await.ok()?;
 
-        // Inside the semaphore: check instance cap.
+        // Inside the semaphore: check instance cap.  Retiring instances
+        // (`Failed` — draining after admin unload, or retired by a config
+        // change) do not count: they are unroutable and reaped once idle,
+        // so counting them would wedge models with `max_instances = 1`
+        // behind a long-running request with no replacement.  Resource
+        // limits are still enforced by the VRAM accounting in
+        // `select_gpu_for_model`, which *does* include retiring instances.
         {
             let instances = self.instances.read().unwrap();
             if let Some(list) = instances.get(model_name) {
-                if list.len() >= cfg.max_instances {
+                let active = list
+                    .iter()
+                    .filter(|h| h.inner().lock().unwrap().state != InstanceState::Failed)
+                    .count();
+                if active >= cfg.max_instances {
                     return None;
                 }
             }
@@ -670,6 +730,7 @@ impl InstanceManager {
             port,
             Some(self.release_tx.clone()),
         );
+        inst.config_fingerprint = self.spawn_fingerprint(cfg);
         // Guarantee a unique ID even when the base `model@gpus` collides
         // (multiple CPU instances of the same model).
         inst.id = format!(
@@ -754,6 +815,35 @@ impl InstanceManager {
             return None;
         }
 
+        // A config reload racing the spawn makes the fresh instance stale
+        // (or removes its model) before it served a single request.  With
+        // zero in-flight requests it can simply be discarded instead of
+        // serving old-config traffic until the next reload notices.
+        let inst_fingerprint = handle.inner().lock().unwrap().config_fingerprint;
+        let current_cfg = self.model_configs.read().unwrap().get(model_name).cloned();
+        let still_current = match current_cfg {
+            Some(c) => self.spawn_fingerprint(&c) == inst_fingerprint,
+            None => false,
+        };
+        if !still_current {
+            warn!(
+                model = %model_name,
+                port = port,
+                "config changed during spawn — discarding fresh instance"
+            );
+            let mut child = {
+                let mut inst = handle.inner().lock().unwrap();
+                inst.state = InstanceState::Failed;
+                inst.child.take()
+            };
+            if let Some(ref mut c) = child {
+                shutdown_child(c, Duration::from_secs(5)).await;
+            }
+            self.unregister_instance(model_name, &handle, &gpu_indices)
+                .await;
+            return None;
+        }
+
         // A successful spawn resets the consecutive pre-output crash counter.
         self.crash_counts.lock().unwrap().remove(model_name);
 
@@ -770,6 +860,12 @@ impl InstanceManager {
         info!(model = %model_name, inst = %instance_id, port = port, "spawn succeeded");
 
         Some(handle)
+    }
+
+    /// Spawn-config fingerprint of `cfg` resolved against the *current*
+    /// cmd aliases (see `fingerprint_with_aliases`).
+    fn spawn_fingerprint(&self, cfg: &ModelConfig) -> u64 {
+        fingerprint_with_aliases(&self.cmd_aliases.read().unwrap(), cfg)
     }
 
     /// Resolve `cmd_aliases` and `{port}` in the model's command string.
@@ -1252,9 +1348,18 @@ impl InstanceManager {
     /// maps, port range, keep-alive), unloads instances of models that no
     /// longer exist, and clears blocked flags + crash counters — a reload
     /// is the operator's way to recover a model after fixing the underlying
-    /// problem (§5).  Running instances of surviving models are kept: a
-    /// running process cannot change its command line, so `cmd` changes
-    /// only affect future spawns.
+    /// problem (§5).
+    ///
+    /// Instances of surviving models whose *spawn-relevant* config changed
+    /// (see `fingerprint_with_aliases`) are retired: marked `Failed`
+    /// (unroutable, same mechanics as draining) so in-flight requests
+    /// finish uninterrupted, then reaped by `reap_drained` once idle.
+    /// Replacements are spawned on demand under the new config — retired
+    /// instances don't count toward the instance cap (see `try_spawn`),
+    /// while VRAM accounting still includes them, so a replacement is
+    /// spawned exactly when resources allow.  Changes to routing-only
+    /// fields (`max_concurrent`, `queue_depth`, `idle_ttl`, autoscale, …)
+    /// keep running instances untouched.
     pub async fn reconcile_config(&self, config: &crate::config::Config) {
         let new_model_configs: HashMap<String, ModelConfig> = config
             .models
@@ -1274,6 +1379,45 @@ impl InstanceManager {
         for model in &removed {
             info!(model = %model, "model removed from config — unloading instances");
             self.unload_model(model).await;
+        }
+
+        // ── Retire instances of surviving models whose spawn config
+        //    changed ─────────────────────────────────────────────────
+        // Computed from the *new* config and *new* cmd aliases directly
+        // (not the swapped manager state), so this is independent of the
+        // swap order below and takes no config locks while holding the
+        // instances lock.
+        for (model_name, new_cfg) in &new_model_configs {
+            let fp = fingerprint_with_aliases(&config.cmd_aliases, new_cfg);
+            let stale: Vec<InstanceHandle> = {
+                let instances = self.instances.read().unwrap();
+                instances
+                    .get(model_name)
+                    .map(|list| {
+                        list.iter()
+                            .filter(|h| {
+                                let inst = h.inner().lock().unwrap();
+                                inst.state != InstanceState::Failed
+                                    && inst.config_fingerprint != fp
+                            })
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            for handle in stale {
+                let (id, in_flight) = {
+                    let mut inst = handle.inner().lock().unwrap();
+                    inst.state = InstanceState::Failed;
+                    (inst.id.clone(), inst.in_flight)
+                };
+                info!(
+                    model = %model_name,
+                    inst = %id,
+                    in_flight,
+                    "spawn config changed — retiring instance (draining)"
+                );
+            }
         }
 
         // ── Swap config-derived fields ───────────────────────────────
@@ -1784,6 +1928,14 @@ models:
         InstanceHandle::new(inst)
     }
 
+    /// Stamp the handle with the fingerprint the manager computes for
+    /// model "m" under the current config (as `try_spawn` does at spawn).
+    fn set_current_fingerprint(mgr: &InstanceManager, handle: &InstanceHandle) {
+        let cfg = mgr.model_configs.read().unwrap().get("m").cloned().unwrap();
+        let fp = mgr.spawn_fingerprint(&cfg);
+        handle.inner().lock().unwrap().config_fingerprint = fp;
+    }
+
     /// Insert a handle and a stale metrics entry (as left over from a
     /// previous despawn→respawn cycle) for model "m".
     fn register_with_stale_metrics(mgr: &InstanceManager, handle: &InstanceHandle) {
@@ -2108,10 +2260,151 @@ models:
 
     #[tokio::test]
     async fn reconcile_keeps_surviving_models_instances() {
-        // Models still present in the reloaded config keep their running
-        // instances (a running process cannot change its command line).
+        // Models still present in the reloaded config with an unchanged
+        // spawn fingerprint keep their running instances.
         let mgr = test_manager();
         let handle = make_handle(InstanceState::Ready, 0, Duration::ZERO);
+        set_current_fingerprint(&mgr, &handle);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle.clone());
+
+        let cfg: crate::config::Config =
+            serde_yaml_ng::from_str(TEST_CONFIG_YAML).unwrap();
+        mgr.reconcile_config(&cfg).await;
+
+        assert_eq!(instance_count(&mgr), 1, "surviving model's instance must be kept");
+        assert_eq!(
+            handle.inner().lock().unwrap().state,
+            InstanceState::Ready,
+            "unchanged spawn config must keep the instance routable"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_retires_stale_instances_and_reaps_after_drain() {
+        // A change to a spawn-relevant field (cmd) retires the running
+        // instance: marked unroutable immediately, but the in-flight
+        // request finishes; the instance is reaped once idle.
+        let mgr = test_manager();
+        let handle = make_handle(InstanceState::Ready, 1, Duration::ZERO);
+        set_current_fingerprint(&mgr, &handle);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle.clone());
+
+        let yaml = TEST_CONFIG_YAML.replace("sleep 3600", "sleep 3601");
+        let cfg: crate::config::Config = serde_yaml_ng::from_str(&yaml).unwrap();
+        mgr.reconcile_config(&cfg).await;
+
+        assert_eq!(
+            handle.inner().lock().unwrap().state,
+            InstanceState::Failed,
+            "stale instance must be marked unroutable"
+        );
+        assert_eq!(
+            instance_count(&mgr),
+            1,
+            "stale instance with an in-flight request must keep serving"
+        );
+        assert!(
+            mgr.find_ready_instance("m", 4).is_none(),
+            "stale instance must not receive new requests"
+        );
+        assert!(handle.try_acquire(4).is_none());
+
+        // The in-flight request completes → reap finishes the removal.
+        handle.inner().lock().unwrap().in_flight = 0;
+        mgr.reap_drained("m").await;
+        assert_eq!(instance_count(&mgr), 0, "retired instance must be reaped");
+    }
+
+    #[tokio::test]
+    async fn reconcile_keeps_instances_when_only_routing_fields_change() {
+        // max_concurrent / queue_depth / idle_ttl changes apply to routing
+        // immediately and must not retire running instances.
+        let mgr = test_manager();
+        let handle = make_handle(InstanceState::Ready, 0, Duration::ZERO);
+        set_current_fingerprint(&mgr, &handle);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle.clone());
+
+        let yaml = r#"
+server: {}
+apikeys_file: apikeys.txt
+models:
+  - name: m
+    context_length: 4096
+    cmd: "sleep 3600"
+    idle_ttl: 30
+    max_concurrent: 8
+    queue_depth: 3
+"#;
+        let cfg: crate::config::Config = serde_yaml_ng::from_str(yaml).unwrap();
+        mgr.reconcile_config(&cfg).await;
+
+        assert_eq!(
+            handle.inner().lock().unwrap().state,
+            InstanceState::Ready,
+            "routing-only config changes must not retire instances"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_cap_excludes_draining_instances() {
+        // A draining/retired instance must not block a replacement spawn:
+        // with max_instances = 1 and one Failed instance, try_spawn must
+        // still attempt the spawn (observable via the crash counter the
+        // instantly-failing "true" command produces).
+        let yaml = r#"
+server: {}
+apikeys_file: apikeys.txt
+models:
+  - name: m
+    context_length: 4096
+    cmd: "true"
+    idle_ttl: 60
+    max_instances: 1
+"#;
+        let config: crate::config::Config = serde_yaml_ng::from_str(yaml).unwrap();
+        let gpu_snapshot = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+        let (mgr, _release_rx, _crash_rx) =
+            InstanceManager::new(&config, gpu_snapshot, None);
+        let draining = make_handle(InstanceState::Failed, 1, Duration::ZERO);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(draining);
+
+        let cfg = mgr.model_configs.read().unwrap().get("m").cloned().unwrap();
+        // "true" exits instantly → spawn attempt fails fast, but it must
+        // have been *attempted* (a cap refusal would not count a crash).
+        assert!(mgr.try_spawn("m", &cfg).await.is_none());
+        assert_eq!(
+            mgr.crash_counts.lock().unwrap().get("m").copied(),
+            Some(1),
+            "spawn must have been attempted despite the draining instance"
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_refused_when_only_draining_instances_exist() {
+        // All remaining instances retiring (Failed): no release event can
+        // ever serve a parked waiter, so enqueue must fail fast.
+        let mgr = test_manager();
+        let handle = make_handle(InstanceState::Failed, 0, Duration::ZERO);
         mgr.instances
             .write()
             .unwrap()
@@ -2119,11 +2412,73 @@ models:
             .or_default()
             .push(handle);
 
+        let result = mgr.enqueue("m", 8, 4).await;
+        assert!(
+            result.is_none(),
+            "enqueue with only retiring instances must fail fast"
+        );
+    }
+
+    #[test]
+    fn fingerprint_covers_cmd_aliases_devices_vram_context() {
         let cfg: crate::config::Config =
             serde_yaml_ng::from_str(TEST_CONFIG_YAML).unwrap();
-        mgr.reconcile_config(&cfg).await;
+        let model = cfg.models[0].clone();
+        let no_aliases = HashMap::new();
 
-        assert_eq!(instance_count(&mgr), 1, "surviving model's instance must be kept");
+        let base = fingerprint_with_aliases(&no_aliases, &model);
+        // Deterministic.
+        assert_eq!(base, fingerprint_with_aliases(&no_aliases, &model));
+
+        // cmd change → different fingerprint.
+        let mut m2 = model.clone();
+        m2.cmd = "sleep 3601".into();
+        assert_ne!(base, fingerprint_with_aliases(&no_aliases, &m2));
+
+        // vulkan_devices change → different fingerprint (order-insensitive).
+        let mut m3 = model.clone();
+        m3.vulkan_devices = vec![1, 0];
+        let mut m4 = model.clone();
+        m4.vulkan_devices = vec![0, 1];
+        assert_eq!(
+            fingerprint_with_aliases(&no_aliases, &m3),
+            fingerprint_with_aliases(&no_aliases, &m4)
+        );
+        assert_ne!(base, fingerprint_with_aliases(&no_aliases, &m3));
+
+        // vram / context_length changes → different fingerprint.
+        let mut m5 = model.clone();
+        m5.vram = 1024;
+        assert_ne!(base, fingerprint_with_aliases(&no_aliases, &m5));
+        let mut m6 = model.clone();
+        m6.context_length = 8192;
+        assert_ne!(base, fingerprint_with_aliases(&no_aliases, &m6));
+
+        // cmd_aliases resolving into the cmd → different fingerprint;
+        // unused aliases → same fingerprint.
+        let mut m7 = model.clone();
+        m7.cmd = "sleep {duration}".into();
+        let mut aliases = HashMap::new();
+        aliases.insert("duration".to_owned(), "3600".to_owned());
+        assert_ne!(
+            fingerprint_with_aliases(&no_aliases, &m7),
+            fingerprint_with_aliases(&aliases, &m7)
+        );
+        aliases.insert("unused".to_owned(), "x".to_owned());
+        let mut only_unused = HashMap::new();
+        only_unused.insert("unused".to_owned(), "x".to_owned());
+        assert_eq!(
+            fingerprint_with_aliases(&only_unused, &model),
+            fingerprint_with_aliases(&aliases, &model)
+        );
+
+        // Routing-only fields must not affect the fingerprint.
+        let mut m8 = model.clone();
+        m8.max_concurrent = 99;
+        m8.queue_depth = 99;
+        m8.idle_ttl = 99;
+        m8.max_instances = 99;
+        assert_eq!(base, fingerprint_with_aliases(&no_aliases, &m8));
     }
 
     #[tokio::test]

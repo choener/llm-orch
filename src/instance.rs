@@ -54,6 +54,13 @@ pub struct Instance {
     /// Channel sender for notifying the manager on slot release.
     /// `None` in tests or after shutdown.
     pub release_tx: Option<mpsc::UnboundedSender<String>>,
+
+    /// Fingerprint of the spawn-relevant config (resolved `cmd`, Vulkan
+    /// device pool, `vram`, `context_length`) this instance was launched
+    /// with.  Set by the manager at spawn time; `0` means "unset" (tests).
+    /// On config reload, instances whose fingerprint no longer matches are
+    /// retired (marked `Failed`/draining) and replaced on demand.
+    pub config_fingerprint: u64,
 }
 
 impl Instance {
@@ -75,6 +82,7 @@ impl Instance {
             in_flight: 0,
             last_active: Instant::now(),
             release_tx,
+            config_fingerprint: 0,
         }
     }
 
