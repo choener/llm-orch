@@ -212,10 +212,11 @@ pub struct ModelInfo {
     pub load_m5: f64,
     pub load_m15: f64,
     /// 1 / 5 / 15-minute EMA of request completion rate (req/min).
+    /// Counted at slot release regardless of outcome (release rate).
     pub req_rate_m1: f64,
     pub req_rate_m5: f64,
     pub req_rate_m15: f64,
-    /// Total completed requests since daemon start.
+    /// Total completed requests since daemon start (release-counted).
     pub completions_total: u64,
     /// Last N completion records (ring buffer, newest first).
     #[serde(skip_serializing_if = "Vec::is_empty")]

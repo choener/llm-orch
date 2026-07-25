@@ -89,10 +89,18 @@ pub struct ModelMetrics {
     pub load_m5: f64,
     pub load_m15: f64,
     /// 1 / 5 / 15-minute EMA of request completion rate (req / min).
+    ///
+    /// Counted at slot release, so this is strictly a *release rate*:
+    /// successful completions, backend errors, and truncated streams
+    /// alike.  That is deliberate — the metric is informational
+    /// (dashboards, sizing), not an eviction input, and plumbing
+    /// per-request outcomes into the RAII `SlotGuard` drop path isn't
+    /// worth the coupling.
     pub req_rate_m1: f64,
     pub req_rate_m5: f64,
     pub req_rate_m15: f64,
-    /// Total completed requests since daemon start.
+    /// Total completed requests since daemon start (release-counted,
+    /// see `req_rate_m1`).
     pub completions_total: u64,
 
     /// Wall-clock time of the most recent activity (acquire, release, or
@@ -1610,7 +1618,8 @@ impl InstanceManager {
     }
 
     /// Record a metrics event for `model_name`.
-    /// `completions_delta` is 0 for acquires, 1 for releases.
+    /// `completions_delta` is 0 for acquires, 1 for releases (counted
+    /// regardless of request outcome — see `ModelMetrics::req_rate_m1`).
     ///
     /// Called from `get_or_spawn` / `enqueue` (acquire path) and from the
     /// background release-processing task (release path — the task the
