@@ -153,7 +153,6 @@ pub struct DebugStreamContext {
     pub model_name: String,
     pub alias: Option<String>,
     pub instance_id: String,
-    pub api_user: String,
     pub t0: Instant,
 }
 

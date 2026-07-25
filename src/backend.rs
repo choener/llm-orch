@@ -59,9 +59,6 @@ use std::time::Duration;
 use reqwest::Client;
 use crate::instance::InstanceHandle;
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-
 /// Spawn a backend subprocess with the given program, arguments, and environment.
 ///
 /// `kill_on_drop(true)` ensures the child is reaped when the handle drops.

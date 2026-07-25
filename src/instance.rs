@@ -91,11 +91,6 @@ impl Instance {
         self.state = InstanceState::Ready;
     }
 
-    /// Mark this instance as failed.
-    pub fn mark_failed(&mut self) {
-        self.state = InstanceState::Failed;
-    }
-
     /// Increment the in-flight counter and bump the activity timestamp.
     pub fn acquire_slot(&mut self) {
         self.in_flight += 1;
@@ -168,11 +163,6 @@ impl InstanceHandle {
         } else {
             None
         }
-    }
-
-    /// Return a clone of the inner `Arc` for sharing across tasks.
-    pub fn clone_arc(&self) -> Arc<Mutex<Instance>> {
-        Arc::clone(&self.inner)
     }
 
     /// Direct access to the inner mutex (for state transitions).

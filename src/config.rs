@@ -218,17 +218,6 @@ impl Config {
 
         Ok(())
     }
-
-    /// Resolve `{alias_name}` references in a model's `cmd` against `cmd_aliases`.
-    /// `{port}` is left untouched — resolved at spawn time.
-    pub fn resolve_model_cmd(&self, raw_cmd: &str) -> String {
-        let mut resolved = raw_cmd.to_owned();
-        for (key, value) in &self.cmd_aliases {
-            let placeholder = format!("{{{}}}", key);
-            resolved = resolved.replace(&placeholder, value);
-        }
-        resolved
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -297,13 +286,6 @@ impl Default for PortRange {
     }
 }
 
-impl PortRange {
-    /// Returns `true` when the OS should pick ports.
-    pub fn is_ephemeral(&self) -> bool {
-        matches!(self, PortRange::EphemeralWord(s) if s == "ephemeral")
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Model definitions
 // ---------------------------------------------------------------------------
@@ -325,7 +307,10 @@ pub struct ModelConfig {
     pub max_concurrent: usize,
 
     /// Eviction priority — higher values are kept longer.
+    /// Reserved for the deferred eviction policy (plan §Eviction);
+    /// accepted in config today for forward compatibility.
     #[serde(default)]
+    #[allow(dead_code)]
     pub priority: i32,
 
     /// Declared VRAM usage in MB (scheduler hint).
@@ -333,7 +318,9 @@ pub struct ModelConfig {
     pub vram: u64,
 
     /// Declared system RAM usage in MB (scheduler hint).
+    /// Reserved for the deferred eviction policy (plan §Eviction).
     #[serde(default)]
+    #[allow(dead_code)]
     pub ram: u64,
 
     /// Seconds of inactivity before the instance is unloaded.
@@ -408,16 +395,11 @@ pub struct AutoscaleConfig {
     /// Minimum seconds between any scale action (up or down).
     #[serde(default = "default_autoscale_cooldown")]
     pub cooldown_secs: u64,
-
-    /// Seconds between autoscale evaluations.
-    #[serde(default = "default_autoscale_interval")]
-    pub interval_secs: u64,
 }
 
 fn default_autoscale_up() -> f64 { 0.7 }
 fn default_autoscale_down() -> f64 { 0.4 }
 fn default_autoscale_cooldown() -> u64 { 120 }
-fn default_autoscale_interval() -> u64 { 30 }
 
 // ---------------------------------------------------------------------------
 // Device mapping

@@ -35,10 +35,6 @@ pub struct GpuMetrics {
     // ── Memory ──────────────────────────────────────────────────────
     pub vram_total_bytes: u64,
     pub vram_used_bytes: u64,
-    pub gtt_total_bytes: Option<u64>,
-    pub gtt_used_bytes: Option<u64>,
-    pub vis_vram_total_bytes: Option<u64>,
-    pub vis_vram_used_bytes: Option<u64>,
 
     // ── Thermals / power ────────────────────────────────────────────
     /// Temperature in °C.
@@ -88,11 +84,6 @@ impl GpuReader {
         (Self { snapshot }, handle)
     }
 
-    /// Return a copy of the latest snapshot.
-    pub async fn metrics(&self) -> Vec<GpuMetrics> {
-        self.snapshot.read().await.clone()
-    }
-
     /// Return the `Arc<RwLock<…>>` for sharing with axum state.
     pub fn snapshot_arc(&self) -> Arc<RwLock<Vec<GpuMetrics>>> {
         Arc::clone(&self.snapshot)
@@ -138,10 +129,6 @@ fn read_one_gpu(card_index: usize, device: &Path) -> Result<GpuMetrics, String> 
     // Memory
     let vram_total_bytes = read_u64(device, "mem_info_vram_total").unwrap_or(0);
     let vram_used_bytes = read_u64(device, "mem_info_vram_used").unwrap_or(0);
-    let gtt_total_bytes = read_u64(device, "mem_info_gtt_total");
-    let gtt_used_bytes = read_u64(device, "mem_info_gtt_used");
-    let vis_vram_total_bytes = read_u64(device, "mem_info_vis_vram_total");
-    let vis_vram_used_bytes = read_u64(device, "mem_info_vis_vram_used");
 
     // Temperature: find the first hwmon that has temp1_input.
     let temperature_c =
@@ -164,10 +151,6 @@ fn read_one_gpu(card_index: usize, device: &Path) -> Result<GpuMetrics, String> 
         vram_vendor,
         vram_total_bytes,
         vram_used_bytes,
-        gtt_total_bytes,
-        gtt_used_bytes,
-        vis_vram_total_bytes,
-        vis_vram_used_bytes,
         temperature_c,
         power_w,
         gpu_busy_pct,

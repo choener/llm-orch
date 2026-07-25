@@ -123,52 +123,6 @@ pub enum StopSequences {
 
 // ── Chat completions response ────────────────────────────────────────────────
 
-/// A non-streaming chat completion response.
-#[derive(Debug, Clone, Serialize)]
-pub struct ChatCompletionResponse {
-    pub id: String,
-    pub object: String,
-    pub created: i64,
-    pub model: String,
-    pub choices: Vec<ChatChoice>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<Usage>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ChatChoice {
-    pub index: u32,
-    pub message: ChatMessage,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub finish_reason: Option<String>,
-}
-
-/// A streaming chat completion chunk (SSE `data:` payload).
-#[derive(Debug, Clone, Serialize)]
-pub struct ChatCompletionChunk {
-    pub id: String,
-    pub object: String,
-    pub created: i64,
-    pub model: String,
-    pub choices: Vec<ChatStreamChoice>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ChatStreamChoice {
-    pub index: u32,
-    pub delta: ChatDelta,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub finish_reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ChatDelta {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Usage {
     #[serde(default)]
@@ -214,26 +168,6 @@ pub struct CompletionRequest {
 pub enum PromptContent {
     Text(String),
     Array(Vec<String>),
-}
-
-/// A non-streaming completions response.
-#[derive(Debug, Clone, Serialize)]
-pub struct CompletionResponse {
-    pub id: String,
-    pub object: String,
-    pub created: i64,
-    pub model: String,
-    pub choices: Vec<CompletionChoice>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<Usage>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct CompletionChoice {
-    pub index: u32,
-    pub text: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub finish_reason: Option<String>,
 }
 
 // ── /v1/models response ──────────────────────────────────────────────────────

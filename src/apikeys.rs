@@ -91,12 +91,6 @@ impl ApikeysStore {
         Ok(Self { keys })
     }
 
-    /// Re-read and re-parse the API keys file from disk.
-    pub fn reload(&mut self, path: &Path) -> Result<(), ApikeysError> {
-        *self = Self::load(path)?;
-        Ok(())
-    }
-
     /// Returns the label for a given key, or `None` if the key is unknown.
     pub fn authenticate(&self, key: &str) -> Option<&str> {
         self.keys.get(key).map(|s| s.as_str())

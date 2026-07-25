@@ -138,7 +138,6 @@ impl KeepAliveManager {
                             Err(e) => {
                                 warn!(slot = %slot, card = card_index, error = %e, "keep-alive command spawn failed");
                             }
-                            _ => {}
                         }
                     }
                 }

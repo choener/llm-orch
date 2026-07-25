@@ -345,7 +345,6 @@ pub async fn chat_completions(
             model_name: model_name.clone(),
             alias: Some(request_model.clone()),
             instance_id: instance_id.clone(),
-            api_user: key.label.clone(),
             t0: std::time::Instant::now(),
         });
         let stream = build_sse_stream(
