@@ -93,7 +93,7 @@ models:
     cmd: |
       {llama}
         --model /models/qwen3-32b-q4_k_m.gguf
-        --ctx-size 32768
+        --ctx-size {context_length}   # substituted from the model's context_length
 
   # --- Example 2: a model too large for one GPU — spans two ----------------
   # `gpus: 2` splits the model evenly across two devices (llama.cpp's

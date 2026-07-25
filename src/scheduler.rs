@@ -987,7 +987,8 @@ impl InstanceManager {
         fingerprint_with_aliases(&self.cmd_aliases.read().unwrap(), cfg)
     }
 
-    /// Resolve `cmd_aliases` and `{port}` in the model's command string.
+    /// Resolve `cmd_aliases`, `{port}`, and `{context_length}` in the
+    /// model's command string.
     fn resolve_cmd(&self, cfg: &ModelConfig, port: u16) -> String {
         let mut resolved = cfg.cmd.clone();
         let cmd_aliases = self.cmd_aliases.read().unwrap();
@@ -995,7 +996,9 @@ impl InstanceManager {
             let placeholder = format!("{{{}}}", key);
             resolved = resolved.replace(&placeholder, value);
         }
-        resolved.replace("{port}", &port.to_string())
+        resolved
+            .replace("{port}", &port.to_string())
+            .replace("{context_length}", &cfg.context_length.to_string())
     }
 
     /// Pick the Vulkan devices for a new instance from the model's
@@ -3026,6 +3029,19 @@ models:
         assert!(
             placement.is_empty(),
             "fewer candidates than gpus must yield no placement, got {placement:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_cmd_substitutes_context_length_and_port() {
+        let mgr = test_manager();
+        let cfg: ModelConfig = serde_yaml_ng::from_str(
+            "name: x\ncontext_length: 8192\ncmd: \"run --ctx-size {context_length} --port {port}\"",
+        )
+        .unwrap();
+        assert_eq!(
+            mgr.resolve_cmd(&cfg, 9999),
+            "run --ctx-size 8192 --port 9999"
         );
     }
 

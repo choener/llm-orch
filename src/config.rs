@@ -152,10 +152,13 @@ impl Config {
         }
 
         // --- cmd_aliases ---
-        if self.cmd_aliases.contains_key("port") {
-            return Err(ConfigError::Validation(
-                "cmd_aliases: 'port' is a reserved name".into(),
-            ));
+        for reserved in ["port", "context_length"] {
+            if self.cmd_aliases.contains_key(reserved) {
+                return Err(ConfigError::Validation(format!(
+                    "cmd_aliases: '{}' is a reserved name",
+                    reserved
+                )));
+            }
         }
 
         // --- port range ---
@@ -354,8 +357,9 @@ pub struct ModelConfig {
     pub queue_depth: usize,
 
     /// Subprocess command line.  Shell-style quoting / whitespace separation.
-    /// `{alias_name}` placeholders are resolved from `cmd_aliases` at load time;
-    /// `{port}` is replaced with the allocated port number before spawning.
+    /// `{alias_name}` placeholders are resolved from `cmd_aliases` at spawn
+    /// time; `{port}` is replaced with the allocated port number and
+    /// `{context_length}` with the model's declared `context_length`.
     pub cmd: String,
 
     /// Vulkan device indices this model can be placed on (from `devices.vulkan`).
@@ -620,6 +624,17 @@ models:
             "cmd: \"sleep 3600\"\n    gpus: 2\n    vulkan_devices: [0, 1]",
         );
         parse(&yaml).unwrap();
+    }
+
+    #[test]
+    fn rejects_reserved_cmd_alias_names() {
+        for reserved in ["port", "context_length"] {
+            let yaml = BASE.replace(
+                "apikeys_file: apikeys.txt",
+                &format!("apikeys_file: apikeys.txt\ncmd_aliases:\n  {reserved}: \"x\""),
+            );
+            expect_validation_error(&yaml, &format!("'{reserved}' is a reserved name"));
+        }
     }
 
     #[test]
