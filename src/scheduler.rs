@@ -33,8 +33,10 @@ const QUEUE_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 const SPAWN_SERIAL_WINDOW: Duration = Duration::from_secs(15);
 
 /// A parked waiter: unique id (for timeout self-removal) plus the channel
-/// used to deliver an instance handle once a slot frees up.
-type WaitQueue = VecDeque<(u64, oneshot::Sender<InstanceHandle>)>;
+/// used to deliver an already-acquired slot once capacity frees up.  The
+/// `SlotGuard` *is* the slot (acquired by `wake_one` under the instance
+/// lock), so a woken waiter can never lose the acquire race.
+type WaitQueue = VecDeque<(u64, oneshot::Sender<SlotGuard>)>;
 
 /// Why `get_or_spawn` could not provide an instance slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,9 +61,6 @@ enum EnqueueError {
     NoInstances,
     /// The queue wait timed out.
     Timeout,
-    /// Woken with a handle, but a competing request grabbed the slot
-    /// first (re-queueing is a separate TODO; treated as no-capacity).
-    LostRace,
 }
 
 /// How instance removal treats an instance with in-flight requests.
@@ -475,12 +474,12 @@ impl InstanceManager {
         }
 
         // Queue path: all instances busy and at cap.
-        match self.enqueue(model_name, cfg.queue_depth, max_concurrent).await {
+        match self.enqueue(model_name, cfg.queue_depth).await {
             Ok(guard) => Ok(guard),
             // Nothing exists that could ever wake a waiter — the spawn
             // failed (see logs) or everything left is retiring.
             Err(EnqueueError::NoInstances) => Err(AcquireError::Unavailable),
-            Err(EnqueueError::QueueFull | EnqueueError::Timeout | EnqueueError::LostRace) => {
+            Err(EnqueueError::QueueFull | EnqueueError::Timeout) => {
                 Err(AcquireError::NoCapacity)
             }
         }
@@ -577,13 +576,13 @@ impl InstanceManager {
     /// 429), with `NoInstances` if no routable instance exists (no release
     /// or spawn event could ever wake the parked waiter — fail fast
     /// instead of hanging forever), or with `Timeout` when the wait
-    /// exceeds the budget.  Acquires the slot on the received handle
-    /// before returning.
+    /// exceeds the budget.  On success the received guard already owns the
+    /// slot (acquired by `wake_one`) — there is no acquire race on this
+    /// side.
     async fn enqueue(
         &self,
         model_name: &str,
         max_depth: usize,
-        max_concurrent: usize,
     ) -> Result<SlotGuard, EnqueueError> {
         let (tx, rx) = oneshot::channel();
         let id = self.next_queue_id.fetch_add(1, Ordering::Relaxed);
@@ -631,26 +630,23 @@ impl InstanceManager {
         // spawn must not time out and 429 just as capacity appears.
         let wait_budget = QUEUE_WAIT_TIMEOUT
             .max(self.spawn_timeout + SPAWN_SERIAL_WINDOW + Duration::from_secs(60));
-        let handle = match tokio::time::timeout(wait_budget, rx).await {
-            Ok(Ok(handle)) => handle,
+        let guard = match tokio::time::timeout(wait_budget, rx).await {
+            Ok(Ok(guard)) => guard,
             // Queue drained (last instance removed) — fail fast.
             Ok(Err(_)) => return Err(EnqueueError::NoInstances),
             Err(_) => {
                 // Timed out — remove our entry if it is still parked.
-                // (If wake_one already popped us, the handle it sent is
-                // dropped with the receiver; handle drop is a no-op.)
+                // (If wake_one already popped us, the guard it sent is
+                // dropped with the receiver, which releases the slot —
+                // accounting stays balanced.)
                 self.remove_queued(model_name, id);
                 return Err(EnqueueError::Timeout);
             }
         };
 
-        if let Some(guard) = handle.try_acquire(max_concurrent) {
-            self.record_metrics_event(model_name, 0);
-            Ok(guard)
-        } else {
-            // Woken but the slot was grabbed by a competing request first.
-            Err(EnqueueError::LostRace)
-        }
+        // The guard already owns the slot (acquired by `wake_one`).
+        self.record_metrics_event(model_name, 0);
+        Ok(guard)
     }
 
     /// Remove a specific queued waiter (used after a queue-wait timeout).
@@ -679,22 +675,54 @@ impl InstanceManager {
         }
     }
 
-    /// Wake the first queued waiter for `model_name` if an instance is available.
+    /// Wake the first queued waiter for `model_name` if an instance has
+    /// spare capacity.
+    ///
+    /// The slot is acquired *here*, under the instance lock, and the
+    /// `SlotGuard` itself is sent through the channel — the woken waiter
+    /// receives an owned slot, so a competing request can never snatch it
+    /// between wake and acquire (the old `LostRace` 429).  Waiters that
+    /// vanished (timeout racing the wake) are skipped; a waiter that
+    /// can't be served because capacity disappeared in between is
+    /// re-parked at the head, preserving FIFO order.
     pub(crate) fn wake_one(&self, model_name: &str) {
         let cfg = match self.model_configs.read().unwrap().get(model_name).cloned() {
             Some(c) => c,
             None => return,
         };
 
-        let handle = self.find_ready_instance(model_name, cfg.max_concurrent);
+        loop {
+            // Pop the head waiter, if any.  The queues lock is released
+            // before touching instances — lock order is instances → queues.
+            let entry = {
+                let mut queues = self.queues.write().unwrap();
+                queues.get_mut(model_name).and_then(|q| q.pop_front())
+            };
+            let Some((id, tx)) = entry else {
+                return;
+            };
 
-        if let Some(h) = handle {
-            let mut queues = self.queues.write().unwrap();
-            if let Some(queue) = queues.get_mut(model_name) {
-                while let Some((_id, tx)) = queue.pop_front() {
-                    if tx.send(h.clone()).is_ok() {
-                        return;
-                    }
+            let guard = self
+                .find_ready_instance(model_name, cfg.max_concurrent)
+                .and_then(|h| h.try_acquire(cfg.max_concurrent));
+            match guard {
+                Some(g) => match tx.send(g) {
+                    Ok(()) => return,
+                    // Waiter vanished (timeout racing the wake) — the
+                    // returned guard drops, releasing the slot; try the
+                    // next waiter.  (Costs a rare phantom release event in
+                    // the req-rate EMA — informational only.)
+                    Err(_) => continue,
+                },
+                None => {
+                    // Capacity disappeared between the release event and
+                    // now — re-park at the head and wait for the next one.
+                    let mut queues = self.queues.write().unwrap();
+                    queues
+                        .entry(model_name.to_owned())
+                        .or_default()
+                        .push_front((id, tx));
+                    return;
                 }
             }
         }
@@ -2114,7 +2142,7 @@ models:
         // Spawn failure with zero instances registered must not park the
         // request forever: nothing would ever wake the waiter.
         let mgr = test_manager();
-        let result = mgr.enqueue("m", 8, 4).await;
+        let result = mgr.enqueue("m", 8).await;
         assert!(
             matches!(result, Err(EnqueueError::NoInstances)),
             "enqueue with no instances must fail fast"
@@ -2163,7 +2191,7 @@ models:
             list.push(h2);
         }
 
-        let (tx, rx) = oneshot::channel::<InstanceHandle>();
+        let (tx, rx) = oneshot::channel::<SlotGuard>();
         mgr.queues
             .write()
             .unwrap()
@@ -2194,9 +2222,73 @@ models:
             .or_default()
             .push(handle.clone());
 
-        let guard = mgr.enqueue("m", 8, 1).await;
+        let guard = mgr.enqueue("m", 8).await;
         assert!(guard.is_ok(), "waiter must be served by the post-push wake");
         assert_eq!(handle.inner().lock().unwrap().in_flight, 1);
+    }
+
+    #[tokio::test]
+    async fn wake_one_transfers_acquired_slot_to_waiter() {
+        // The wake must transfer an already-acquired slot: the waiter
+        // receives a SlotGuard, so it can't lose an acquire race — there
+        // is no acquire on its side.
+        let mgr = test_manager();
+        let handle = make_handle(InstanceState::Ready, 1, Duration::ZERO);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle.clone());
+        let (tx, rx) = oneshot::channel::<SlotGuard>();
+        mgr.queues
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push_back((0, tx));
+
+        mgr.wake_one("m");
+
+        let guard = rx.await.expect("waiter must receive a slot");
+        assert_eq!(
+            handle.inner().lock().unwrap().in_flight,
+            2,
+            "the slot must be acquired atomically with the wake"
+        );
+        drop(guard);
+        assert_eq!(handle.inner().lock().unwrap().in_flight, 1);
+    }
+
+    #[tokio::test]
+    async fn wake_one_reparks_waiter_at_head_when_capacity_vanishes() {
+        // Instance full (in_flight = max_concurrent = 4, the config
+        // default): wake_one must re-park the waiter at the head of the
+        // queue, preserving FIFO order, instead of dropping it.
+        let mgr = test_manager();
+        let handle = make_handle(InstanceState::Ready, 4, Duration::ZERO);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle);
+        let (tx, rx) = oneshot::channel::<SlotGuard>();
+        {
+            let mut queues = mgr.queues.write().unwrap();
+            let q = queues.entry("m".to_owned()).or_default();
+            q.push_back((7, tx));
+        }
+
+        mgr.wake_one("m");
+
+        assert_eq!(mgr.queue_depth("m"), 1, "waiter must be re-parked");
+        assert!(!rx.is_terminated(), "waiter must stay parked");
+        let queues = mgr.queues.read().unwrap();
+        assert_eq!(
+            queues["m"][0].0, 7,
+            "re-parked waiter must be back at the head"
+        );
     }
 
     #[tokio::test]
@@ -2204,8 +2296,8 @@ models:
         // Timeout path: a timed-out waiter removes its own entry by id;
         // other parked waiters must stay in place.
         let mgr = test_manager();
-        let (tx1, rx1) = oneshot::channel::<InstanceHandle>();
-        let (tx2, rx2) = oneshot::channel::<InstanceHandle>();
+        let (tx1, rx1) = oneshot::channel::<SlotGuard>();
+        let (tx2, rx2) = oneshot::channel::<SlotGuard>();
         {
             let mut queues = mgr.queues.write().unwrap();
             let q = queues.entry("m".to_owned()).or_default();
@@ -2495,7 +2587,7 @@ models:
             .or_default()
             .push(handle);
 
-        let result = mgr.enqueue("m", 8, 4).await;
+        let result = mgr.enqueue("m", 8).await;
         assert!(
             matches!(result, Err(EnqueueError::NoInstances)),
             "enqueue with only retiring instances must fail fast"
@@ -2516,7 +2608,7 @@ models:
             .or_default()
             .push(handle);
 
-        let result = mgr.enqueue("m", 8, 4).await;
+        let result = mgr.enqueue("m", 8).await;
         assert!(matches!(result, Err(EnqueueError::Timeout)), "got: {:?}", result.map(|_| "guard"));
         assert_eq!(mgr.queue_depth("m"), 0, "timed-out waiter must self-remove");
     }
