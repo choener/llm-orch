@@ -276,12 +276,15 @@ pub async fn chat_completions(
     //    Pure computation — no locks involved.
     apply_alias_prompts(&mut request.messages, alias_system_prompt, alias_prompt_template);
 
-    // ── 3. Verify the model exists in the config and extract debug_log. ─
+    // ── 3. Verify the model exists in the config; extract debug_log and
+    //    the backend timeouts. ─
     let request_model = request.model.clone();
-    let debug_log_path: Option<std::path::PathBuf> = {
+    let (debug_log_path, idle_timeout, total_timeout): (Option<std::path::PathBuf>, _, _) = {
         let cfg = state.config.read().await;
+        let idle = std::time::Duration::from_secs(cfg.server.backend_idle_timeout_secs);
+        let total = std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs);
         match cfg.models.iter().find(|m| m.name == model_name) {
-            Some(m) => m.debug_log.clone(),
+            Some(m) => (m.debug_log.clone(), idle, total),
             None => return Err(ApiError::ModelNotFound(model_name)),
         }
     }; // cfg read guard dropped
@@ -362,6 +365,7 @@ pub async fn chat_completions(
             state.manager.clone(),
             key.label.clone(),
             request_id.clone(),
+            idle_timeout,
         )
         .await
         .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
@@ -374,6 +378,7 @@ pub async fn chat_completions(
             &state.client,
             &backend_url,
             &request_body,
+            total_timeout,
         )
         .await?;
         let elapsed = t0.elapsed();
@@ -459,14 +464,18 @@ pub async fn completions(
         resolve_alias(&cfg.aliases, &request.model)
     };
 
-    // ── 2. Verify model exists. ─────────────────────────────────────────
-    {
+    // ── 2. Verify model exists; read the backend timeouts. ────────────
+    let (idle_timeout, total_timeout) = {
         let cfg = state.config.read().await;
         let exists = cfg.models.iter().any(|m| m.name == model_name);
         if !exists {
             return Err(ApiError::ModelNotFound(model_name));
         }
-    }
+        (
+            std::time::Duration::from_secs(cfg.server.backend_idle_timeout_secs),
+            std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs),
+        )
+    };
 
     // ── 3. Acquire instance slot. ───────────────────────────────────────
     let guard = state
@@ -512,6 +521,7 @@ pub async fn completions(
             state.manager.clone(),
             String::new(),
             String::new(),
+            idle_timeout,
         )
         .await
         .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
@@ -523,6 +533,7 @@ pub async fn completions(
             &state.client,
             &backend_url,
             &serde_json::to_value(&request).unwrap_or_default(),
+            total_timeout,
         )
         .await?;
         let elapsed = t0.elapsed();
@@ -558,14 +569,15 @@ pub async fn embeddings(
         resolve_alias(&cfg.aliases, &request.model)
     };
 
-    // ── 2. Verify model exists. ─────────────────────────────────────────
-    {
+    // ── 2. Verify model exists; read the backend timeout. ─────────────
+    let total_timeout = {
         let cfg = state.config.read().await;
         let exists = cfg.models.iter().any(|m| m.name == model_name);
         if !exists {
             return Err(ApiError::ModelNotFound(model_name));
         }
-    }
+        std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs)
+    };
 
     // ── 3. Acquire instance slot. ───────────────────────────────────────
     let guard = state
@@ -597,6 +609,7 @@ pub async fn embeddings(
         &state.client,
         &backend_url,
         &serde_json::to_value(&request).unwrap_or_default(),
+        total_timeout,
     )
     .await
     .map_err(|e| {
@@ -659,11 +672,12 @@ pub async fn rerank(
 
     let request_model = request.model.clone();
 
-    // ── 2. Verify model exists and extract debug_log. ───────────────────
-    let debug_log_path: Option<std::path::PathBuf> = {
+    // ── 2. Verify model exists; extract debug_log and the backend timeout. ─
+    let (debug_log_path, total_timeout): (Option<std::path::PathBuf>, _) = {
         let cfg = state.config.read().await;
+        let total = std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs);
         match cfg.models.iter().find(|m| m.name == model_name) {
-            Some(m) => m.debug_log.clone(),
+            Some(m) => (m.debug_log.clone(), total),
             None => return Err(ApiError::ModelNotFound(model_name)),
         }
     };
@@ -723,6 +737,7 @@ pub async fn rerank(
         &state.client,
         &backend_url,
         &request_body,
+        total_timeout,
     )
     .await
     .map_err(|e| {
@@ -1016,34 +1031,59 @@ fn log_completion(
 // ── Backend forwarding ───────────────────────────────────────────────────────
 
 /// Forward a request to a backend and aggregate the full response.
+///
+/// `total_timeout` bounds the whole exchange (request + full body): a
+/// hung-but-alive backend must not tie up the in-flight slot and the
+/// client request forever.  `Duration::ZERO` disables the timeout.
 async fn forward_request_aggregate(
     client: &reqwest::Client,
     backend_url: &str,
     body: &serde_json::Value,
+    total_timeout: std::time::Duration,
 ) -> Result<serde_json::Value, ApiError> {
-    let resp = client
-        .post(backend_url)
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let text = resp
-            .text()
+    let work = async {
+        let resp = client
+            .post(backend_url)
+            .json(body)
+            .send()
             .await
-            .unwrap_or_else(|_| "unknown error".into());
-        warn!(backend_status = %status, error = %text, "backend returned non-success");
-        return Err(ApiError::Internal(format!(
-            "backend returned {}: {}",
-            status, text
-        )));
-    }
+            .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
 
-    resp.json::<serde_json::Value>()
-        .await
-        .map_err(|e| ApiError::Internal(format!("failed to parse backend response: {}", e)))
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "unknown error".into());
+            warn!(backend_status = %status, error = %text, "backend returned non-success");
+            return Err(ApiError::Internal(format!(
+                "backend returned {}: {}",
+                status, text
+            )));
+        }
+
+        resp.json::<serde_json::Value>()
+            .await
+            .map_err(|e| ApiError::Internal(format!("failed to parse backend response: {}", e)))
+    };
+
+    if total_timeout.is_zero() {
+        return work.await;
+    }
+    match tokio::time::timeout(total_timeout, work).await {
+        Ok(result) => result,
+        Err(_) => {
+            warn!(
+                url = %backend_url,
+                timeout_secs = total_timeout.as_secs(),
+                "backend aggregate request timed out"
+            );
+            Err(ApiError::BackendTimeout(format!(
+                "backend did not complete within {}s",
+                total_timeout.as_secs()
+            )))
+        }
+    }
 }
 
 /// Build an SSE stream that forwards chunks from the backend to the client.
@@ -1064,12 +1104,56 @@ async fn build_sse_stream(
     manager: Arc<InstanceManager>,
     api_user: String,
     request_id: String,
+    idle_timeout: std::time::Duration,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>, reqwest::Error> {
-    let resp = client
-        .post(&backend_url)
-        .json(&body)
-        .send()
-        .await?;
+    // The idle timeout also bounds the wait for the first response
+    // headers — a hung backend must not hold the slot while silent.
+    let send = client.post(&backend_url).json(&body).send();
+    let resp = if idle_timeout.is_zero() {
+        send.await?
+    } else {
+        match tokio::time::timeout(idle_timeout, send).await {
+            Ok(r) => r?,
+            Err(_) => {
+                warn!(
+                    url = %backend_url,
+                    timeout_secs = idle_timeout.as_secs(),
+                    "backend sent no response headers within idle timeout"
+                );
+                if let Some(ctx) = debug {
+                    ctx.loggers.write_line(&ctx.path, &DebugLogEntry {
+                        ts: ts_now(),
+                        request_id: ctx.request_id,
+                        model: ctx.model_name,
+                        alias: ctx.alias,
+                        instance_id: Some(ctx.instance_id),
+                        dir: "response".into(),
+                        stream: Some(true),
+                        body: None,
+                        usage: None,
+                        duration_ms: Some(ctx.t0.elapsed().as_millis() as u64),
+                        error: Some(format!(
+                            "backend idle timeout ({}s) waiting for response headers",
+                            idle_timeout.as_secs()
+                        )),
+                    });
+                }
+                let stream = futures_util::stream::once(async move {
+                    let error_sse = serde_json::json!({
+                        "error": {
+                            "message": format!("backend sent no response for {}s (idle timeout)", idle_timeout.as_secs()),
+                            "type": "backend_idle_timeout",
+                        }
+                    });
+                    Ok(Event::default()
+                        .data(error_sse.to_string())
+                        .event("error"))
+                });
+                let stream = StreamWithGuard::new(Box::pin(stream), guard);
+                return Ok(Box::pin(stream));
+            }
+        }
+    };
 
     let status = resp.status();
     if !status.is_success() {
@@ -1114,7 +1198,7 @@ async fn build_sse_stream(
 
     // Success — forward the byte stream as SSE events.
     let byte_stream = resp.bytes_stream();
-    let sse_stream = SseForwarder::new(byte_stream, guard, model_name, instance_id, debug, manager, api_user, request_id);
+    let sse_stream = SseForwarder::new(byte_stream, guard, model_name, instance_id, debug, manager, api_user, request_id, idle_timeout);
 
     Ok(Box::pin(sse_stream))
 }
@@ -1144,6 +1228,12 @@ struct SseForwarder<S> {
     chunks: Vec<String>,
     /// The backend sent its own `data: [DONE]` terminator.
     saw_done: bool,
+    /// Maximum gap between backend chunks before the backend is declared
+    /// hung.  `Duration::ZERO` disables the idle timeout.
+    idle_timeout: std::time::Duration,
+    /// Deadline for the next backend chunk (`None` = no idle timeout).
+    /// Reset every time a chunk arrives.
+    idle_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
     /// Used to record completion stats on stream end.
     manager: Arc<InstanceManager>,
     model_name: String,
@@ -1159,14 +1249,21 @@ impl<S> SseForwarder<S>
 where
     S: Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
 {
-    fn new(stream: S, guard: SlotGuard, model_name: String, instance_id: String, debug: Option<DebugStreamContext>, manager: Arc<InstanceManager>, api_user: String, request_id: String) -> Self {
+    fn new(stream: S, guard: SlotGuard, model_name: String, instance_id: String, debug: Option<DebugStreamContext>, manager: Arc<InstanceManager>, api_user: String, request_id: String, idle_timeout: std::time::Duration) -> Self {
         debug!("SseForwarder::new: model={} inst={}", model_name, instance_id);
+        let idle_sleep = if idle_timeout.is_zero() {
+            None
+        } else {
+            Some(Box::pin(tokio::time::sleep(idle_timeout)))
+        };
         Self {
             inner: Some(stream),
             buffer: Vec::new(),
             debug,
             chunks: Vec::new(),
             saw_done: false,
+            idle_timeout,
+            idle_sleep,
             manager,
             model_name,
             api_user,
@@ -1189,9 +1286,6 @@ where
         if self.inner.is_none() {
             return Poll::Ready(None);
         }
-        let model = self.model_name.clone();
-        let inst = self.instance_id.clone();
-        debug!("SseForwarder::poll_next: model={} inst={} buffer={} capacity={}", model, inst, self.buffer.len(), self.buffer.capacity());
         loop {
             // Try to extract a complete event from the buffer.
             if let Some((event, data)) = extract_sse_event(&mut self.buffer) {
@@ -1222,6 +1316,13 @@ where
             match Pin::new(inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
                     self.buffer.extend_from_slice(&chunk);
+                    // Backend is alive — reset the idle deadline.
+                    let idle_timeout = self.idle_timeout;
+                    if let Some(sleep) = self.idle_sleep.as_mut() {
+                        sleep
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + idle_timeout);
+                    }
                     // Loop back to try extracting an event.
                 }
                 Poll::Ready(Some(Err(e))) => {
@@ -1275,7 +1376,35 @@ where
                         .data(error_sse.to_string())
                         .event("error"))));
                 }
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    // No backend data right now — enforce the idle timeout
+                    // so a hung-but-alive backend can't hold the slot
+                    // (and the client connection) forever.
+                    let idle_timeout = self.idle_timeout;
+                    let timed_out = match self.idle_sleep.as_mut() {
+                        Some(sleep) => std::future::Future::poll(sleep.as_mut(), cx).is_ready(),
+                        None => false,
+                    };
+                    if timed_out {
+                        warn!(
+                            model = %self.model_name,
+                            inst = %self.instance_id,
+                            timeout_secs = idle_timeout.as_secs(),
+                            "backend stream idle timeout"
+                        );
+                        self.inner = None;
+                        let error_sse = serde_json::json!({
+                            "error": {
+                                "message": format!("backend sent no data for {}s (idle timeout)", idle_timeout.as_secs()),
+                                "type": "backend_idle_timeout",
+                            }
+                        });
+                        return Poll::Ready(Some(Ok(Event::default()
+                            .data(error_sse.to_string())
+                            .event("error"))));
+                    }
+                    return Poll::Pending;
+                }
             }
         }
     }
@@ -1497,6 +1626,7 @@ models:
             mgr,
             "user".into(),
             "req-1".into(),
+            std::time::Duration::ZERO, // idle timeout disabled
         )
     }
 
@@ -1614,6 +1744,76 @@ models:
         }
         assert_eq!(events.len(), 1, "only the truncation error");
         assert!(events[0].contains("stream_truncated"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_signals_error_and_ends_stream() {
+        // First chunk arrives, then the backend goes silent forever:
+        // the idle timeout must end the stream with an explicit error
+        // instead of hanging the client (and the slot) forever.
+        let mgr = test_manager();
+        let byte_stream = futures_util::stream::iter(vec![Ok(bytes::Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n".to_string(),
+        ))])
+        .chain(futures_util::stream::pending::<Result<bytes::Bytes, reqwest::Error>>());
+
+        let mut stream = SseForwarder::new(
+            byte_stream,
+            test_guard(),
+            "m".into(),
+            "m@cpu#0".into(),
+            None,
+            mgr.clone(),
+            "user".into(),
+            "req-1".into(),
+            std::time::Duration::from_millis(50),
+        );
+
+        let first = stream.next().await.unwrap().unwrap();
+        assert!(event_text(&first).contains("hi"));
+
+        // Paused time auto-advances past the idle deadline while we await.
+        let second = stream.next().await.unwrap().unwrap();
+        assert!(event_text(&second).contains("backend_idle_timeout"));
+        assert!(stream.next().await.is_none(), "stream must end after the idle error");
+        assert!(!stream.saw_done);
+
+        drop(stream);
+        assert_eq!(
+            completions_recorded(&mgr),
+            0,
+            "idle-timed-out stream must not record a completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_request_times_out_on_hung_backend() {
+        // Backend that accepts connections but never responds: the total
+        // timeout must fail the request instead of hanging forever.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock); // hold the socket open, never answer
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{}/v1/chat/completions", addr);
+        let err = forward_request_aggregate(
+            &client,
+            &url,
+            &serde_json::json!({"model": "m"}),
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .expect_err("hung backend must time out");
+        assert!(
+            matches!(err, ApiError::BackendTimeout(_)),
+            "expected BackendTimeout, got: {}",
+            err
+        );
     }
 
     #[tokio::test]

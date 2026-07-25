@@ -119,6 +119,9 @@ pub enum ApiError {
     #[error("no capacity: {0}")]
     NoCapacity(String),
 
+    #[error("backend timeout: {0}")]
+    BackendTimeout(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -130,6 +133,7 @@ impl IntoResponse for ApiError {
             ApiError::ModelNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             ApiError::ModelBlocked(_) => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             ApiError::NoCapacity(_) => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
+            ApiError::BackendTimeout(_) => (StatusCode::GATEWAY_TIMEOUT, self.to_string()),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
         };
         (status, message).into_response()

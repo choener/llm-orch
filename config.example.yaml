@@ -17,6 +17,20 @@ server:
     end: 9100
   # port_range: "ephemeral"
 
+  # Total timeout (seconds) for non-streaming backend requests.  Must
+  # cover worst-case prefill + generation, since non-streaming responses
+  # only materialize once generation is complete.  0 disables.
+  # backend_total_timeout_secs: 900   # default
+
+  # Idle timeout (seconds) for streaming backend requests: maximum gap
+  # between SSE chunks (and until the first response headers) before the
+  # backend is considered hung.  0 disables.
+  # backend_idle_timeout_secs: 300    # default
+
+  # Seconds to wait for in-flight requests to drain on shutdown before
+  # aborting the remaining connections.
+  # shutdown_drain_timeout_secs: 60   # default
+
 # ---------------------------------------------------------------------------
 # API keys
 # ---------------------------------------------------------------------------

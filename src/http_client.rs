@@ -6,7 +6,11 @@ use std::time::Duration;
 ///
 /// * Connection pooling is enabled by default in `reqwest`.
 /// * A short connect timeout so dead backends fail fast.
-/// * **No** overall read timeout — streaming responses may last minutes.
+/// * **No** overall read timeout at the client level — streaming responses
+///   may last minutes.  Per-request total/idle timeouts are enforced by
+///   the handlers instead (`forward_request_aggregate`, `SseForwarder`),
+///   configured via `server.backend_total_timeout_secs` and
+///   `server.backend_idle_timeout_secs`.
 pub fn build() -> Client {
     Client::builder()
         .connect_timeout(Duration::from_secs(2))

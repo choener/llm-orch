@@ -204,10 +204,38 @@ pub struct ServerConfig {
     /// Port range for backend instance allocation.
     #[serde(default)]
     pub port_range: PortRange,
+
+    /// Total timeout (seconds) for non-streaming backend requests.
+    /// Non-streaming responses only materialize once generation is
+    /// complete, so this must cover worst-case prefill + generation —
+    /// keep it generous.  `0` disables the timeout.
+    #[serde(default = "default_backend_total_timeout")]
+    pub backend_total_timeout_secs: u64,
+
+    /// Idle timeout (seconds) for streaming backend requests: maximum gap
+    /// between SSE chunks (and until the first response headers) before
+    /// the backend is considered hung.  Must cover worst-case prefill
+    /// before the first token.  `0` disables the timeout.
+    #[serde(default = "default_backend_idle_timeout")]
+    pub backend_idle_timeout_secs: u64,
+
+    /// Seconds to wait for in-flight HTTP requests to drain on shutdown
+    /// before aborting the remaining connections.
+    #[serde(default = "default_shutdown_drain_timeout")]
+    pub shutdown_drain_timeout_secs: u64,
 }
 
 fn default_listen() -> String {
     "127.0.0.1:8080".into()
+}
+fn default_backend_total_timeout() -> u64 {
+    900
+}
+fn default_backend_idle_timeout() -> u64 {
+    300
+}
+fn default_shutdown_drain_timeout() -> u64 {
+    60
 }
 
 /// Port allocation strategy for backend instances.

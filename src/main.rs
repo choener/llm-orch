@@ -198,7 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gpu: gpu_snapshot,
         debug_loggers,
     };
-    let server_task = tokio::spawn(server::serve(app_state, shutdown_rx));
+    let mut server_task = tokio::spawn(server::serve(app_state, shutdown_rx));
 
     // ── File watchers + reload loop §6 ───────────────────────────────────
     let config_path = cli.config.clone();
@@ -312,7 +312,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     // 1. Wait for SIGINT / SIGTERM.
     // 2. Signal axum to stop accepting new connections.
-    // 3. Wait for in-flight requests to drain (server_task completes).
+    // 3. Wait for in-flight requests to drain, up to
+    //    `server.shutdown_drain_timeout_secs`, then abort the rest.
     // 4. Shut down all backend instances.
 
     // Wait for shutdown signal.
@@ -334,11 +335,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("received Ctrl-C");
     }
 
-    // Signal axum to stop accepting and drain in-flight.
+    // Signal axum to stop accepting and drain in-flight — bounded by the
+    // configured drain timeout so one hung streaming request can't block
+    // shutdown forever (plan §11).
     info!("stopping http server...");
     drop(shutdown_tx);
-    let _ = server_task.await;
-    info!("http server drained");
+    let drain_timeout =
+        Duration::from_secs(shared_cfg.read().await.server.shutdown_drain_timeout_secs);
+    match tokio::time::timeout(drain_timeout, &mut server_task).await {
+        Ok(_) => info!("http server drained"),
+        Err(_) => {
+            warn!(
+                timeout_secs = drain_timeout.as_secs(),
+                "drain timeout exceeded — aborting remaining in-flight connections"
+            );
+            server_task.abort();
+        }
+    }
 
     // Shut down all backend instances.
     info!("shutting down backends...");
