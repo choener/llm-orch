@@ -11,7 +11,7 @@ use crate::handlers;
 use crate::scheduler::InstanceManager;
 
 use axum::{
-    extract::FromRequestParts,
+    extract::{DefaultBodyLimit, FromRequestParts},
     http::{header, request::Parts, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -63,6 +63,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/admin/load", post(handlers::admin_load))
         .route("/admin/unload", post(handlers::admin_unload))
         .route("/admin/unblock", post(handlers::admin_unblock))
+        // Large-context chat requests legitimately exceed axum's default
+        // 2 MB body limit — raise it explicitly instead of 413-ing them.
+        .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -119,6 +122,9 @@ pub enum ApiError {
     #[error("no capacity: {0}")]
     NoCapacity(String),
 
+    #[error("model unavailable: {0}")]
+    ModelUnavailable(String),
+
     #[error("backend timeout: {0}")]
     BackendTimeout(String),
 
@@ -132,11 +138,18 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
             ApiError::ModelNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             ApiError::ModelBlocked(_) => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
+            ApiError::ModelUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             ApiError::NoCapacity(_) => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
             ApiError::BackendTimeout(_) => (StatusCode::GATEWAY_TIMEOUT, self.to_string()),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
         };
-        (status, message).into_response()
+        let mut resp = (status, message).into_response();
+        // 429s ask the client to retry later — say when (plan §5).
+        if matches!(self, ApiError::NoCapacity(_)) {
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("5"));
+        }
+        resp
     }
 }
 

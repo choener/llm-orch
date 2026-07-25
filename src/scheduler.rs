@@ -36,6 +36,34 @@ const SPAWN_SERIAL_WINDOW: Duration = Duration::from_secs(15);
 /// used to deliver an instance handle once a slot frees up.
 type WaitQueue = VecDeque<(u64, oneshot::Sender<InstanceHandle>)>;
 
+/// Why `get_or_spawn` could not provide an instance slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcquireError {
+    /// The model is crash-blocked.
+    Blocked,
+    /// Instances exist but all are busy, and the queue is full or the
+    /// wait timed out.
+    NoCapacity,
+    /// No instance could be provided at all: the model is unknown to the
+    /// manager (e.g. removed by a concurrent config reload), its spawn
+    /// failed (see server logs), or all remaining instances are retiring.
+    Unavailable,
+}
+
+/// Why `enqueue` failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnqueueError {
+    /// The queue is at capacity.
+    QueueFull,
+    /// No routable instance exists — nothing could ever wake a waiter.
+    NoInstances,
+    /// The queue wait timed out.
+    Timeout,
+    /// Woken with a handle, but a competing request grabbed the slot
+    /// first (re-queueing is a separate TODO; treated as no-capacity).
+    LostRace,
+}
+
 /// How instance removal treats an instance with in-flight requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemovalMode {
@@ -348,8 +376,7 @@ impl InstanceManager {
     // ── get-or-spawn ──────────────────────────────────────────────────────
 
     /// Acquire an instance slot for `model_name`, spawning a new instance
-    /// if necessary.  Returns `None` when the model is blocked, all instances
-    /// are at capacity, the instance cap is reached and the queue is full.
+    /// if necessary.  See `AcquireError` for the failure modes.
     ///
     /// The returned guard already owns one in-flight slot — the caller must
     /// not call `try_acquire` again.  The slot is released automatically
@@ -359,20 +386,26 @@ impl InstanceManager {
     /// function only *awaits* the spawn's completion.  A client disconnect
     /// that drops this future therefore cannot abort a spawn half-way and
     /// strand a `Loading` instance that nothing would ever reap.
-    pub async fn get_or_spawn(self: &Arc<Self>, model_name: &str) -> Option<SlotGuard> {
+    pub async fn get_or_spawn(self: &Arc<Self>, model_name: &str) -> Result<SlotGuard, AcquireError> {
         if self.is_blocked(model_name) {
-            return None;
+            return Err(AcquireError::Blocked);
         }
 
         // Clone the model config out of the lock — it may be swapped by a
         // config reload at any time, and the guard must not be held across
         // the awaits below.
-        let cfg = self.model_configs.read().unwrap().get(model_name).cloned()?;
+        let cfg = self
+            .model_configs
+            .read()
+            .unwrap()
+            .get(model_name)
+            .cloned()
+            .ok_or(AcquireError::Unavailable)?;
         let max_concurrent = cfg.max_concurrent;
 
         // Fast path: find a ready instance with spare capacity.
         if let Some(guard) = self.acquire_ready_slot(model_name, max_concurrent) {
-            return Some(guard);
+            return Ok(guard);
         }
 
         // Autoscale spawn gate: only spawn if sustained load exceeds
@@ -437,12 +470,52 @@ impl InstanceManager {
             // competing requests filled it first) fall through to the
             // queue — which fails fast when no instance exists at all.
             if let Some(guard) = self.acquire_ready_slot(model_name, max_concurrent) {
-                return Some(guard);
+                return Ok(guard);
             }
         }
 
         // Queue path: all instances busy and at cap.
-        self.enqueue(model_name, cfg.queue_depth, max_concurrent).await
+        match self.enqueue(model_name, cfg.queue_depth, max_concurrent).await {
+            Ok(guard) => Ok(guard),
+            // Nothing exists that could ever wake a waiter — the spawn
+            // failed (see logs) or everything left is retiring.
+            Err(EnqueueError::NoInstances) => Err(AcquireError::Unavailable),
+            Err(EnqueueError::QueueFull | EnqueueError::Timeout | EnqueueError::LostRace) => {
+                Err(AcquireError::NoCapacity)
+            }
+        }
+    }
+
+    /// Ensure at least one instance of `model_name` exists (spawning one
+    /// if necessary) without acquiring a request slot and — unlike
+    /// `get_or_spawn` — without ever parking on the request queue.
+    /// Used by `/admin/load`, which must not hang behind user traffic.
+    pub async fn ensure_instance(self: &Arc<Self>, model_name: &str) -> Result<(), AcquireError> {
+        if self.is_blocked(model_name) {
+            return Err(AcquireError::Blocked);
+        }
+        let cfg = self
+            .model_configs
+            .read()
+            .unwrap()
+            .get(model_name)
+            .cloned()
+            .ok_or(AcquireError::Unavailable)?;
+
+        // Already serving (or at least registered and routable)?
+        if self.find_ready_instance(model_name, cfg.max_concurrent).is_some() {
+            return Ok(());
+        }
+
+        let mut rx = self.ensure_spawn(model_name, &cfg);
+        let budget = self.spawn_timeout + SPAWN_SERIAL_WINDOW + Duration::from_secs(30);
+        let _ = tokio::time::timeout(budget, rx.changed()).await;
+
+        if self.find_ready_instance(model_name, cfg.max_concurrent).is_some() {
+            Ok(())
+        } else {
+            Err(AcquireError::Unavailable)
+        }
     }
 
     /// Fast path of `get_or_spawn`: acquire a slot on the least-loaded
@@ -500,17 +573,18 @@ impl InstanceManager {
     }
 
     /// Enqueue the caller, waiting for an instance slot to free up.
-    /// Returns `None` if the queue is at capacity (caller should return 429),
-    /// if no instance exists (or is loading) — in that case no release or
-    /// spawn event could ever wake the parked waiter, so fail fast instead
-    /// of hanging forever — or if the wait exceeds `QUEUE_WAIT_TIMEOUT`.
-    /// Acquires the slot on the received handle before returning.
+    /// Fails with `QueueFull` if the queue is at capacity (caller maps to
+    /// 429), with `NoInstances` if no routable instance exists (no release
+    /// or spawn event could ever wake the parked waiter — fail fast
+    /// instead of hanging forever), or with `Timeout` when the wait
+    /// exceeds the budget.  Acquires the slot on the received handle
+    /// before returning.
     async fn enqueue(
         &self,
         model_name: &str,
         max_depth: usize,
         max_concurrent: usize,
-    ) -> Option<SlotGuard> {
+    ) -> Result<SlotGuard, EnqueueError> {
         let (tx, rx) = oneshot::channel();
         let id = self.next_queue_id.fetch_add(1, Ordering::Relaxed);
 
@@ -535,13 +609,13 @@ impl InstanceManager {
                 })
                 .unwrap_or(false);
             if !has_instances {
-                return None;
+                return Err(EnqueueError::NoInstances);
             }
 
             let mut queues = self.queues.write().unwrap();
             let queue = queues.entry(model_name.to_owned()).or_default();
             if queue.len() >= max_depth {
-                return None;
+                return Err(EnqueueError::QueueFull);
             }
             queue.push_back((id, tx));
         }
@@ -552,24 +626,30 @@ impl InstanceManager {
         // parked — if capacity exists, the head waiter gets served.
         self.wake_one(model_name);
 
-        let handle = match tokio::time::timeout(QUEUE_WAIT_TIMEOUT, rx).await {
+        // The wait budget must exceed the worst-case spawn (spawn timeout
+        // + serialized window + margin): a waiter parked behind a fresh
+        // spawn must not time out and 429 just as capacity appears.
+        let wait_budget = QUEUE_WAIT_TIMEOUT
+            .max(self.spawn_timeout + SPAWN_SERIAL_WINDOW + Duration::from_secs(60));
+        let handle = match tokio::time::timeout(wait_budget, rx).await {
             Ok(Ok(handle)) => handle,
             // Queue drained (last instance removed) — fail fast.
-            Ok(Err(_)) => return None,
+            Ok(Err(_)) => return Err(EnqueueError::NoInstances),
             Err(_) => {
                 // Timed out — remove our entry if it is still parked.
                 // (If wake_one already popped us, the handle it sent is
                 // dropped with the receiver; handle drop is a no-op.)
                 self.remove_queued(model_name, id);
-                return None;
+                return Err(EnqueueError::Timeout);
             }
         };
 
         if let Some(guard) = handle.try_acquire(max_concurrent) {
             self.record_metrics_event(model_name, 0);
-            Some(guard)
+            Ok(guard)
         } else {
-            None
+            // Woken but the slot was grabbed by a competing request first.
+            Err(EnqueueError::LostRace)
         }
     }
 
@@ -2035,7 +2115,10 @@ models:
         // request forever: nothing would ever wake the waiter.
         let mgr = test_manager();
         let result = mgr.enqueue("m", 8, 4).await;
-        assert!(result.is_none(), "enqueue with no instances must fail fast");
+        assert!(
+            matches!(result, Err(EnqueueError::NoInstances)),
+            "enqueue with no instances must fail fast"
+        );
     }
 
     #[tokio::test]
@@ -2112,7 +2195,7 @@ models:
             .push(handle.clone());
 
         let guard = mgr.enqueue("m", 8, 1).await;
-        assert!(guard.is_some(), "waiter must be served by the post-push wake");
+        assert!(guard.is_ok(), "waiter must be served by the post-push wake");
         assert_eq!(handle.inner().lock().unwrap().in_flight, 1);
     }
 
@@ -2414,9 +2497,76 @@ models:
 
         let result = mgr.enqueue("m", 8, 4).await;
         assert!(
-            result.is_none(),
+            matches!(result, Err(EnqueueError::NoInstances)),
             "enqueue with only retiring instances must fail fast"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn enqueue_times_out_when_never_woken() {
+        // All instances busy (in_flight = max_concurrent = 4, the config
+        // default), nothing ever releases: the waiter must eventually
+        // fail with Timeout (paused time auto-advances).
+        let mgr = test_manager();
+        let handle = make_handle(InstanceState::Ready, 4, Duration::ZERO);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle);
+
+        let result = mgr.enqueue("m", 8, 4).await;
+        assert!(matches!(result, Err(EnqueueError::Timeout)), "got: {:?}", result.map(|_| "guard"));
+        assert_eq!(mgr.queue_depth("m"), 0, "timed-out waiter must self-remove");
+    }
+
+    #[tokio::test]
+    async fn get_or_spawn_reports_blocked_and_unknown_models() {
+        let mgr = Arc::new(test_manager());
+        mgr.block_model("m");
+        assert!(matches!(
+            mgr.get_or_spawn("m").await,
+            Err(AcquireError::Blocked)
+        ));
+        assert!(matches!(
+            mgr.get_or_spawn("nonexistent").await,
+            Err(AcquireError::Unavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn ensure_instance_reports_spawn_failure_without_queueing() {
+        // `cmd: "true"` exits instantly: the spawn fails fast and
+        // ensure_instance must report Unavailable (not park on a queue).
+        let yaml = r#"
+server: {}
+apikeys_file: apikeys.txt
+models:
+  - name: m
+    context_length: 4096
+    cmd: "true"
+    idle_ttl: 60
+"#;
+        let config: crate::config::Config = serde_yaml_ng::from_str(yaml).unwrap();
+        let gpu_snapshot = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+        let (mgr, _release_rx, _crash_rx) =
+            InstanceManager::new(&config, gpu_snapshot, None);
+        let mgr = Arc::new(mgr);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            mgr.ensure_instance("m"),
+        )
+        .await
+        .expect("ensure_instance must not park");
+        assert!(matches!(result, Err(AcquireError::Unavailable)));
+
+        mgr.block_model("m");
+        assert!(matches!(
+            mgr.ensure_instance("m").await,
+            Err(AcquireError::Blocked)
+        ));
     }
 
     #[test]

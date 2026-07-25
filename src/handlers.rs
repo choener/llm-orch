@@ -45,7 +45,7 @@ use tracing::{debug, info, warn};
 use crate::config::AliasConfig;
 use crate::debug_log::{DebugLogEntry, DebugStreamContext, ts_now};
 use crate::instance::SlotGuard;
-use crate::scheduler::InstanceManager;
+use crate::scheduler::{AcquireError, InstanceManager};
 use crate::server::{ApiKey, ApiError, AppState};
 use crate::types::*;
 use tracing::Instrument;
@@ -294,16 +294,7 @@ pub async fn chat_completions(
         .manager
         .get_or_spawn(&model_name)
         .await
-        .ok_or_else(|| {
-            if state.manager.is_blocked(&model_name) {
-                ApiError::ModelBlocked(model_name.clone())
-            } else {
-                ApiError::NoCapacity(format!(
-                    "model '{}' is at capacity and the queue is full",
-                    model_name
-                ))
-            }
-        })?;
+        .map_err(|e| acquire_error(&model_name, e))?;
 
     // Capture instance ID now that we hold the slot guard.
     let instance_id = {
@@ -320,6 +311,9 @@ pub async fn chat_completions(
     let backend_url = format!("http://127.0.0.1:{}/v1/chat/completions", port);
 
     // ── 6. Forward the request. ─────────────────────────────────────────
+    // Forward the *resolved* model name to the backend, not the alias —
+    // strict backends validate the model field.
+    request.model = model_name.clone();
     let request_body = serde_json::to_value(&request).unwrap_or_default();
 
     // Debug log: request (exact body being forwarded).
@@ -448,8 +442,8 @@ pub async fn chat_completions(
 /// Same pattern as `chat_completions` — locks are dropped before `.await`.
 pub async fn completions(
     State(state): State<AppState>,
-    _key: ApiKey,
-    Json(request): Json<CompletionRequest>,
+    key: ApiKey,
+    Json(mut request): Json<CompletionRequest>,
 ) -> Result<Response, ApiError> {
     let request_id = uuid::Uuid::new_v4().to_string();
     let span = tracing::info_span!(
@@ -482,16 +476,7 @@ pub async fn completions(
         .manager
         .get_or_spawn(&model_name)
         .await
-        .ok_or_else(|| {
-            if state.manager.is_blocked(&model_name) {
-                ApiError::ModelBlocked(model_name.clone())
-            } else {
-                ApiError::NoCapacity(format!(
-                    "model '{}' is at capacity and the queue is full",
-                    model_name
-                ))
-            }
-        })?;
+        .map_err(|e| acquire_error(&model_name, e))?;
 
     // Capture instance ID now that we hold the slot guard.
     let instance_id = {
@@ -508,6 +493,8 @@ pub async fn completions(
     let backend_url = format!("http://127.0.0.1:{}/v1/completions", port);
 
     // ── 5. Forward request. ─────────────────────────────────────────────
+    // Forward the *resolved* model name to the backend, not the alias.
+    request.model = model_name.clone();
     if request.stream {
         info!("stream start model={} inst={}", model_name, instance_id);
         let stream = build_sse_stream(
@@ -519,8 +506,8 @@ pub async fn completions(
             instance_id.clone(),
             None,
             state.manager.clone(),
-            String::new(),
-            String::new(),
+            key.label.clone(),
+            request_id.clone(),
             idle_timeout,
         )
         .await
@@ -554,7 +541,7 @@ pub async fn completions(
 pub async fn embeddings(
     State(state): State<AppState>,
     _key: ApiKey,
-    Json(request): Json<EmbeddingRequest>,
+    Json(mut request): Json<EmbeddingRequest>,
 ) -> Result<Json<EmbeddingResponse>, ApiError> {
     let request_id = uuid::Uuid::new_v4().to_string();
     let span = tracing::info_span!(
@@ -579,21 +566,15 @@ pub async fn embeddings(
         std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs)
     };
 
+    // Forward the *resolved* model name to the backend, not the alias.
+    request.model = model_name.clone();
+
     // ── 3. Acquire instance slot. ───────────────────────────────────────
     let guard = state
         .manager
         .get_or_spawn(&model_name)
         .await
-        .ok_or_else(|| {
-            if state.manager.is_blocked(&model_name) {
-                ApiError::ModelBlocked(model_name.clone())
-            } else {
-                ApiError::NoCapacity(format!(
-                    "model '{}' is at capacity and the queue is full",
-                    model_name
-                ))
-            }
-        })?;
+        .map_err(|e| acquire_error(&model_name, e))?;
 
     // ── 4. Read port. ──────────────────────────────────────────────────
     let port = {
@@ -655,7 +636,7 @@ pub async fn embeddings(
 pub async fn rerank(
     State(state): State<AppState>,
     key: ApiKey,
-    Json(request): Json<RerankRequest>,
+    Json(mut request): Json<RerankRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let request_id = uuid::Uuid::new_v4().to_string();
     let span = tracing::info_span!(
@@ -682,21 +663,15 @@ pub async fn rerank(
         }
     };
 
+    // Forward the *resolved* model name to the backend, not the alias.
+    request.model = model_name.clone();
+
     // ── 3. Acquire instance slot. ───────────────────────────────────────
     let guard = state
         .manager
         .get_or_spawn(&model_name)
         .await
-        .ok_or_else(|| {
-            if state.manager.is_blocked(&model_name) {
-                ApiError::ModelBlocked(model_name.clone())
-            } else {
-                ApiError::NoCapacity(format!(
-                    "model '{}' is at capacity and the queue is full",
-                    model_name
-                ))
-            }
-        })?;
+        .map_err(|e| acquire_error(&model_name, e))?;
 
     // Capture instance ID now that we hold the slot guard.
     let instance_id = {
@@ -831,25 +806,14 @@ pub async fn admin_load(
         }
     }
 
-    // Spawn an instance (or get an existing one).
-    let guard = state
+    // Ensure an instance exists (spawning if necessary).  Unlike the
+    // request path this never parks on the request queue — an admin
+    // operation must not hang behind user traffic.
+    state
         .manager
-        .get_or_spawn(&body.model)
+        .ensure_instance(&body.model)
         .await
-        .ok_or_else(|| {
-            if state.manager.is_blocked(&body.model) {
-                ApiError::ModelBlocked(body.model.clone())
-            } else {
-                ApiError::NoCapacity(format!(
-                    "cannot load model '{}': instance cap reached and queue is full",
-                    body.model
-                ))
-            }
-        })?;
-
-    // Drop the slot guard immediately — we just wanted to ensure an
-    // instance exists.  The in-flight slot is released on drop.
-    drop(guard);
+        .map_err(|e| acquire_error(&body.model, e))?;
 
     Ok(Json(AdminResponse {
         status: "ok".into(),
@@ -920,6 +884,21 @@ pub async fn admin_unblock(
 }
 
 // ── Helpers (lock-free) ──────────────────────────────────────────────────────
+
+/// Map an instance-acquisition failure to the HTTP error for this model.
+fn acquire_error(model_name: &str, e: AcquireError) -> ApiError {
+    match e {
+        AcquireError::Blocked => ApiError::ModelBlocked(model_name.to_owned()),
+        AcquireError::NoCapacity => ApiError::NoCapacity(format!(
+            "model '{}' is at capacity and the queue is full",
+            model_name
+        )),
+        AcquireError::Unavailable => ApiError::ModelUnavailable(format!(
+            "model '{}' is unavailable (spawn failed or instances retiring — see server logs)",
+            model_name
+        )),
+    }
+}
 
 /// Resolve an alias name to its underlying model.
 ///
