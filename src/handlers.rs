@@ -1126,13 +1126,24 @@ async fn build_sse_stream(
 ///
 /// Holds a `SlotGuard` so the in-flight slot is released when the
 /// stream is dropped (end of response or client disconnect).
+///
+/// Stream-end semantics: the backend's own `data: [DONE]` is the only
+/// end-of-stream signal forwarded (`saw_done`).  A stream that ends
+/// without it is *truncated* — the client gets an explicit error event,
+/// never a synthetic `[DONE]` that would make partial output look
+/// complete, and no completion is recorded.
 struct SseForwarder<S> {
     inner: Option<S>,
     /// Accumulated partial line from previous chunks.
     buffer: Vec<u8>,
     /// Debug log context + accumulated SSE data chunks (logged on Drop).
     debug: Option<DebugStreamContext>,
+    /// SSE data chunks.  With a debug log: the full generation (logged on
+    /// Drop).  Without: only the most recent chunk is kept (the usage
+    /// chunk, if any, is always last) — no unbounded buffering.
     chunks: Vec<String>,
+    /// The backend sent its own `data: [DONE]` terminator.
+    saw_done: bool,
     /// Used to record completion stats on stream end.
     manager: Arc<InstanceManager>,
     model_name: String,
@@ -1155,6 +1166,7 @@ where
             buffer: Vec::new(),
             debug,
             chunks: Vec::new(),
+            saw_done: false,
             manager,
             model_name,
             api_user,
@@ -1183,9 +1195,21 @@ where
         loop {
             // Try to extract a complete event from the buffer.
             if let Some((event, data)) = extract_sse_event(&mut self.buffer) {
-                // Accumulate raw data for completion recording and debug logging.
-                if !data.is_empty() && data != "[DONE]" {
-                    self.chunks.push(data);
+                if data == "[DONE]" {
+                    // The backend's own terminator — forwarded like any
+                    // other event and remembered so the stream end is
+                    // recognized as a clean completion.
+                    self.saw_done = true;
+                } else if !data.is_empty() {
+                    if self.debug.is_some() {
+                        // Full accumulation for the debug log body.
+                        self.chunks.push(data);
+                    } else {
+                        // Without a debug log only the final (usage) chunk
+                        // matters — don't buffer the whole generation.
+                        self.chunks.clear();
+                        self.chunks.push(data);
+                    }
                 }
                 return Poll::Ready(Some(Ok(event)));
             }
@@ -1203,23 +1227,53 @@ where
                 Poll::Ready(Some(Err(e))) => {
                     warn!(error = %e, "backend stream error");
                     self.inner = None;
+                    let error_sse = serde_json::json!({
+                        "error": {
+                            "message": format!("backend stream error: {}", e),
+                            "type": "backend_stream_error",
+                        }
+                    });
                     let error_event = Event::default()
-                        .data(format!("{{\"error\":\"{}\"}}", e))
+                        .data(error_sse.to_string())
                         .event("error");
                     return Poll::Ready(Some(Ok(error_event)));
                 }
                 Poll::Ready(None) => {
-                    // Stream ended — flush any remaining buffer.
-                    if !self.buffer.is_empty() {
-                        let remaining = String::from_utf8_lossy(&self.buffer).to_string();
-                        self.buffer.clear();
-                        if !remaining.trim().is_empty() {
-                            return Poll::Ready(Some(Ok(Event::default().data(remaining))));
-                        }
-                    }
                     debug!("SseForwarder::poll_next: stream ended model={} inst={}", self.model_name, self.instance_id);
                     self.inner = None;
-                    return Poll::Ready(Some(Ok(Event::default().data("[DONE]"))));
+                    if !self.buffer.is_empty() {
+                        // Leftover bytes = an SSE event without its
+                        // terminating blank line — incomplete JSON that
+                        // must not be forwarded as if valid.
+                        debug!(
+                            leftover = self.buffer.len(),
+                            "discarding unterminated SSE event at stream end"
+                        );
+                        self.buffer.clear();
+                    }
+                    if self.saw_done {
+                        // Clean completion — the backend's own [DONE] was
+                        // already forwarded; nothing more to emit.
+                        return Poll::Ready(None);
+                    }
+                    // The backend stream ended without [DONE]: the
+                    // response is truncated.  Signal it explicitly —
+                    // clients must not mistake partial output for a
+                    // complete answer.
+                    warn!(
+                        model = %self.model_name,
+                        inst = %self.instance_id,
+                        "backend stream ended without [DONE] — truncated response"
+                    );
+                    let error_sse = serde_json::json!({
+                        "error": {
+                            "message": "backend stream ended without completing (truncated response)",
+                            "type": "stream_truncated",
+                        }
+                    });
+                    return Poll::Ready(Some(Ok(Event::default()
+                        .data(error_sse.to_string())
+                        .event("error"))));
                 }
                 Poll::Pending => return Poll::Pending,
             }
@@ -1230,48 +1284,59 @@ where
 impl<S> Drop for SseForwarder<S> {
     fn drop(&mut self) {
         debug!("SseForwarder::drop: model={} inst={}", self.model_name, self.instance_id);
-
-        // Record completion from streaming chunks: parse the last chunk
-        // for usage data and write to the ring buffer.
-        let mut prompt_tokens = 0u64;
-        let mut gen_tokens = 0u64;
-        let mut cached_tokens = 0u64;
-        for chunk in self.chunks.iter().rev() {
-            if chunk == "[DONE]" {
-                continue;
-            }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(chunk) {
-                if let Some(usage) = v.get("usage") {
-                    prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    gen_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    cached_tokens = usage
-                        .pointer("/prompt_tokens_details/cached_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    break;
-                }
-            }
-        }
         let duration_ms = self.t0.elapsed().as_millis() as u64;
 
-        self.manager.record_completion(
-            &self.model_name,
-            crate::types::CompletionRecord {
-                ts: crate::debug_log::ts_now(),
-                request_id: self.request_id.clone(),
-                instance_id: self.instance_id.clone(),
-                api_user: self.api_user.clone(),
-                prompt_tokens,
-                generated_tokens: gen_tokens,
-                cached_tokens,
-                duration_ms,
-            },
-        );
+        // Only clean completions (backend sent [DONE]) are recorded —
+        // truncated streams and client disconnects must not leave phantom
+        // 0-token records in the ring buffer.
+        if self.saw_done {
+            // Parse the last usage-bearing chunk for token counts.
+            let mut prompt_tokens = 0u64;
+            let mut gen_tokens = 0u64;
+            let mut cached_tokens = 0u64;
+            for chunk in self.chunks.iter().rev() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(chunk) {
+                    if let Some(usage) = v.get("usage") {
+                        prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                        gen_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                        cached_tokens = usage
+                            .pointer("/prompt_tokens_details/cached_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        break;
+                    }
+                }
+            }
+            self.manager.record_completion(
+                &self.model_name,
+                crate::types::CompletionRecord {
+                    ts: crate::debug_log::ts_now(),
+                    request_id: self.request_id.clone(),
+                    instance_id: self.instance_id.clone(),
+                    api_user: self.api_user.clone(),
+                    prompt_tokens,
+                    generated_tokens: gen_tokens,
+                    cached_tokens,
+                    duration_ms,
+                },
+            );
+        } else {
+            debug!(
+                model = %self.model_name,
+                inst = %self.instance_id,
+                "stream ended without [DONE] (truncated or client disconnect) — no completion recorded"
+            );
+        }
 
         // Debug log: streaming response (logged on drop so we capture partial
         // output even on client disconnect).
         if let Some(ctx) = self.debug.take() {
             let body = serde_json::json!({"chunks": self.chunks});
+            let error = if self.saw_done {
+                None
+            } else {
+                Some("stream ended before [DONE] (truncated or client disconnect)".to_string())
+            };
             ctx.loggers.write_line(&ctx.path, &DebugLogEntry {
                 ts: ts_now(),
                 request_id: ctx.request_id,
@@ -1283,7 +1348,7 @@ impl<S> Drop for SseForwarder<S> {
                 body: Some(body),
                 usage: None,
                 duration_ms: Some(duration_ms),
-                error: None,
+                error,
             });
         }
     }
@@ -1380,5 +1445,200 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::instance::{Instance, InstanceHandle, InstanceState};
+    use futures_util::StreamExt;
+
+    const TEST_YAML: &str = r#"
+server: {}
+apikeys_file: apikeys.txt
+models:
+  - name: m
+    context_length: 4096
+    cmd: "sleep 3600"
+    idle_ttl: 60
+"#;
+
+    fn test_manager() -> Arc<InstanceManager> {
+        let config: crate::config::Config = serde_yaml_ng::from_str(TEST_YAML).unwrap();
+        let gpu_snapshot = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+        let (mgr, _release_rx, _crash_rx) =
+            InstanceManager::new(&config, gpu_snapshot, None);
+        Arc::new(mgr)
+    }
+
+    fn test_guard() -> SlotGuard {
+        let mut inst = Instance::new("m", vec![], 9999, None);
+        inst.state = InstanceState::Ready;
+        let handle = InstanceHandle::new(inst);
+        handle.try_acquire(4).expect("slot available")
+    }
+
+    fn forwarder_from(
+        chunks: &[&str],
+        mgr: Arc<InstanceManager>,
+    ) -> SseForwarder<impl Stream<Item = Result<bytes::Bytes, reqwest::Error>>> {
+        let byte_stream = futures_util::stream::iter(
+            chunks.iter().map(|c| Ok(bytes::Bytes::from(c.to_string()))),
+        );
+        SseForwarder::new(
+            byte_stream,
+            test_guard(),
+            "m".into(),
+            "m@cpu#0".into(),
+            None,
+            mgr,
+            "user".into(),
+            "req-1".into(),
+        )
+    }
+
+    /// Event content via its Debug impl (buffer bytes are shown).
+    fn event_text(ev: &Event) -> String {
+        format!("{:?}", ev)
+    }
+
+    fn completions_recorded(mgr: &InstanceManager) -> usize {
+        mgr.recent_completions_snapshot()
+            .get("m")
+            .map(|v| v.len())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn clean_completion_forwards_done_exactly_once() {
+        let mgr = test_manager();
+        let mut stream = forwarder_from(
+            &[
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                "data: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n",
+                "data: [DONE]\n\n",
+            ],
+            mgr.clone(),
+        );
+
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next().await {
+            events.push(event_text(&ev.unwrap()));
+        }
+        assert_eq!(events.len(), 3, "chunk + usage + [DONE], nothing synthetic");
+        assert!(events[2].contains("[DONE]"));
+        assert!(
+            !events.iter().any(|e| e.contains("stream_truncated")),
+            "clean completion must not emit a truncation error"
+        );
+        assert!(stream.saw_done);
+
+        drop(stream);
+        assert_eq!(
+            completions_recorded(&mgr),
+            1,
+            "clean completion must be recorded"
+        );
+        let recs = mgr.recent_completions_snapshot();
+        let rec = &recs["m"][0];
+        assert_eq!((rec.prompt_tokens, rec.generated_tokens), (3, 2));
+    }
+
+    #[tokio::test]
+    async fn truncated_stream_signals_error_not_fake_done() {
+        // Backend connection ends mid-generation without [DONE]: the
+        // client must get an explicit truncation error, never a synthetic
+        // [DONE] that makes partial output look complete.
+        let mgr = test_manager();
+        let mut stream = forwarder_from(
+            &["data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"],
+            mgr.clone(),
+        );
+
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next().await {
+            events.push(event_text(&ev.unwrap()));
+        }
+        assert_eq!(events.len(), 2, "content chunk + truncation error");
+        assert!(events[1].contains("stream_truncated"));
+        assert!(!events[1].contains("[DONE]"));
+        assert!(!stream.saw_done);
+
+        drop(stream);
+        assert_eq!(
+            completions_recorded(&mgr),
+            0,
+            "truncated stream must not record a phantom completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_records_no_completion() {
+        // Dropping the stream mid-generation (client gone) must not
+        // record a phantom completion either.
+        let mgr = test_manager();
+        let mut stream = forwarder_from(
+            &[
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                "data: [DONE]\n\n",
+            ],
+            mgr.clone(),
+        );
+
+        // Consume one event, then drop before [DONE] is seen.
+        let first = stream.next().await;
+        assert!(first.is_some());
+        assert!(!stream.saw_done);
+        drop(stream);
+
+        assert_eq!(completions_recorded(&mgr), 0);
+    }
+
+    #[tokio::test]
+    async fn unterminated_tail_event_is_not_forwarded() {
+        // A partial SSE event at stream end (no terminating blank line)
+        // is incomplete JSON — discard it and signal truncation instead
+        // of forwarding it as if valid.
+        let mgr = test_manager();
+        let mut stream = forwarder_from(
+            &["data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]"],
+            mgr.clone(),
+        );
+
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next().await {
+            events.push(event_text(&ev.unwrap()));
+        }
+        assert_eq!(events.len(), 1, "only the truncation error");
+        assert!(events[0].contains("stream_truncated"));
+    }
+
+    #[tokio::test]
+    async fn chunks_are_not_buffered_without_debug_log() {
+        // Without a debug log, only the most recent chunk (usage) is
+        // retained — no unbounded per-request buffering.
+        let mgr = test_manager();
+        let mut stream = forwarder_from(
+            &[
+                "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"c\"}}]}\n\n",
+                "data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":3}}\n\n",
+                "data: [DONE]\n\n",
+            ],
+            mgr.clone(),
+        );
+        while stream.next().await.is_some() {}
+        assert!(
+            stream.chunks.len() <= 1,
+            "without a debug log only the usage chunk is kept, got {}",
+            stream.chunks.len()
+        );
+        drop(stream);
+        let recs = mgr.recent_completions_snapshot();
+        assert_eq!(recs["m"][0].generated_tokens, 3);
     }
 }
