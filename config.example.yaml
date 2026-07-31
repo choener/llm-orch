@@ -49,6 +49,25 @@ devices:
     0: "0000:03:00.0"  # dGPU — find with `llama-server --list-devices`
     # 1: "0000:7b:00.0" # iGPU — too small for LLMs
 
+  # CUDA (NVIDIA) devices — separate namespace.  Models reference these
+  # indices via `cuda_devices` (mutually exclusive with `vulkan_devices`
+  # on the same model) and are pinned via CUDA_VISIBLE_DEVICES.
+  # PCI slots are validated against /sys/bus/pci/devices/; find them with
+  # `nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader` (strip the
+  # domain down to 4 hex digits: 00000000:65:00.0 → 0000:65:00.0).
+  #
+  # `vram_mb` (optional): static VRAM total in MB.  Doubles as a
+  # capacity cap over the nvidia-smi-reported total and as the fallback
+  # total when nvidia-smi is unavailable — set it if nvidia-smi is not
+  # on llm-orch's PATH.
+  # cuda:
+  #   0:
+  #     pci: "0000:65:00.0"
+  #     vram_mb: 24576
+  #   1:
+  #     pci: "0000:c1:00.0"
+  #     vram_mb: 24576
+
 # ---------------------------------------------------------------------------
 # Command aliases
 # ---------------------------------------------------------------------------
@@ -68,6 +87,9 @@ cmd_aliases:
 # Prevent the kernel driver from auto-suspending a GPU while models are
 # loaded.  The command runs periodically per active GPU and stops when the
 # last instance on that GPU is unloaded.
+#
+# AMD/Vulkan only — NVIDIA GPUs are not auto-suspended this way (enable
+# persistence mode instead: `nvidia-smi -pm 1`).
 #
 # keep_alive:
 #   amd:
@@ -114,6 +136,38 @@ models:
   #   cmd: |
   #     {llama}
   #       --model /models/qwen3.6-27b-q8_0.gguf
+  #       --ctx-size 32768
+
+  # --- Example 2b: a CUDA model — pinned via CUDA_VISIBLE_DEVICES ----------
+  # - name: "qwen3-14b-cuda"
+  #   context_length: 32768
+  #   max_instances: 1
+  #   max_concurrent: 4
+  #   vram: 12000
+  #   idle_ttl: 300
+  #   queue_depth: 20
+  #   cuda_devices: [0, 1]      # pool: CUDA devices 0 and 1
+  #   cmd: |
+  #     {llama}
+  #       --model /models/qwen3-14b-q4_k_m.gguf
+  #       --ctx-size 32768
+
+  # --- Example 2c: a CUDA model spanning two GPUs ---------------------------
+  # `gpus: 2` selects two devices from the `cuda_devices` pool and pins
+  # them as CUDA_VISIBLE_DEVICES=<a>,<b> (selection order = emission
+  # order); `vram` is reserved on EACH occupied GPU.
+  # - name: "qwen3-32b-cuda"
+  #   context_length: 32768
+  #   max_instances: 1
+  #   max_concurrent: 4
+  #   vram: 20000             # MB reserved per occupied GPU
+  #   gpus: 2
+  #   idle_ttl: 600
+  #   queue_depth: 10
+  #   cuda_devices: [0, 1]
+  #   cmd: |
+  #     {llama}
+  #       --model /models/qwen3-32b-q4_k_m.gguf
   #       --ctx-size 32768
 
   # --- Example 3: a smaller model — runs on CPU ----------------------------

@@ -70,6 +70,33 @@ In `config.yaml`, each model definition controls its lifecycle:
 - `idle_ttl`: Seconds to keep the model loaded after the last request.
 - `vulkan_devices`: The pool of GPU indices this model is allowed to use.
 
+### CUDA (NVIDIA) devices
+Device placement works for NVIDIA GPUs with full parity to the Vulkan path:
+
+```yaml
+devices:
+  cuda:
+    0:
+      pci: "0000:65:00.0"   # see nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader
+      vram_mb: 24576         # optional: capacity cap + fallback when nvidia-smi is absent
+    1:
+      pci: "0000:c1:00.0"
+      vram_mb: 24576
+
+models:
+  - name: "qwen3-32b"
+    # ...
+    vram: 20000             # reserved per occupied GPU
+    gpus: 2                 # span two GPUs (CUDA_VISIBLE_DEVICES=<a>,<b>)
+    cuda_devices: [0, 1]    # mutually exclusive with vulkan_devices
+```
+
+- Instances are pinned via `CUDA_VISIBLE_DEVICES` (selection order = emission order, like Vulkan's `GGML_VK_VISIBLE_DEVICES`).
+- VRAM capacity comes from periodic `nvidia-smi` queries; `vram_mb` caps that value and serves as the fallback total when `nvidia-smi` is unavailable. A CUDA device with neither metrics nor `vram_mb` is unusable for placement.
+- `nvidia-smi` must be on llm-orch's PATH for live metrics. Under the NixOS module: `services.llm-orch.extraPackages = [ config.hardware.nvidia.package ];`.
+- You need a CUDA-enabled llama.cpp build (e.g. `pkgs.llama-cpp.override { cudaSupport = true; }` as the module's `llamaPackage`, or an absolute store path in your `cmd`).
+- GPU keep-alive is AMD-only; NVIDIA GPUs don't need it — enable persistence mode instead (`nvidia-smi -pm 1`).
+
 ### Aliases
 Aliases allow you to expose the same model under different names with different personas:
 ```yaml
