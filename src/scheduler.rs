@@ -3,7 +3,7 @@
 // Central scheduler: owns the map of model → running instances, handles
 // spawning, slot acquisition, queueing, idle eviction, and shutdown.
 
-use crate::backend::{poll_readiness, shutdown_child, spawn_process, Backend, DeviceKind, LlamaCppBackend, ReadyOutcome};
+use crate::backend::{output_lines, poll_readiness, shutdown_child, spawn_process, Backend, DeviceKind, LlamaCppBackend, ReadyOutcome};
 use crate::config::ModelConfig;
 use crate::gpu::GpuMetrics;
 use crate::types::CompletionRecord;
@@ -875,8 +875,8 @@ impl InstanceManager {
         let envs = model_backend.gpu_env(&gpu_indices);
 
         // Spawn.
-        let child = match spawn_process(prog, &args, &envs).await {
-            Ok(c) => c,
+        let (child, output) = match spawn_process(prog, &args, &envs, model_name, port).await {
+            Ok(pair) => pair,
             Err(e) => {
                 warn!(model = %model_name, error = %e, "spawn failed");
                 self.ports.lock().await.free(port);
@@ -899,6 +899,7 @@ impl InstanceManager {
             self.instance_seq.fetch_add(1, Ordering::Relaxed)
         );
         inst.child = Some(child);
+        inst.output = Some(output);
         let handle = InstanceHandle::new(inst);
 
         // Register under model name immediately as Loading.
@@ -960,6 +961,7 @@ impl InstanceManager {
             // the model block limit) from a live-but-slow load (no count).
             let child_exited = outcome == ReadyOutcome::ChildExited;
             warn!(model = %model_name, port = port, exited = child_exited, "instance did not become ready — shutting down");
+            self.dump_recent_output(&handle);
             let mut child_to_kill = {
                 let mut inst_lock = handle.inner().lock().unwrap();
                 inst_lock.state = InstanceState::Failed;
@@ -1480,11 +1482,32 @@ impl InstanceManager {
             was_ready = was_ready,
             "backend instance exited unexpectedly"
         );
+        self.dump_recent_output(&handle);
 
         self.unregister_instance(&model_name, &handle, &gpu_indices).await;
 
         if !was_ready {
             self.note_pre_output_crash(&model_name);
+        }
+    }
+
+    /// Log an instance's buffered backend stdout/stderr at `warn!` level.
+    /// Called on failure paths (readiness failure, unexpected exit) — this
+    /// is where backend init errors (e.g. llama.cpp "CUDA init failed")
+    /// surface, since live output is only forwarded at `debug!` level.
+    fn dump_recent_output(&self, handle: &InstanceHandle) {
+        let (id, buf) = {
+            let inst = handle.inner().lock().unwrap();
+            (inst.id.clone(), inst.output.clone())
+        };
+        let Some(buf) = buf else { return };
+        let lines = output_lines(&buf);
+        if lines.is_empty() {
+            return;
+        }
+        warn!(inst = %id, lines = lines.len(), "recent backend output:");
+        for line in lines {
+            warn!(inst = %id, "{line}");
         }
     }
 

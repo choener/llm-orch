@@ -45,6 +45,11 @@ pub struct Instance {
     /// Subprocess handle (`None` before spawn, or after the process exits).
     pub child: Option<Child>,
 
+    /// Ring buffer of the backend's recent stdout/stderr lines.  Set by
+    /// the manager at spawn time; dumped at `warn!` level when the
+    /// instance fails readiness or crashes.
+    pub output: Option<crate::backend::OutputBuffer>,
+
     /// Number of in-flight requests currently being processed.
     pub in_flight: usize,
 
@@ -79,6 +84,7 @@ impl Instance {
             gpu_indices,
             state: InstanceState::Loading,
             child: None,
+            output: None,
             in_flight: 0,
             last_active: Instant::now(),
             release_tx,

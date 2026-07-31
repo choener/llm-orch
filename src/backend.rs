@@ -88,12 +88,56 @@ impl Backend for LlamaCppBackend {
 
 // ── Process helpers (shared) ─────────────────────────────────────────────────
 
+use std::collections::VecDeque;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use reqwest::Client;
 use crate::instance::InstanceHandle;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tracing::debug;
 
-/// Spawn a backend subprocess with the given program, arguments, and environment.
+/// Maximum number of recent backend output lines kept per instance.
+/// Dumped at `warn!` level when the instance fails or crashes — this is
+/// where llama.cpp's "CUDA init failed" style messages surface.
+const OUTPUT_BUFFER_LINES: usize = 200;
+
+/// Ring buffer of a backend process's recent stdout/stderr lines.
+/// Shared between the reader tasks (writers) and the instance/scheduler
+/// (readers on failure paths).
+pub type OutputBuffer = Arc<Mutex<VecDeque<String>>>;
+
+/// Snapshot of the buffered lines, oldest first.
+pub fn output_lines(buf: &OutputBuffer) -> Vec<String> {
+    buf.lock().unwrap().iter().cloned().collect()
+}
+
+/// Forward one stream's lines to `tracing::debug!` and the ring buffer.
+fn pipe_output<S>(
+    stream: S,
+    stream_name: &'static str,
+    model: String,
+    port: u16,
+    buf: OutputBuffer,
+) where
+    S: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stream).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            debug!(model = %model, port = port, stream = stream_name, "backend| {line}");
+            let mut guard = buf.lock().unwrap();
+            if guard.len() >= OUTPUT_BUFFER_LINES {
+                guard.pop_front();
+            }
+            guard.push_back(format!("{stream_name}| {line}"));
+        }
+    });
+}
+
+/// Spawn a backend subprocess with the given program, arguments, and
+/// environment.  Returns the child plus a ring buffer of its recent
+/// stdout/stderr lines (also forwarded live at `debug!` level).
 ///
 /// `kill_on_drop(true)` ensures the child is reaped when the handle drops.
 /// Additionally, `PR_SET_PDEATHSIG` is set on Unix so the child receives
@@ -102,7 +146,9 @@ pub async fn spawn_process(
     prog: &str,
     args: &[String],
     envs: &[(String, String)],
-) -> std::io::Result<tokio::process::Child> {
+    model: &str,
+    port: u16,
+) -> std::io::Result<(tokio::process::Child, OutputBuffer)> {
     let mut cmd = tokio::process::Command::new(prog);
     cmd.args(args);
     for (k, v) in envs {
@@ -110,8 +156,8 @@ pub async fn spawn_process(
     }
     cmd.kill_on_drop(true);
     cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
 
     // Die with the parent — even if the parent is SIGKILL'd.
     #[cfg(unix)]
@@ -122,7 +168,15 @@ pub async fn spawn_process(
         });
     }
 
-    cmd.spawn()
+    let mut child = cmd.spawn()?;
+    let buf: OutputBuffer = Arc::new(Mutex::new(VecDeque::new()));
+    if let Some(stdout) = child.stdout.take() {
+        pipe_output(stdout, "stdout", model.to_owned(), port, Arc::clone(&buf));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        pipe_output(stderr, "stderr", model.to_owned(), port, Arc::clone(&buf));
+    }
+    Ok((child, buf))
 }
 
 // ── Readiness detection ──────────────────────────────────────────────────────
@@ -259,7 +313,7 @@ mod tests {
     async fn poll_readiness_detects_instant_child_exit() {
         // A child that exits immediately must fail readiness fast —
         // not after the full spawn timeout.
-        let child = spawn_process("true", &[], &[]).await.unwrap();
+        let (child, _out) = spawn_process("true", &[], &[], "test", 0).await.unwrap();
         let mut inst = Instance::new("m", vec![], 9, None);
         inst.child = Some(child);
         let handle = InstanceHandle::new(inst);
@@ -278,10 +332,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn output_buffer_captures_stdout_and_stderr() {
+        let (mut child, buf) = spawn_process(
+            "sh",
+            &["-c".into(), "echo out-line; echo err-line >&2".into()],
+            &[],
+            "test",
+            0,
+        )
+        .await
+        .unwrap();
+        child.wait().await.unwrap();
+        // Give the reader tasks a moment to drain the pipes.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let lines = output_lines(&buf);
+        assert!(
+            lines.iter().any(|l| l == "stdout| out-line"),
+            "missing stdout line: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l == "stderr| err-line"),
+            "missing stderr line: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn poll_readiness_times_out_for_unresponsive_backend() {
         // A live child that never serves /health must time out, not be
         // mistaken for a crash.
-        let child = spawn_process("sleep", &["30".into()], &[]).await.unwrap();
+        let (child, _out) = spawn_process("sleep", &["30".into()], &[], "test", 0).await.unwrap();
         let mut inst = Instance::new("m", vec![], 9, None);
         inst.child = Some(child);
         let handle = InstanceHandle::new(inst);
