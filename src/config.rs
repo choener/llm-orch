@@ -451,6 +451,20 @@ pub struct ModelConfig {
     pub autoscale: Option<AutoscaleConfig>,
 }
 
+impl ModelConfig {
+    /// Device namespace this model is placed on.  A model is a CUDA model
+    /// iff `cuda_devices` is non-empty (validation guarantees the two
+    /// pools are mutually exclusive); otherwise it is a Vulkan model
+    /// (`vulkan_devices` possibly empty = CPU-only).
+    pub fn device_kind(&self) -> crate::backend::DeviceKind {
+        if !self.cuda_devices.is_empty() {
+            crate::backend::DeviceKind::Cuda
+        } else {
+            crate::backend::DeviceKind::Vulkan
+        }
+    }
+}
+
 fn default_max_instances() -> usize {
     1
 }
