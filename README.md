@@ -80,6 +80,59 @@ aliases:
 ```
 When a client requests the `coder` model, `llm-orch` routes it to `deepseek-coder-7b` and injects the system prompt.
 
+## ❄️ NixOS Module
+
+The flake exports `nixosModules.llm-orch` (also aliased as `nixosModules.default`), which runs llm-orch as a hardened systemd service:
+
+```nix
+# flake.nix (consumer)
+{
+  inputs.llm-orch.url = "github:you/llm-orch";
+
+  outputs = { self, nixpkgs, llm-orch, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        llm-orch.nixosModules.llm-orch
+        {
+          services.llm-orch = {
+            enable = true;
+            configFile = "/var/lib/llm-orch/config.yaml";
+            # user = "choener";        # optional: run as an existing user
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+The module automatically uses the flake's own build of llm-orch; override with `services.llm-orch.package` if needed.
+
+### Options
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `enable` | `false` | Enable the llm-orch service. |
+| `package` | this flake's build | The llm-orch package to run. |
+| `configFile` | — (required) | Path to `config.yaml`; hot-reloaded at runtime. |
+| `user` / `group` | `"llm-orch"` | Account to run under. The default is created as a system user with `video`/`render` group membership for GPU access. Set to your own user if your model files are owned by it. |
+| `llamaPackage` | `pkgs.llama-cpp` | Provides `llama-server` on the service PATH. Set to `null` to opt out. |
+| `extraPackages` | `[]` | Additional packages on the service PATH (available to model `cmd`s and keep-alive hooks). |
+
+### File ownership and permissions
+
+The service reads its files directly (hot-reload requires this), so ownership matters:
+
+- **Config file**: owned by the service user, may be world-readable (e.g. `0644 llm-orch:llm-orch`).
+- **Apikeys file** (path set via `apikeys_file` in the config): owned by the service user, readable by **no one else** (`0400` or `0600`).
+- Relative paths in the config (like `apikeys_file: "apikeys.txt"`) resolve against the state directory `/var/lib/llm-orch`, which the module creates owned by the service user.
+- Replace both files **atomically** (write temp file, then `mv`) so the hot-reload watcher fires reliably.
+
+### Hardening notes
+
+The unit runs with `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp`, `NoNewPrivileges`, no capabilities, and `PrivateDevices=true` with `DeviceAllow` for `/dev/dri` (Vulkan) and `/dev/nvidia*` (CUDA). `MemoryDenyWriteExecute=false` is set because GPU runtimes JIT-compile at runtime. Model files under `/home` remain readable; tighten permissions yourself if they must stay private.
+
 ## 🛠 Development
 
 - **Tests**: Run `cargo test` to execute integration tests.

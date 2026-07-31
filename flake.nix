@@ -27,6 +27,13 @@
         };
       };
 
+      nixosModules.llm-orch = { pkgs, lib, ... }: {
+        imports = [ ./nix/nixos.nix ];
+        services.llm-orch.package =
+          lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+      };
+      nixosModules.default = self.nixosModules.llm-orch;
+
       devShells.${system}.default = pkgs.mkShell {
         name = "llm-orch-devshell";
 
