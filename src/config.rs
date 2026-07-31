@@ -104,20 +104,29 @@ impl Config {
                     m.name
                 )));
             }
-            if m.vulkan_devices.is_empty() {
+            if !m.vulkan_devices.is_empty() && !m.cuda_devices.is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "model '{}': vulkan_devices and cuda_devices are mutually exclusive (a model uses exactly one device namespace)",
+                    m.name
+                )));
+            }
+            let (pool_len, ns) = if !m.cuda_devices.is_empty() {
+                (m.cuda_devices.len(), "cuda_devices")
+            } else {
+                (m.vulkan_devices.len(), "vulkan_devices")
+            };
+            if pool_len == 0 {
                 // CPU-only model: spanning multiple devices is meaningless.
                 if m.gpus != 1 {
                     return Err(ConfigError::Validation(format!(
-                        "model '{}': gpus ({}) exceeds vulkan_devices count (0) (CPU-only models must use gpus: 1)",
+                        "model '{}': gpus ({}) exceeds device count (0) (CPU-only models must use gpus: 1)",
                         m.name, m.gpus
                     )));
                 }
-            } else if m.gpus > m.vulkan_devices.len() {
+            } else if m.gpus > pool_len {
                 return Err(ConfigError::Validation(format!(
-                    "model '{}': gpus ({}) exceeds vulkan_devices count ({})",
-                    m.name,
-                    m.gpus,
-                    m.vulkan_devices.len()
+                    "model '{}': gpus ({}) exceeds {} count ({})",
+                    m.name, m.gpus, ns, pool_len
                 )));
             }
         }
@@ -224,6 +233,31 @@ impl Config {
                     )));
                 }
             }
+
+            // --- cuda ---
+            // NVIDIA GPUs do not register DRM cards, so slots are checked
+            // against /sys/bus/pci/devices/ directly.
+            let mut seen_cuda = HashSet::new();
+            for (idx, cdev) in &devs.cuda {
+                if !pci_slot_exists(&cdev.pci) {
+                    return Err(ConfigError::Validation(format!(
+                        "devices.cuda.{}: PCI slot '{}' not found in /sys/bus/pci/devices/",
+                        idx, cdev.pci
+                    )));
+                }
+                if !seen_cuda.insert(&cdev.pci) {
+                    return Err(ConfigError::Validation(format!(
+                        "devices.cuda: PCI slot '{}' assigned to multiple indices",
+                        cdev.pci
+                    )));
+                }
+                if devs.vulkan.values().any(|s| s == &cdev.pci) {
+                    return Err(ConfigError::Validation(format!(
+                        "devices.cuda.{}: PCI slot '{}' is also assigned in devices.vulkan",
+                        idx, cdev.pci
+                    )));
+                }
+            }
         }
 
         // --- model vulkan_devices ---
@@ -234,6 +268,25 @@ impl Config {
                     if !valid_indices.contains(idx) {
                         return Err(ConfigError::Validation(format!(
                             "model '{}': vulkan_device {} not defined in devices.vulkan",
+                            m.name, idx
+                        )));
+                    }
+                }
+            }
+        }
+
+        // --- model cuda_devices ---
+        {
+            let valid_indices: HashSet<usize> = self
+                .devices
+                .as_ref()
+                .map(|d| d.cuda.keys().copied().collect())
+                .unwrap_or_default();
+            for m in &self.models {
+                for idx in &m.cuda_devices {
+                    if !valid_indices.contains(idx) {
+                        return Err(ConfigError::Validation(format!(
+                            "model '{}': cuda_device {} not defined in devices.cuda",
                             m.name, idx
                         )));
                     }
@@ -363,17 +416,25 @@ pub struct ModelConfig {
     pub cmd: String,
 
     /// Vulkan device indices this model can be placed on (from `devices.vulkan`).
-    /// Empty = CPU only.
+    /// Empty = CPU only (unless `cuda_devices` is set).
+    /// Mutually exclusive with `cuda_devices`.
     #[serde(default)]
     pub vulkan_devices: Vec<usize>,
 
-    /// Number of Vulkan devices each instance of this model spans.
+    /// CUDA device indices this model can be placed on (from `devices.cuda`).
+    /// When non-empty the model is a CUDA model: placement uses the CUDA
+    /// pool and instances are pinned via `CUDA_VISIBLE_DEVICES`.
+    /// Mutually exclusive with `vulkan_devices`.
+    #[serde(default)]
+    pub cuda_devices: Vec<usize>,
+
+    /// Number of devices each instance of this model spans.
     /// The model is split evenly across them (llama.cpp's default tensor
-    /// split over `GGML_VK_VISIBLE_DEVICES`): `vram` is reserved on **each**
-    /// occupied GPU, so `vram: 20000, gpus: 2` reserves 2×20000 MB.
-    /// Asymmetric splits (`--tensor-split` in `cmd`) are possible; then
-    /// `vram` is a conservative per-GPU reservation.  Must be `>= 1` and
-    /// `<= vulkan_devices.len()`.
+    /// split over `GGML_VK_VISIBLE_DEVICES` / `CUDA_VISIBLE_DEVICES`):
+    /// `vram` is reserved on **each** occupied GPU, so `vram: 20000,
+    /// gpus: 2` reserves 2×20000 MB.  Asymmetric splits (`--tensor-split`
+    /// in `cmd`) are possible; then `vram` is a conservative per-GPU
+    /// reservation.  Must be `>= 1` and `<=` the device pool size.
     #[serde(default = "default_gpus")]
     pub gpus: usize,
 
@@ -446,8 +507,9 @@ fn default_autoscale_cooldown() -> u64 { 120 }
 
 /// Global device index → PCI slot mapping.
 ///
-/// Each backend gets its own namespace (e.g. `vulkan`).  The indices here
-/// are what `GGML_VK_VISIBLE_DEVICES` uses — they correspond to Vulkan's
+/// Each backend gets its own namespace (e.g. `vulkan`, `cuda`).  The
+/// indices here are what `GGML_VK_VISIBLE_DEVICES` /
+/// `CUDA_VISIBLE_DEVICES` use — they correspond to the backend's
 /// enumeration order, not sysfs card numbers.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DevicesConfig {
@@ -455,11 +517,31 @@ pub struct DevicesConfig {
     #[serde(default)]
     pub vulkan: HashMap<usize, String>,
 
+    /// CUDA device index → device definition.
+    #[serde(default)]
+    pub cuda: HashMap<usize, CudaDeviceConfig>,
+
     /// Optional per-GPU VRAM limit in MB.
     /// Caps the usable VRAM below the sysfs-reported total, leaving
     /// headroom for driver overhead.  When unset, sysfs total is used.
     #[serde(default)]
     pub vram_limit_mb: HashMap<usize, u64>,
+}
+
+/// A single CUDA device definition.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CudaDeviceConfig {
+    /// PCI slot name (e.g. `"0000:65:00.0"`).  Validated against
+    /// `/sys/bus/pci/devices/` — NVIDIA GPUs do not register DRM cards,
+    /// so the Vulkan `/sys/class/drm` check does not apply.
+    pub pci: String,
+
+    /// Static VRAM total in MB.  Doubles as a capacity cap (like
+    /// `vram_limit_mb`) and as the fallback total when `nvidia-smi`
+    /// metrics are unavailable.  When unset and no metrics are available,
+    /// the device cannot satisfy VRAM-aware placement.
+    #[serde(default)]
+    pub vram_mb: Option<u64>,
 }
 
 /// List PCI slot names from `/sys/class/drm/card*/device/uevent`.
@@ -476,6 +558,11 @@ fn list_pci_slots() -> Vec<String> {
         }
     }
     slots
+}
+
+/// Check whether a PCI slot name exists under `/sys/bus/pci/devices/`.
+fn pci_slot_exists(slot: &str) -> bool {
+    std::path::Path::new("/sys/bus/pci/devices").join(slot).exists()
 }
 
 // ---------------------------------------------------------------------------
@@ -635,6 +722,141 @@ models:
             );
             expect_validation_error(&yaml, &format!("'{reserved}' is a reserved name"));
         }
+    }
+
+    // ── CUDA device namespace ─────────────────────────────────────────
+
+    /// Real PCI slot names from /sys/bus/pci/devices, for tests that need
+    /// slots passing the existence check.  Every Linux host has some.
+    fn real_pci_slots(n: usize) -> Vec<String> {
+        let mut slots: Vec<String> = std::fs::read_dir("/sys/bus/pci/devices")
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        slots.sort();
+        slots.truncate(n);
+        slots
+    }
+
+    /// Real DRM PCI slots (what devices.vulkan validates against).
+    fn real_drm_slots() -> Vec<String> {
+        list_pci_slots()
+    }
+
+    #[test]
+    fn rejects_model_with_both_device_namespaces() {
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\n    vulkan_devices: [0]\n    cuda_devices: [0]",
+        );
+        expect_validation_error(&yaml, "mutually exclusive");
+    }
+
+    #[test]
+    fn rejects_gpus_exceeding_cuda_pool() {
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\n    gpus: 3\n    cuda_devices: [0, 1]",
+        );
+        expect_validation_error(&yaml, "gpus (3) exceeds cuda_devices count (2)");
+    }
+
+    #[test]
+    fn rejects_cuda_device_without_devices_section() {
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\n    cuda_devices: [0]",
+        );
+        expect_validation_error(&yaml, "cuda_device 0 not defined in devices.cuda");
+    }
+
+    #[test]
+    fn rejects_undefined_cuda_device_index() {
+        let slots = real_pci_slots(1);
+        if slots.is_empty() {
+            return; // no PCI bus visible in this environment
+        }
+        let yaml = BASE
+            .replace(
+                "apikeys_file: apikeys.txt",
+                &format!(
+                    "apikeys_file: apikeys.txt\ndevices:\n  cuda:\n    0:\n      pci: \"{}\"",
+                    slots[0]
+                ),
+            )
+            .replace(
+                "cmd: \"sleep 3600\"",
+                "cmd: \"sleep 3600\"\n    cuda_devices: [1]",
+            );
+        expect_validation_error(&yaml, "cuda_device 1 not defined in devices.cuda");
+    }
+
+    #[test]
+    fn accepts_multi_gpu_cuda_model() {
+        let slots = real_pci_slots(2);
+        if slots.len() < 2 {
+            return; // need two distinct PCI slots for this test
+        }
+        let yaml = BASE
+            .replace(
+                "apikeys_file: apikeys.txt",
+                &format!(
+                    "apikeys_file: apikeys.txt\ndevices:\n  cuda:\n    0:\n      pci: \"{}\"\n      vram_mb: 24576\n    1:\n      pci: \"{}\"",
+                    slots[0], slots[1]
+                ),
+            )
+            .replace(
+                "cmd: \"sleep 3600\"",
+                "cmd: \"sleep 3600\"\n    gpus: 2\n    cuda_devices: [0, 1]",
+            );
+        let cfg = parse(&yaml).unwrap();
+        let devs = cfg.devices.unwrap();
+        assert_eq!(devs.cuda[&0].vram_mb, Some(24576));
+        assert_eq!(devs.cuda[&1].vram_mb, None);
+    }
+
+    #[test]
+    fn rejects_duplicate_cuda_slots() {
+        let slots = real_pci_slots(1);
+        if slots.is_empty() {
+            return;
+        }
+        let yaml = BASE.replace(
+            "apikeys_file: apikeys.txt",
+            &format!(
+                "apikeys_file: apikeys.txt\ndevices:\n  cuda:\n    0:\n      pci: \"{0}\"\n    1:\n      pci: \"{0}\"",
+                slots[0]
+            ),
+        );
+        expect_validation_error(&yaml, "assigned to multiple indices");
+    }
+
+    #[test]
+    fn rejects_cuda_slot_also_assigned_in_vulkan() {
+        let drm = real_drm_slots();
+        if drm.is_empty() {
+            return; // no DRM cards in this environment
+        }
+        let yaml = BASE.replace(
+            "apikeys_file: apikeys.txt",
+            &format!(
+                "apikeys_file: apikeys.txt\ndevices:\n  vulkan:\n    0: \"{0}\"\n  cuda:\n    0:\n      pci: \"{0}\"",
+                drm[0]
+            ),
+        );
+        expect_validation_error(&yaml, "also assigned in devices.vulkan");
+    }
+
+    #[test]
+    fn rejects_cuda_slot_not_on_pci_bus() {
+        let yaml = BASE.replace(
+            "apikeys_file: apikeys.txt",
+            "apikeys_file: apikeys.txt\ndevices:\n  cuda:\n    0:\n      pci: \"0000:ff:ff.f\"",
+        );
+        expect_validation_error(&yaml, "not found in /sys/bus/pci/devices/");
     }
 
     #[test]
