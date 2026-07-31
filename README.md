@@ -158,7 +158,7 @@ The service reads its files directly (hot-reload requires this), so ownership ma
 
 ### Hardening notes
 
-The unit runs with `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp`, `NoNewPrivileges`, no capabilities, and `PrivateDevices=true` with `DeviceAllow` for `/dev/dri` (Vulkan) and `/dev/nvidia*` (CUDA). `MemoryDenyWriteExecute=false` is set because GPU runtimes JIT-compile at runtime. Model files under `/home` remain readable; tighten permissions yourself if they must stay private.
+The unit runs with `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp`, `NoNewPrivileges`, no capabilities, and cgroup-level device filtering (`DevicePolicy=closed` with `DeviceAllow` for the `char-drm` (Vulkan) and `char-nvidia*` (CUDA) device groups; unresolvable groups are skipped on hosts without the matching hardware). `MemoryDenyWriteExecute=false` is set because GPU runtimes JIT-compile at runtime. Model files under `/home` remain readable; tighten permissions yourself if they must stay private.
 
 ## 🛠 Development
 

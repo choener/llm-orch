@@ -118,10 +118,20 @@ in
         ProtectSystem = "strict";
         ProtectHome = "read-only";
         PrivateTmp = true;
-        PrivateDevices = true;
+        # Device path wildcards are NOT supported by DeviceAllow (only
+        # char-*/block-* group names support globs), and PrivateDevices
+        # would hide the nodes from the mount namespace anyway — with
+        # DevicePolicy=closed implied, a path rule that matches nothing
+        # silently denies all GPU access (CUDA/Vulkan init then falls
+        # back to CPU).  Cgroup-level filtering via DevicePolicy=closed
+        # plus device groups is the recommended pattern for GPU
+        # services.  Groups that don't resolve at unit start (e.g.
+        # char-nvidia* on a Vulkan-only host) are skipped harmlessly.
+        PrivateDevices = false;
+        DevicePolicy = "closed";
         DeviceAllow = [
-          "/dev/dri rw"      # Vulkan / AMD / Intel GPUs
-          "/dev/nvidia* rw"  # CUDA devices (nvidia0, nvidiactl, nvidia-uvm, ...)
+          "char-drm rw"      # Vulkan: /dev/dri/* (AMD/Intel; NVIDIA with nvidia-drm)
+          "char-nvidia* rw"  # CUDA: /dev/nvidia*, /dev/nvidia-uvm*, /dev/nvidia-caps/*
         ];
         ProtectKernelTunables = true;
         ProtectKernelModules = true;
