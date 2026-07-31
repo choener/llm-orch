@@ -354,7 +354,7 @@ impl InstanceManager {
 
         let mgr = Self {
             client: http_client::build(),
-            backend: LlamaCppBackend,
+            backend: LlamaCppBackend::default(),
             ports: Mutex::new(PortAllocator::new(config.server.port_range.clone())),
             model_configs: RwLock::new(model_configs),
             cmd_aliases: RwLock::new(config.cmd_aliases.clone()),

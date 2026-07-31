@@ -27,12 +27,42 @@ pub trait Backend: Send + Sync {
 
 // ── llama.cpp backend ────────────────────────────────────────────────────────
 
+/// Device namespace a llama.cpp build uses for GPU selection.
+///
+/// Determines which environment variable device indices are pinned
+/// through.  A model's kind follows its configured device pool
+/// (`vulkan_devices` vs `cuda_devices`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeviceKind {
+    /// Vulkan backend — pinned via `GGML_VK_VISIBLE_DEVICES`.
+    #[default]
+    Vulkan,
+    /// CUDA backend — pinned via `CUDA_VISIBLE_DEVICES`.
+    Cuda,
+}
+
 /// Backend for llama.cpp built with Vulkan, ROCm, or CUDA.
 ///
-/// GPU selection uses `GGML_VK_VISIBLE_DEVICES` (Vulkan) — other backends
-/// may use different env vars or CLI flags.  The indices passed to `gpu_env`
-/// are logical backend device indices, not sysfs card numbers.
-pub struct LlamaCppBackend;
+/// GPU selection uses `GGML_VK_VISIBLE_DEVICES` (Vulkan) or
+/// `CUDA_VISIBLE_DEVICES` (CUDA) depending on [`DeviceKind`].  The indices
+/// passed to `gpu_env` are logical backend device indices, not sysfs card
+/// numbers.  Their order is preserved — it has semantics in llama.cpp
+/// (tensor split order).
+pub struct LlamaCppBackend {
+    kind: DeviceKind,
+}
+
+impl LlamaCppBackend {
+    pub fn new(kind: DeviceKind) -> Self {
+        Self { kind }
+    }
+}
+
+impl Default for LlamaCppBackend {
+    fn default() -> Self {
+        Self::new(DeviceKind::Vulkan)
+    }
+}
 
 impl Backend for LlamaCppBackend {
     fn gpu_args(&self, _indices: &[usize]) -> Vec<String> {
@@ -43,12 +73,16 @@ impl Backend for LlamaCppBackend {
         if indices.is_empty() {
             return Vec::new();
         }
+        let var = match self.kind {
+            DeviceKind::Vulkan => "GGML_VK_VISIBLE_DEVICES",
+            DeviceKind::Cuda => "CUDA_VISIBLE_DEVICES",
+        };
         let list = indices
             .iter()
             .map(usize::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        vec![("GGML_VK_VISIBLE_DEVICES".into(), list)]
+        vec![(var.into(), list)]
     }
 }
 
@@ -195,6 +229,32 @@ mod tests {
     use super::*;
     use crate::instance::Instance;
 
+    #[test]
+    fn gpu_env_pins_vulkan_devices() {
+        let backend = LlamaCppBackend::new(DeviceKind::Vulkan);
+        assert_eq!(
+            backend.gpu_env(&[0, 2]),
+            vec![("GGML_VK_VISIBLE_DEVICES".to_string(), "0,2".to_string())]
+        );
+    }
+
+    #[test]
+    fn gpu_env_pins_cuda_devices() {
+        let backend = LlamaCppBackend::new(DeviceKind::Cuda);
+        assert_eq!(
+            backend.gpu_env(&[1, 0]),
+            // Order is preserved — it has semantics in llama.cpp.
+            vec![("CUDA_VISIBLE_DEVICES".to_string(), "1,0".to_string())]
+        );
+    }
+
+    #[test]
+    fn gpu_env_empty_pool_sets_nothing() {
+        for kind in [DeviceKind::Vulkan, DeviceKind::Cuda] {
+            assert!(LlamaCppBackend::new(kind).gpu_env(&[]).is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn poll_readiness_detects_instant_child_exit() {
         // A child that exits immediately must fail readiness fast —
@@ -204,7 +264,7 @@ mod tests {
         inst.child = Some(child);
         let handle = InstanceHandle::new(inst);
         let client = Client::new();
-        let backend = LlamaCppBackend;
+        let backend = LlamaCppBackend::default();
 
         let t0 = std::time::Instant::now();
         let outcome =
@@ -229,7 +289,7 @@ mod tests {
             .connect_timeout(Duration::from_millis(100))
             .build()
             .unwrap();
-        let backend = LlamaCppBackend;
+        let backend = LlamaCppBackend::default();
 
         let outcome =
             poll_readiness(&handle, &client, &backend, Duration::from_millis(600)).await;
