@@ -67,7 +67,7 @@ impl GpuReader {
     /// background polling task.  Returns the reader handle (for
     /// cheap shared access) and the `JoinHandle` of the poll task.
     pub fn start(poll_interval: Duration) -> (Self, tokio::task::JoinHandle<()>) {
-        let initial = read_all_gpus();
+        let initial = read_all();
         let snapshot = Arc::new(RwLock::new(initial));
 
         let snapshot_clone = Arc::clone(&snapshot);
@@ -75,7 +75,7 @@ impl GpuReader {
             let mut tick = interval(poll_interval);
             loop {
                 tick.tick().await;
-                let metrics = read_all_gpus();
+                let metrics = read_all_async().await;
                 let mut guard = snapshot_clone.write().await;
                 *guard = metrics;
             }
@@ -91,6 +91,21 @@ impl GpuReader {
 }
 
 // ── Core reading ─────────────────────────────────────────────────────────────
+
+/// Read metrics for every detected GPU: AMD via sysfs, NVIDIA via
+/// nvidia-smi (blocking variant — used for the initial snapshot).
+pub fn read_all() -> Vec<GpuMetrics> {
+    let mut metrics = read_all_gpus();
+    metrics.extend(crate::nvidia::read_all_nvidia_blocking());
+    metrics
+}
+
+/// Async variant of [`read_all`], used by the periodic poll task.
+async fn read_all_async() -> Vec<GpuMetrics> {
+    let mut metrics = read_all_gpus();
+    metrics.extend(crate::nvidia::read_all_nvidia().await);
+    metrics
+}
 
 /// Read metrics for every AMD GPU detected on the system.
 pub fn read_all_gpus() -> Vec<GpuMetrics> {
