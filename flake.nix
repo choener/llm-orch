@@ -11,6 +11,22 @@
       pkgs = nixpkgs.legacyPackages.${system};
     in
     {
+      packages.${system}.default = pkgs.rustPlatform.buildRustPackage {
+        pname = "llm-orch";
+        version = "0.1.0";
+
+        src = ./.;
+
+        cargoLock.lockFile = ./Cargo.lock;
+
+        meta = with pkgs.lib; {
+          description = "Single-host LLM orchestrator with hot-reload, API key auth, and llama.cpp backend management";
+          license = licenses.mit;
+          mainProgram = "llm-orch";
+          platforms = platforms.linux;
+        };
+      };
+
       devShells.${system}.default = pkgs.mkShell {
         name = "llm-orch-devshell";
 
