@@ -330,6 +330,17 @@ pub struct ServerConfig {
     /// before aborting the remaining connections.
     #[serde(default = "default_shutdown_drain_timeout")]
     pub shutdown_drain_timeout_secs: u64,
+
+    /// Interval (seconds) between loading-indicator events sent to
+    /// streaming clients while a backend instance is being acquired
+    /// (spawning / warming up / queued).  When `None` or `0`, no
+    /// loading indicators are sent and streaming requests block silently
+    /// until a slot is available (the classic behavior — clients may time
+    /// out on very slow model loads).
+    ///
+    /// Can be overridden per-model via `ModelConfig.loading_dots`.
+    #[serde(default)]
+    pub loading_dots: Option<u64>,
 }
 
 fn default_listen() -> String {
@@ -420,6 +431,12 @@ pub struct ModelConfig {
     /// Mutually exclusive with `cuda_devices`.
     #[serde(default)]
     pub vulkan_devices: Vec<usize>,
+
+    /// Override the global `server.loading_dots` interval for this model.
+    /// `Some(n)` replaces the global value (including disabling with `0`);
+    /// `None` inherits the global setting.
+    #[serde(default)]
+    pub loading_dots: Option<u64>,
 
     /// CUDA device indices this model can be placed on (from `devices.cuda`).
     /// When non-empty the model is a CUDA model: placement uses the CUDA
@@ -674,6 +691,40 @@ models:
     fn rejects_zero_max_concurrent() {
         let yaml = BASE.replace("cmd: \"sleep 3600\"", "cmd: \"sleep 3600\"\n    max_concurrent: 0");
         expect_validation_error(&yaml, "max_concurrent must be > 0");
+    }
+
+    #[test]
+    fn accepts_loading_dots_global() {
+        let yaml = BASE.replace("server: {}", "server:\n  loading_dots: 1");
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.server.loading_dots, Some(1));
+    }
+
+    #[test]
+    fn accepts_loading_dots_per_model() {
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\n    loading_dots: 2",
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.models[0].loading_dots, Some(2));
+    }
+
+    #[test]
+    fn accepts_loading_dots_disabled_per_model() {
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\n    loading_dots: 0",
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.models[0].loading_dots, Some(0));
+    }
+
+    #[test]
+    fn loading_dots_defaults_to_none() {
+        let cfg = parse(BASE).unwrap();
+        assert_eq!(cfg.server.loading_dots, None);
+        assert_eq!(cfg.models[0].loading_dots, None);
     }
 
     #[test]

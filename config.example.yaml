@@ -31,6 +31,22 @@ server:
   # aborting the remaining connections.
   # shutdown_drain_timeout_secs: 60   # default
 
+  # Interval (seconds) between loading-indicator events sent to streaming
+  # clients while a backend instance is being acquired (spawning / warming
+  # up / queued behind a busy model).  When absent/0, streaming requests
+  # block silently until a slot is available (the classic behavior —
+  # clients may time out on very slow model loads).
+  #
+  # Why: large models (30B+) can take a minute or more to load.  Without
+  # keep-alive dots the downstream client (e.g. an LLM coding harness) may
+  # abort the connection for being silent, then retry — spawning the same
+  # model twice.  The dots are emitted as SSE comment events so they do
+  # not appear in the model's conversation context.
+  #
+  # Per-model override: set `loading_dots: 0` on a model to silence dots
+  # for that model only, or `loading_dots: N` to use a different interval.
+  # loading_dots: 1   # default: off (absent)
+
 # ---------------------------------------------------------------------------
 # API keys
 # ---------------------------------------------------------------------------
@@ -111,6 +127,8 @@ models:
     idle_ttl: 300             # unload after 5 min of inactivity (seconds)
     queue_depth: 20           # max queued requests before returning 429
     vulkan_devices: [0]       # run on Vulkan device 0
+    # loading_dots: 1         # override server.loading_dots interval (seconds)
+    #                         # set to 0 to silence dots for this model only
 
     cmd: |
       {llama}

@@ -289,83 +289,68 @@ pub async fn chat_completions(
         }
     }; // cfg read guard dropped
 
-    // ── 4. Acquire an instance slot (or queue). ─────────────────────────
-    let guard = state
-        .manager
-        .get_or_spawn(&model_name)
-        .await
-        .map_err(|e| acquire_error(&model_name, e))?;
-
-    // Capture instance ID now that we hold the slot guard.
-    let instance_id = {
-        let inst = guard.handle().inner().lock().unwrap();
-        inst.id.clone()
-    }; // inner lock dropped — `guard` itself is still alive
-
-    // ── 5. Read the port from the instance. ────────────────────────────
-    let port = {
-        let inst = guard.handle().inner().lock().unwrap();
-        inst.port
-    }; // inner lock dropped — `guard` itself is still alive
-
-    let backend_url = format!("http://127.0.0.1:{}/v1/chat/completions", port);
-
-    // ── 6. Forward the request. ─────────────────────────────────────────
+    // ── 4. Forward the request. ─────────────────────────────────────────
     // Forward the *resolved* model name to the backend, not the alias —
     // strict backends validate the model field.
     request.model = model_name.clone();
     let request_body = serde_json::to_value(&request).unwrap_or_default();
 
-    // Debug log: request (exact body being forwarded).
-    if let Some(ref log_path) = debug_log_path {
-        state.debug_loggers.write_line(log_path, &DebugLogEntry {
-            ts: ts_now(),
-            request_id: request_id.clone(),
-            model: model_name.clone(),
-            alias: Some(request_model.clone()),
-            instance_id: Some(instance_id.clone()),
-            dir: "request".into(),
-            stream: Some(request.stream),
-            body: Some(request_body.clone()),
-            usage: None,
-            duration_ms: None,
-            error: None,
-        });
-    }
-
     if request.stream {
-        // Streaming mode: forward SSE stream from backend to client.
-        // The `SlotGuard` is moved into the stream wrapper so the
-        // in-flight slot is released when the stream ends (Drop).
-        info!("stream start model={} inst={}", model_name, instance_id);
-        let debug_ctx = debug_log_path.map(|path| DebugStreamContext {
-            loggers: state.debug_loggers.clone(),
-            path,
-            request_id: request_id.clone(),
-            model_name: model_name.clone(),
-            alias: Some(request_model.clone()),
-            instance_id: instance_id.clone(),
-            t0: std::time::Instant::now(),
-        });
-        let stream = build_sse_stream(
+        // Streaming mode: acquire a slot (spawning/queueing as needed,
+        // emitting loading-indicator dots while waiting) and forward the
+        // backend SSE stream to the client.  The `SlotGuard` is moved into
+        // the stream wrapper so the in-flight slot is released when the
+        // stream ends (Drop).
+        let stream = build_response_stream(
             state.client.clone(),
-            backend_url,
-            request_body,
-            guard,
-            model_name.clone(),
-            instance_id.clone(),
-            debug_ctx,
             state.manager.clone(),
+            model_name.clone(),
+            request_model.clone(),
+            request_body,
             key.label.clone(),
             request_id.clone(),
+            state.debug_loggers.clone(),
+            debug_log_path,
             idle_timeout,
-        )
-        .await
-        .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
+            "/v1/chat/completions",
+        );
 
         Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
     } else {
-        // Non-streaming mode: aggregate the backend response.
+        // Non-streaming mode: acquire a slot first, then aggregate the
+        // response (no loading dots — the response hasn't started yet).
+        let guard = state
+            .manager
+            .get_or_spawn(&model_name)
+            .await
+            .map_err(|e| acquire_error(&model_name, e))?;
+        let instance_id = {
+            let inst = guard.handle().inner().lock().unwrap();
+            inst.id.clone()
+        };
+        let port = {
+            let inst = guard.handle().inner().lock().unwrap();
+            inst.port
+        };
+        let backend_url = format!("http://127.0.0.1:{}/v1/chat/completions", port);
+
+        // Debug log: request (exact body being forwarded).
+        if let Some(ref log_path) = debug_log_path {
+            state.debug_loggers.write_line(log_path, &DebugLogEntry {
+                ts: ts_now(),
+                request_id: request_id.clone(),
+                model: model_name.clone(),
+                alias: Some(request_model.clone()),
+                instance_id: Some(instance_id.clone()),
+                dir: "request".into(),
+                stream: Some(false),
+                body: Some(request_body.clone()),
+                usage: None,
+                duration_ms: None,
+                error: None,
+            });
+        }
+
         let t0 = std::time::Instant::now();
         let response_body = forward_request_aggregate(
             &state.client,
@@ -470,55 +455,49 @@ pub async fn completions(
         )
     };
 
-    // ── 3. Acquire instance slot. ───────────────────────────────────────
-    let guard = state
-        .manager
-        .get_or_spawn(&model_name)
-        .await
-        .map_err(|e| acquire_error(&model_name, e))?;
-
-    // Capture instance ID now that we hold the slot guard.
-    let instance_id = {
-        let inst = guard.handle().inner().lock().unwrap();
-        inst.id.clone()
-    };
-
-    // ── 4. Read port. ──────────────────────────────────────────────────
-    let port = {
-        let inst = guard.handle().inner().lock().unwrap();
-        inst.port
-    };
-
-    let backend_url = format!("http://127.0.0.1:{}/v1/completions", port);
-
-    // ── 5. Forward request. ─────────────────────────────────────────────
+    // ── 3. Forward request. ─────────────────────────────────────────────
     // Forward the *resolved* model name to the backend, not the alias.
     request.model = model_name.clone();
+    let request_body = serde_json::to_value(&request).unwrap_or_default();
+
     if request.stream {
-        info!("stream start model={} inst={}", model_name, instance_id);
-        let stream = build_sse_stream(
+        // Streaming mode: acquire a slot (emitting loading-indicator dots
+        // while waiting) and forward the backend SSE stream.
+        let stream = build_response_stream(
             state.client.clone(),
-            backend_url,
-            serde_json::to_value(&request).unwrap_or_default(),
-            guard,
-            model_name.clone(),
-            instance_id.clone(),
-            None,
             state.manager.clone(),
+            model_name.clone(),
+            model_name.clone(),
+            request_body,
             key.label.clone(),
             request_id.clone(),
+            state.debug_loggers.clone(),
+            None,
             idle_timeout,
-        )
-        .await
-        .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
+            "/v1/completions",
+        );
 
         Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
     } else {
+        let guard = state
+            .manager
+            .get_or_spawn(&model_name)
+            .await
+            .map_err(|e| acquire_error(&model_name, e))?;
+        let instance_id = {
+            let inst = guard.handle().inner().lock().unwrap();
+            inst.id.clone()
+        };
+        let port = {
+            let inst = guard.handle().inner().lock().unwrap();
+            inst.port
+        };
+        let backend_url = format!("http://127.0.0.1:{}/v1/completions", port);
         let t0 = std::time::Instant::now();
         let response_body = forward_request_aggregate(
             &state.client,
             &backend_url,
-            &serde_json::to_value(&request).unwrap_or_default(),
+            &request_body,
             total_timeout,
         )
         .await?;
@@ -1062,6 +1041,221 @@ async fn forward_request_aggregate(
             )))
         }
     }
+}
+
+/// Build an SSE stream for a streaming request, emitting optional
+/// loading-indicator dots while the backend instance is acquired.
+///
+/// This *reuses* the canonical `InstanceManager::get_or_spawn` routing and
+/// queueing — so `queue_depth`/429, autoscale gating, and the fast-path
+/// acquire all still apply to streaming requests.  Loading dots are a pure
+/// presentation layer on top of that same acquisition future: when
+/// acquisition takes longer than the configured interval, a keep-alive `.`
+/// comment is emitted (clients ignore SSE comments), preventing client-side
+/// timeouts on slow model loads without ever touching the model's
+/// conversation context.
+///
+/// Because dots are gated on the *actual* wait (not on a separate
+/// loading-state probe), they also cover queue waits behind a saturated
+/// model, not just cold loads.  The debug "request" log is written here,
+/// once the real instance is known, so the dots path records the actual
+/// backend instance id.
+///
+/// Returns a `Stream<Item = Result<Event, Infallible>>` suitable for axum's
+/// `Sse` response type.  The `SlotGuard` is moved into the stream so the
+/// in-flight slot is released when the stream ends (via `Drop`).
+#[allow(clippy::too_many_arguments)]
+fn build_response_stream(
+    client: reqwest::Client,
+    manager: Arc<InstanceManager>,
+    model_name: String,
+    request_model: String,
+    body: serde_json::Value,
+    api_user: String,
+    request_id: String,
+    debug_loggers: Arc<crate::debug_log::DebugLoggers>,
+    debug_log_path: Option<std::path::PathBuf>,
+    idle_timeout: std::time::Duration,
+    backend_endpoint: &'static str,
+) -> Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
+
+    tokio::spawn(async move {
+        // Effective loading-dots interval for this model (None = disabled).
+        let dots = manager.loading_dots_interval(&model_name);
+        let acquire = manager.get_or_spawn(&model_name);
+
+        // ── Phase 1: acquire a slot, emitting dots while waiting. ──
+        // The acquisition future is pinned and polled across ticks (never
+        // dropped/restarted), so queueing state is preserved and waiters
+        // aren't re-queued at the back on every dot.  The first tick is
+        // scheduled one interval out, so a fast (fast-path) acquire emits
+        // no spurious dots.
+        let (guard, emitted_dots) = match dots {
+            Some(interval) => {
+                let mut ticker = tokio::time::interval_at(
+                    tokio::time::Instant::now() + interval,
+                    interval,
+                );
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut emitted = false;
+                // Pin the acquisition future so it can be polled across
+                // ticks without being dropped (dropping would lose queue
+                // position / re-queue the waiter at the back).
+                tokio::pin!(acquire);
+                let result = loop {
+                    tokio::select! {
+                        r = &mut acquire => break (r, emitted),
+                        _ = ticker.tick() => {
+                            emitted = true;
+                            // Comment events are ignored by SSE clients.
+                            if tx
+                                .send(Ok(Event::default().comment(".")))
+                                .await
+                                .is_err()
+                            {
+                                return; // client disconnected
+                            }
+                        }
+                    }
+                };
+                match result {
+                    (Ok(guard), emitted) => (guard, emitted),
+                    (Err(e), _) => {
+                        let _ = tx
+                            .send(Ok(Event::default()
+                                .data(acquire_error_sse(&model_name, e))
+                                .event("error")))
+                            .await;
+                        return;
+                    }
+                }
+            }
+            None => match acquire.await {
+                Ok(guard) => (guard, false),
+                Err(e) => {
+                    let _ = tx
+                        .send(Ok(Event::default()
+                            .data(acquire_error_sse(&model_name, e))
+                            .event("error")))
+                        .await;
+                    return;
+                }
+            },
+        };
+
+        // Summarise a long load so the client can show progress state.
+        if emitted_dots {
+            let _ = tx
+                .send(Ok(Event::default()
+                    .comment(format!("< {} loaded >", model_name))))
+                .await;
+        }
+
+        // ── Phase 2: instance is ready — forward the request. ──
+        let instance_id = {
+            let inst = guard.handle().inner().lock().unwrap();
+            inst.id.clone()
+        };
+        let port = {
+            let inst = guard.handle().inner().lock().unwrap();
+            inst.port
+        };
+        let backend_url = format!("http://127.0.0.1:{}{}", port, backend_endpoint);
+
+        // Debug log: request (exact body being forwarded).
+        if let Some(ref path) = debug_log_path {
+            debug_loggers.write_line(path, &DebugLogEntry {
+                ts: ts_now(),
+                request_id: request_id.clone(),
+                model: model_name.clone(),
+                alias: Some(request_model.clone()),
+                instance_id: Some(instance_id.clone()),
+                dir: "request".into(),
+                stream: Some(true),
+                body: Some(body.clone()),
+                usage: None,
+                duration_ms: None,
+                error: None,
+            });
+        }
+
+        info!("stream start model={} inst={}", model_name, instance_id);
+        let debug_ctx = debug_log_path.map(|path| DebugStreamContext {
+            loggers: debug_loggers.clone(),
+            path,
+            request_id: request_id.clone(),
+            model_name: model_name.clone(),
+            alias: Some(request_model.clone()),
+            instance_id: instance_id.clone(),
+            t0: std::time::Instant::now(),
+        });
+
+        match build_sse_stream(
+            client,
+            backend_url,
+            body,
+            guard,
+            model_name,
+            instance_id,
+            debug_ctx,
+            manager,
+            api_user,
+            request_id,
+            idle_timeout,
+        )
+        .await
+        {
+            Ok(mut stream) => {
+                use futures_util::StreamExt;
+                while let Some(ev) = stream.next().await {
+                    if tx.send(ev).await.is_err() {
+                        break; // client disconnected
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(Ok(Event::default()
+                        .data(
+                            serde_json::json!({ "error": {
+                                "message": format!("backend request failed: {}", e),
+                                "type": "backend_error",
+                            }})
+                            .to_string(),
+                        )
+                        .event("error")))
+                    .await;
+            }
+        }
+    });
+
+    use futures_util::StreamExt;
+    tokio_stream::wrappers::ReceiverStream::new(rx).boxed()
+}
+
+/// Map an `AcquireError` to an SSE error body for the streaming path, so a
+/// streaming request that couldn't acquire a slot (blocked / 429 / spawn
+/// failed) still surfaces the failure to the client as an in-band event.
+fn acquire_error_sse(model_name: &str, e: AcquireError) -> String {
+    let (message, etype) = match e {
+        AcquireError::Blocked => (
+            format!("model '{}' is blocked", model_name),
+            "model_blocked",
+        ),
+        AcquireError::NoCapacity => (
+            format!("model '{}' is at capacity and the queue is full", model_name),
+            "no_capacity",
+        ),
+        AcquireError::Unavailable => (
+            format!(
+                "model '{}' is unavailable (spawn failed or instances retiring — see server logs)",
+                model_name
+            ),
+            "model_unavailable",
+        ),
+    };
+    serde_json::json!({ "error": { "message": message, "type": etype } }).to_string()
 }
 
 /// Build an SSE stream that forwards chunks from the backend to the client.

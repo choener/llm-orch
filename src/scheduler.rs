@@ -298,6 +298,12 @@ pub struct InstanceManager {
     /// Spawn readiness timeout.
     spawn_timeout: Duration,
 
+    /// Global interval (seconds) between loading-indicator dots sent to
+    /// streaming clients while a backend instance is being acquired.
+    /// `0` disables globally.  Stored from `server.loading_dots`; the
+    /// per-model override is applied in `loading_dots_interval`.
+    loading_dots_interval_secs: AtomicU64,
+
     /// Per-model EMA metrics (load & request rate).
     model_metrics: RwLock<HashMap<String, ModelMetrics>>,
 
@@ -405,6 +411,7 @@ impl InstanceManager {
             keepalive: RwLock::new(keepalive),
             crash_limit: 3,
             spawn_timeout: Duration::from_secs(120),
+            loading_dots_interval_secs: AtomicU64::new(config.server.loading_dots.unwrap_or(0)),
             model_metrics: RwLock::new(HashMap::new()),
             spawn_semaphore: Arc::new(Semaphore::new(1)),
             last_scale_action: RwLock::new(HashMap::new()),
@@ -559,6 +566,29 @@ impl InstanceManager {
             Ok(())
         } else {
             Err(AcquireError::Unavailable)
+        }
+    }
+
+    /// Effective loading-indicator interval for `model_name`, after applying
+    /// the per-model override (`models[].loading_dots`) on top of the global
+    /// `server.loading_dots` setting.
+    ///
+    /// Returns `None` when the feature is disabled (either globally `0` /
+    /// `None`, or the per-model override is `0`).
+    pub fn loading_dots_interval(&self, model_name: &str) -> Option<Duration> {
+        let global = self.loading_dots_interval_secs.load(Ordering::Relaxed);
+        if global == 0 {
+            // Global disabled — per-model override can't re-enable.
+            return None;
+        }
+        let cfg = self.model_configs.read().unwrap();
+        match cfg.get(model_name) {
+            Some(m) => match m.loading_dots {
+                Some(0) => None,                            // per-model override silences dots
+                Some(n) => Some(Duration::from_secs(n)),    // per-model override
+                None => Some(Duration::from_secs(global)),  // inherit global
+            },
+            None => None, // model unknown
         }
     }
 
@@ -1713,6 +1743,10 @@ impl InstanceManager {
             .lock()
             .await
             .set_range(config.server.port_range.clone());
+        self.loading_dots_interval_secs.store(
+            config.server.loading_dots.unwrap_or(0),
+            Ordering::Relaxed,
+        );
 
         // ── Keep-alive: rebuild when the config changed ──────────────
         let rebuild = match &*self.keepalive.read().unwrap() {

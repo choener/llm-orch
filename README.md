@@ -12,6 +12,7 @@
 - **API Key Authentication**: Simple, file-based API key management with hot-reload support.
 - **Multi-GPU Support**: Supports models that span multiple GPUs by coordinating tensor splits across specified devices.
 - **Model Aliasing**: Create aliases for models with optional system prompt injections for different use cases.
+- **Loading Indicators**: Optional SSE keep-alive dots during model loads prevent client-side timeouts on streaming requests.
 
 ## 🏗 Architecture
 
@@ -69,6 +70,27 @@ In `config.yaml`, each model definition controls its lifecycle:
 - `vram`: Declared VRAM usage in MB used by the scheduler to pick a GPU.
 - `idle_ttl`: Seconds to keep the model loaded after the last request.
 - `vulkan_devices`: The pool of GPU indices this model is allowed to use.
+
+### Loading Indicators (Loading Dots)
+Large models can take a minute or more to load. During this time, streaming SSE responses are silent — which can cause downstream clients (e.g. LLM coding harnesses) to time out and abort the connection, triggering a retry that spawns the model twice.
+
+The `loading_dots` feature sends periodic `.` keep-alive events (as SSE comment lines, which clients ignore) while a backend instance is being acquired, preventing premature timeouts:
+
+```yaml
+server:
+  loading_dots: 1  # emit a dot every 1 second (0 or absent = disabled)
+
+models:
+  - name: "qwen3-32b"
+    # ...
+    loading_dots: 0  # per-model override: silence dots for this model
+```
+
+- **Global** (`server.loading_dots`): the dot interval in seconds. Absent or `0` disables the feature entirely.
+- **Per-model** (`models[].loading_dots`): `Some(n)` overrides the global interval for that model; `Some(0)` silences dots for that model even when globally enabled; absent inherits the global setting.
+- Dots apply only to **streaming** requests, and only while the request is actually waiting for a slot — during model load/spawn *or* when queued behind a busy model. If a ready instance is available, the request is forwarded immediately with no dots.
+- Dots appear in the SSE stream as comment events (`: .`) and a final `: <model> loaded` summary once a slot is acquired. They are never part of the model's conversation context.
+- The feature reuses the normal instance-acquisition/queueing path (`queue_depth`, 429, autoscale all still apply) — it is purely a keep-alive layer on top of that same wait.
 
 ### CUDA (NVIDIA) devices
 Device placement works for NVIDIA GPUs with full parity to the Vulkan path:
