@@ -56,6 +56,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/info", get(handlers::info_endpoint))
         .route("/v1/chat/completions", post(handlers::chat_completions))
         .route("/v1/responses", post(handlers::responses))
+        .route(
+            "/v1/responses/input_tokens",
+            post(handlers::responses_input_tokens),
+        )
         .route("/v1/completions", post(handlers::completions))
         .route("/v1/embeddings", post(handlers::embeddings))
         .route("/v1/rerank", post(handlers::rerank))

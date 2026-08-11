@@ -645,6 +645,151 @@ pub async fn responses(
     }.instrument(span).await
 }
 
+// ── /v1/responses/input_tokens ────────────────────────────────────────────────
+
+/// `POST /v1/responses/input_tokens` — Responses API token counting
+/// (pass-through, non-streaming only).
+///
+/// Same routing/alias pattern as `responses`, but aggregated only — the
+/// endpoint returns a small JSON object (`{object, input_tokens}`).
+pub async fn responses_input_tokens(
+    State(state): State<AppState>,
+    key: ApiKey,
+    Json(mut request): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let requested_model = request
+        .get("model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("missing or invalid 'model' field".into()))?
+        .to_string();
+    let span = tracing::info_span!(
+        "responses_input_tokens",
+        id = %request_id,
+        model = %requested_model,
+    );
+    async {
+    // ── 1. Resolve alias. ───────────────────────────────────────────────
+    let (model_name, alias_system_prompt, alias_prompt_template) = {
+        let cfg = state.config.read().await;
+        resolve_alias(&cfg.aliases, &requested_model)
+    };
+
+    // Inject alias prompts so the count matches a real `responses` call.
+    apply_alias_prompts_responses(&mut request, alias_system_prompt, alias_prompt_template);
+
+    // ── 2. Verify model exists; extract debug_log and the timeout. ──────
+    let (debug_log_path, total_timeout): (Option<std::path::PathBuf>, _) = {
+        let cfg = state.config.read().await;
+        let total = std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs);
+        match cfg.models.iter().find(|m| m.name == model_name) {
+            Some(m) => (m.debug_log.clone(), total),
+            None => return Err(ApiError::ModelNotFound(model_name)),
+        }
+    };
+
+    // ── 3. Acquire instance slot. ───────────────────────────────────────
+    let guard = state
+        .manager
+        .get_or_spawn(&model_name)
+        .await
+        .map_err(|e| acquire_error(&model_name, e))?;
+
+    let instance_id = {
+        let inst = guard.handle().inner().lock().unwrap();
+        inst.id.clone()
+    };
+
+    // ── 4. Read port. ───────────────────────────────────────────────────
+    let port = {
+        let inst = guard.handle().inner().lock().unwrap();
+        inst.port
+    };
+
+    let backend_url = format!("http://127.0.0.1:{}/v1/responses/input_tokens", port);
+
+    // Forward the *resolved* model name to the backend, not the alias.
+    request["model"] = serde_json::Value::String(model_name.clone());
+
+    // Debug log: request (exact body being forwarded).
+    if let Some(ref log_path) = debug_log_path {
+        state.debug_loggers.write_line(log_path, &DebugLogEntry {
+            ts: ts_now(),
+            request_id: request_id.clone(),
+            model: model_name.clone(),
+            alias: Some(requested_model.clone()),
+            instance_id: Some(instance_id.clone()),
+            dir: "request".into(),
+            stream: Some(false),
+            body: Some(request.clone()),
+            usage: None,
+            duration_ms: None,
+            error: None,
+        });
+    }
+
+    // ── 5. Forward request, aggregate, release. ─────────────────────────
+    let t0 = std::time::Instant::now();
+    let response_body = forward_request_aggregate(
+        &state.client,
+        &backend_url,
+        &request,
+        total_timeout,
+    )
+    .await?;
+    let elapsed = t0.elapsed();
+
+    // Debug log: response.
+    if let Some(ref log_path) = debug_log_path {
+        state.debug_loggers.write_line(log_path, &DebugLogEntry {
+            ts: ts_now(),
+            request_id: request_id.clone(),
+            model: model_name.clone(),
+            alias: Some(requested_model),
+            instance_id: Some(instance_id.clone()),
+            dir: "response".into(),
+            stream: Some(false),
+            body: Some(response_body.clone()),
+            usage: None,
+            duration_ms: Some(elapsed.as_millis() as u64),
+            error: None,
+        });
+    }
+
+    // Record in per-model ring buffer for /admin/status.
+    // Token counting carries only input tokens — no generation.
+    let input_tokens = response_body
+        .pointer("/input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    state.manager.record_completion(
+        &model_name,
+        crate::types::CompletionRecord {
+            ts: crate::debug_log::ts_now(),
+            request_id: request_id.clone(),
+            instance_id: instance_id.clone(),
+            api_user: key.label.clone(),
+            prompt_tokens: input_tokens,
+            generated_tokens: 0,
+            cached_tokens: 0,
+            duration_ms: elapsed.as_millis() as u64,
+        },
+    );
+
+    info!(
+        "id={} model={} inst={} input_tokens={} server_ms={}",
+        request_id,
+        model_name,
+        instance_id,
+        input_tokens,
+        elapsed.as_millis()
+    );
+
+    Ok(Json(response_body))
+    }.instrument(span).await
+}
+
 // ── /v1/completions ──────────────────────────────────────────────────────────
 
 /// `POST /v1/completions` — legacy (non-chat) completions endpoint.
