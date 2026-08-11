@@ -430,6 +430,221 @@ pub async fn chat_completions(
     }.instrument(span).await
 }
 
+// ── /v1/responses ────────────────────────────────────────────────────────────
+
+/// `POST /v1/responses` — OpenAI Responses API (pass-through).
+///
+/// llama.cpp (≥ b8126) implements `/v1/responses` natively — it converts the
+/// request to chat completions internally — so this handler is a thin
+/// pass-through over the same machinery as `chat_completions`:
+/// - Alias resolution (system prompt → `instructions`, prompt template →
+///   last user input)
+/// - Model resolution; the *resolved* model name is forwarded, not the alias
+/// - Instance management (spawn or reuse)
+/// - SSE streaming or aggregated response
+///
+/// The body is handled as a raw `serde_json::Value` so current and future
+/// Responses API fields pass through to the backend untouched.
+///
+/// # Send safety
+/// Same pattern as `chat_completions` — no lock guard crosses an `.await`.
+pub async fn responses(
+    State(state): State<AppState>,
+    key: ApiKey,
+    Json(mut request): Json<serde_json::Value>,
+) -> Result<Response, ApiError> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let requested_model = request
+        .get("model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("missing or invalid 'model' field".into()))?
+        .to_string();
+    let stream_requested = request
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let span = tracing::info_span!(
+        "responses",
+        id = %request_id,
+        model = %requested_model,
+    );
+    async {
+    // ── 1. Resolve alias → underlying model. ────────────────────────────
+    let (model_name, alias_system_prompt, alias_prompt_template) = {
+        let cfg = state.config.read().await;
+        resolve_alias(&cfg.aliases, &requested_model)
+    }; // cfg read guard dropped — future is `Send`
+
+    debug!(
+        request_model = %requested_model,
+        resolved_model = %model_name,
+        has_system_prompt = alias_system_prompt.is_some(),
+        "resolved model"
+    );
+
+    // ── 2. Apply alias prompt injection (instructions / input). ─────────
+    //    Pure computation — no locks involved.
+    apply_alias_prompts_responses(&mut request, alias_system_prompt, alias_prompt_template);
+
+    // ── 3. Verify the model exists; extract debug_log and timeouts. ─────
+    let (debug_log_path, idle_timeout, total_timeout): (Option<std::path::PathBuf>, _, _) = {
+        let cfg = state.config.read().await;
+        let idle = std::time::Duration::from_secs(cfg.server.backend_idle_timeout_secs);
+        let total = std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs);
+        match cfg.models.iter().find(|m| m.name == model_name) {
+            Some(m) => (m.debug_log.clone(), idle, total),
+            None => return Err(ApiError::ModelNotFound(model_name)),
+        }
+    }; // cfg read guard dropped
+
+    // ── 4. Acquire an instance slot (or queue). ─────────────────────────
+    let guard = state
+        .manager
+        .get_or_spawn(&model_name)
+        .await
+        .map_err(|e| acquire_error(&model_name, e))?;
+
+    // Capture instance ID now that we hold the slot guard.
+    let instance_id = {
+        let inst = guard.handle().inner().lock().unwrap();
+        inst.id.clone()
+    }; // inner lock dropped — `guard` itself is still alive
+
+    // ── 5. Read the port from the instance. ─────────────────────────────
+    let port = {
+        let inst = guard.handle().inner().lock().unwrap();
+        inst.port
+    }; // inner lock dropped
+
+    let backend_url = format!("http://127.0.0.1:{}/v1/responses", port);
+
+    // ── 6. Forward the *resolved* model name to the backend, not the
+    //    alias — strict backends validate the model field. ───────────────
+    request["model"] = serde_json::Value::String(model_name.clone());
+
+    // Debug log: request (exact body being forwarded).
+    if let Some(ref log_path) = debug_log_path {
+        state.debug_loggers.write_line(log_path, &DebugLogEntry {
+            ts: ts_now(),
+            request_id: request_id.clone(),
+            model: model_name.clone(),
+            alias: Some(requested_model.clone()),
+            instance_id: Some(instance_id.clone()),
+            dir: "request".into(),
+            stream: Some(stream_requested),
+            body: Some(request.clone()),
+            usage: None,
+            duration_ms: None,
+            error: None,
+        });
+    }
+
+    if stream_requested {
+        // Streaming mode: forward the backend's Responses SSE events.
+        // The `SlotGuard` is moved into the stream wrapper so the
+        // in-flight slot is released when the stream ends (Drop).
+        info!("stream start model={} inst={}", model_name, instance_id);
+        let debug_ctx = debug_log_path.map(|path| DebugStreamContext {
+            loggers: state.debug_loggers.clone(),
+            path,
+            request_id: request_id.clone(),
+            model_name: model_name.clone(),
+            alias: Some(requested_model.clone()),
+            instance_id: instance_id.clone(),
+            t0: std::time::Instant::now(),
+        });
+        let stream = build_sse_stream(
+            state.client.clone(),
+            backend_url,
+            request,
+            guard,
+            model_name.clone(),
+            instance_id.clone(),
+            debug_ctx,
+            state.manager.clone(),
+            key.label.clone(),
+            request_id.clone(),
+            idle_timeout,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
+
+        Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
+    } else {
+        // Non-streaming mode: aggregate the backend response.
+        let t0 = std::time::Instant::now();
+        let response_body = forward_request_aggregate(
+            &state.client,
+            &backend_url,
+            &request,
+            total_timeout,
+        )
+        .await?;
+        let elapsed = t0.elapsed();
+
+        // Debug log: response.
+        if let Some(ref log_path) = debug_log_path {
+            let usage = response_body.pointer("/usage").cloned();
+            state.debug_loggers.write_line(log_path, &DebugLogEntry {
+                ts: ts_now(),
+                request_id: request_id.clone(),
+                model: model_name.clone(),
+                alias: Some(requested_model),
+                instance_id: Some(instance_id.clone()),
+                dir: "response".into(),
+                stream: Some(false),
+                body: Some(response_body.clone()),
+                usage,
+                duration_ms: Some(elapsed.as_millis() as u64),
+                error: None,
+            });
+        }
+
+        // Responses API usage shape: input_tokens / output_tokens.
+        let prompt_tokens = response_body
+            .pointer("/usage/input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let gen_tokens = response_body
+            .pointer("/usage/output_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let cached_tokens = response_body
+            .pointer("/usage/input_tokens_details/cached_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        info!(
+            "id={} model={} inst={} prompt={} generated={} server_ms={}",
+            response_body.get("id").and_then(|v| v.as_str()).unwrap_or("-"),
+            model_name,
+            instance_id,
+            prompt_tokens,
+            gen_tokens,
+            elapsed.as_millis()
+        );
+
+        // Record in per-model ring buffer for /admin/status.
+        state.manager.record_completion(
+            &model_name,
+            crate::types::CompletionRecord {
+                ts: crate::debug_log::ts_now(),
+                request_id: request_id.clone(),
+                instance_id: instance_id.clone(),
+                api_user: key.label.clone(),
+                prompt_tokens,
+                generated_tokens: gen_tokens,
+                cached_tokens,
+                duration_ms: elapsed.as_millis() as u64,
+            },
+        );
+
+        Ok(Json(response_body).into_response())
+    }
+    }.instrument(span).await
+}
+
 // ── /v1/completions ──────────────────────────────────────────────────────────
 
 /// `POST /v1/completions` — legacy (non-chat) completions endpoint.
@@ -949,6 +1164,70 @@ fn apply_alias_prompts(
                 let rendered = tmpl.replace("{prompt}", text);
                 last_user.content = Some(MessageContent::Text(rendered));
             }
+        }
+    }
+}
+
+/// Apply alias system prompt and/or prompt template injection to a
+/// Responses API request body (`/v1/responses`).
+///
+/// - `system_prompt` becomes the `instructions` field — but only when the
+///   request doesn't already carry non-empty instructions (mirrors the chat
+///   completions rule of not overriding an existing system message).
+/// - `prompt_template` is applied to the last user input: a string `input`,
+///   or the last `input_text` part of the last `role:"user"` message item.
+///   Shapes we don't understand are left untouched (debug-logged).
+fn apply_alias_prompts_responses(
+    request: &mut serde_json::Value,
+    system_prompt: Option<String>,
+    prompt_template: Option<String>,
+) {
+    if let Some(sp) = system_prompt {
+        let has_instructions = request
+            .get("instructions")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        if !has_instructions {
+            request["instructions"] = serde_json::Value::String(sp);
+        }
+    }
+
+    if let Some(tmpl) = prompt_template {
+        match request.get_mut("input") {
+            Some(serde_json::Value::String(text)) => {
+                *text = tmpl.replace("{prompt}", text);
+            }
+            Some(serde_json::Value::Array(items)) => {
+                // Both the shorthand (`{"role":"user","content":"…"}`) and
+                // the item form (`{"type":"message","role":"user","content":[
+                // {"type":"input_text","text":"…"}]}`) carry a `role` field.
+                if let Some(item) = items
+                    .iter_mut()
+                    .rev()
+                    .find(|it| it.get("role").and_then(|r| r.as_str()) == Some("user"))
+                {
+                    match item.get_mut("content") {
+                        Some(serde_json::Value::String(text)) => {
+                            *text = tmpl.replace("{prompt}", text);
+                        }
+                        Some(serde_json::Value::Array(parts)) => {
+                            if let Some(part) = parts.iter_mut().rev().find(|p| {
+                                p.get("type").and_then(|t| t.as_str()) == Some("input_text")
+                            }) {
+                                if let Some(serde_json::Value::String(text)) = part.get_mut("text")
+                                {
+                                    *text = tmpl.replace("{prompt}", text);
+                                }
+                            }
+                        }
+                        _ => debug!(
+                            "responses alias: prompt_template skipped — unsupported content shape"
+                        ),
+                    }
+                }
+            }
+            _ => debug!("responses alias: prompt_template skipped — no usable input"),
         }
     }
 }

@@ -55,6 +55,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/info", get(handlers::info_endpoint))
         .route("/v1/chat/completions", post(handlers::chat_completions))
+        .route("/v1/responses", post(handlers::responses))
         .route("/v1/completions", post(handlers::completions))
         .route("/v1/embeddings", post(handlers::embeddings))
         .route("/v1/rerank", post(handlers::rerank))
@@ -122,6 +123,9 @@ pub enum ApiError {
     #[error("unauthorized")]
     Unauthorized,
 
+    #[error("bad request: {0}")]
+    BadRequest(String),
+
     #[error("model not found: {0}")]
     ModelNotFound(String),
 
@@ -145,6 +149,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match &self {
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
+            ApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             ApiError::ModelNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             ApiError::ModelBlocked(_) => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             ApiError::ModelUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
