@@ -71,6 +71,26 @@ in
       '';
     };
 
+    nvidiaPackage = lib.mkOption {
+      type = lib.types.nullOr lib.types.package;
+      default =
+        if lib.any (d: lib.hasPrefix "nvidia" d) config.services.xserver.videoDrivers
+        then config.hardware.nvidia.package.bin
+        else null;
+      defaultText = lib.literalExpression ''
+        if NVIDIA is in services.xserver.videoDrivers:
+          config.hardware.nvidia.package.bin
+        else null
+      '';
+      description = ''
+        NVIDIA driver userspace package providing `nvidia-smi`, added to
+        the service's PATH on CUDA hosts. Without it, GPU metrics degrade
+        to static `vram_mb` totals from the config (a warning is logged
+        once). The default uses the exact driver version loaded by the
+        kernel. Set to `null` to opt out.
+      '';
+    };
+
     extraPackages = lib.mkOption {
       type = lib.types.listOf lib.types.package;
       default = [ ];
@@ -97,7 +117,18 @@ in
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
 
-      path = lib.optional (cfg.llamaPackage != null) cfg.llamaPackage ++ cfg.extraPackages;
+      # bash provides `sh` and coreutils `cat` — both are required by the
+      # keep-alive mechanism (`sh -c <cmd>`, default cmd reads
+      # gpu_busy_percent via cat). Without them on PATH the keep-alive
+      # spawn fails with ENOENT: NixOS replaces the unit PATH entirely once
+      # `path` is non-empty, and llama-cpp's bin dir has no shell.
+      path =
+        [ pkgs.runtimeShellPackage pkgs.coreutils ]
+        ++ lib.optional (cfg.llamaPackage != null) cfg.llamaPackage
+        # nvidia-smi (live VRAM metrics on CUDA hosts): the driver bin
+        # output is only on PATH when NVIDIA was detected on the host.
+        ++ lib.optional (cfg.nvidiaPackage != null) cfg.nvidiaPackage
+        ++ cfg.extraPackages;
 
       serviceConfig = {
         User = cfg.user;
