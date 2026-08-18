@@ -1,0 +1,16 @@
+{
+  "host": "127.0.0.1",
+  "port": 9000,
+  "backend": "vulkan",
+  "threads": 1,
+  "lazy_load": false,
+  "models": [
+    {
+      "id": "qwen3-tts",
+      "family": "qwen3_tts",
+      "path": "/models/Qwen3-TTS",
+      "task": "tts",
+      "mode": "offline"
+    }
+  ]
+}

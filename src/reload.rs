@@ -67,10 +67,7 @@ pub async fn handle_config_reload(
             // Record the mtime only on success — a rejected or failed
             // reload must be retried on the next file event, not consumed.
             *last_mtime.lock().await = Some(mtime);
-            info!(
-                "config reloaded successfully — {} model(s)",
-                model_count
-            );
+            info!("config reloaded successfully — {} model(s)", model_count);
         }
         Err(e) => {
             error!("config reload rejected (keeping old): {}", e);

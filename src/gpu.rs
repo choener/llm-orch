@@ -17,7 +17,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::time::{interval, Duration};
+use tokio::time::{Duration, interval};
 use tracing::warn;
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -202,9 +202,7 @@ fn read_pci_slot(device: &Path) -> String {
 /// Read the contents of a single-file sysfs node as a trimmed `String`.
 fn read_file(device: &Path, name: &str) -> Option<String> {
     let path = device.join(name);
-    fs::read_to_string(&path)
-        .map(|s| s.trim().to_string())
-        .ok()
+    fs::read_to_string(&path).map(|s| s.trim().to_string()).ok()
 }
 
 /// Read a numeric sysfs node as `u64`.
@@ -279,10 +277,8 @@ mod tests {
                 if line.contains('*') {
                     if let Some(colon) = line.find(':') {
                         let after = &line[colon + 1..].trim();
-                        let num: String = after
-                            .chars()
-                            .take_while(|c| c.is_ascii_digit())
-                            .collect();
+                        let num: String =
+                            after.chars().take_while(|c| c.is_ascii_digit()).collect();
                         val = Some(num.parse().unwrap());
                         break;
                     }

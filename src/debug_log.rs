@@ -47,10 +47,7 @@ impl DebugLoggers {
         let writer = {
             // Recover from poisoning: one panicking request must not
             // disable debug logging for every later request.
-            let mut writers = self
-                .writers
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let mut writers = self.writers.lock().unwrap_or_else(PoisonError::into_inner);
             match writers.entry(path.to_path_buf()) {
                 std::collections::hash_map::Entry::Occupied(e) => Some(e.get().clone()),
                 std::collections::hash_map::Entry::Vacant(e) => {
@@ -189,7 +186,11 @@ mod tests {
     }
 
     fn temp_log_path(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("llm-orch-debug-log-test-{}-{}", tag, uuid::Uuid::new_v4()))
+        std::env::temp_dir().join(format!(
+            "llm-orch-debug-log-test-{}-{}",
+            tag,
+            uuid::Uuid::new_v4()
+        ))
     }
 
     #[test]
@@ -215,7 +216,9 @@ mod tests {
         // A misconfigured path (parent directory does not exist) must drop
         // the entry with a warning, not panic — this runs from
         // `SseForwarder::drop`, where a panic would poison shared mutexes.
-        let path = temp_log_path("missing-parent").join("no-such-dir").join("x.jsonl");
+        let path = temp_log_path("missing-parent")
+            .join("no-such-dir")
+            .join("x.jsonl");
         let loggers = DebugLoggers::new();
         loggers.write_line(&path, &test_entry());
         // Retried on the next call (failure is not cached) — still no panic.

@@ -79,10 +79,16 @@ impl ApikeysStore {
                 });
             }
             if !seen_labels.insert(label.clone()) {
-                return Err(ApikeysError::DuplicateLabel { label, line: line_num });
+                return Err(ApikeysError::DuplicateLabel {
+                    label,
+                    line: line_num,
+                });
             }
             if keys.contains_key(&key) {
-                return Err(ApikeysError::DuplicateKey { label, line: line_num });
+                return Err(ApikeysError::DuplicateKey {
+                    label,
+                    line: line_num,
+                });
             }
 
             keys.insert(key, label);

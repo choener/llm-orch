@@ -88,12 +88,12 @@ impl Backend for LlamaCppBackend {
 
 // ── Process helpers (shared) ─────────────────────────────────────────────────
 
+use crate::instance::InstanceHandle;
+use reqwest::Client;
 use std::collections::VecDeque;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use reqwest::Client;
-use crate::instance::InstanceHandle;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::debug;
 
@@ -113,13 +113,8 @@ pub fn output_lines(buf: &OutputBuffer) -> Vec<String> {
 }
 
 /// Forward one stream's lines to `tracing::debug!` and the ring buffer.
-fn pipe_output<S>(
-    stream: S,
-    stream_name: &'static str,
-    model: String,
-    port: u16,
-    buf: OutputBuffer,
-) where
+fn pipe_output<S>(stream: S, stream_name: &'static str, model: String, port: u16, buf: OutputBuffer)
+where
     S: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
@@ -321,8 +316,7 @@ mod tests {
         let backend = LlamaCppBackend::default();
 
         let t0 = std::time::Instant::now();
-        let outcome =
-            poll_readiness(&handle, &client, &backend, Duration::from_secs(30)).await;
+        let outcome = poll_readiness(&handle, &client, &backend, Duration::from_secs(30)).await;
         assert_eq!(outcome, ReadyOutcome::ChildExited);
         assert!(
             t0.elapsed() < Duration::from_secs(5),
@@ -360,7 +354,9 @@ mod tests {
     async fn poll_readiness_times_out_for_unresponsive_backend() {
         // A live child that never serves /health must time out, not be
         // mistaken for a crash.
-        let (child, _out) = spawn_process("sleep", &["30".into()], &[], "test", 0).await.unwrap();
+        let (child, _out) = spawn_process("sleep", &["30".into()], &[], "test", 0)
+            .await
+            .unwrap();
         let mut inst = Instance::new("m", vec![], 9, None);
         inst.child = Some(child);
         let handle = InstanceHandle::new(inst);
@@ -370,8 +366,7 @@ mod tests {
             .unwrap();
         let backend = LlamaCppBackend::default();
 
-        let outcome =
-            poll_readiness(&handle, &client, &backend, Duration::from_millis(600)).await;
+        let outcome = poll_readiness(&handle, &client, &backend, Duration::from_millis(600)).await;
         assert_eq!(outcome, ReadyOutcome::TimedOut);
     }
 }

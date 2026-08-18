@@ -42,6 +42,9 @@ clap = { version = "4", features = ["derive"] }
 # Byte buffers for streaming
 bytes = "1"
 
+# Base64 (audio payloads in the stub backend)
+base64 = "0.22"
+
 # Stream utilities
 futures-util = "0.3"
 tokio-stream = "0.1"

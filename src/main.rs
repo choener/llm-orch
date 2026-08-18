@@ -2,7 +2,7 @@ use clap::Parser;
 use llm_orch::{apikeys, config, debug_log, gpu, keepalive, reload, scheduler, server, watcher};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -28,8 +28,7 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Tracing ────────────────────────────────────────────────────────
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     if std::env::var("LLM_ORCH_LOG_JSON").is_ok() {
         tracing_subscriber::fmt()
@@ -37,9 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_env_filter(env_filter)
             .init();
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .init();
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
     }
 
     let cli = Cli::parse();
@@ -99,18 +96,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("gpu metrics reader started");
 
     // 4. Create GPU keep-alive manager.
-    let keepalive = keepalive::KeepAliveManager::new(&cfg.keep_alive)
-        .map(Arc::new);
+    let keepalive = keepalive::KeepAliveManager::new(&cfg.keep_alive).map(Arc::new);
     if keepalive.is_some() {
         info!("keep-alive configured");
     }
 
     // 5. Create the instance manager.
-    let (manager, release_rx, crash_rx) = scheduler::InstanceManager::new(
-        &cfg,
-        Arc::clone(&gpu_snapshot),
-        keepalive,
-    );
+    let (manager, release_rx, crash_rx) =
+        scheduler::InstanceManager::new(&cfg, Arc::clone(&gpu_snapshot), keepalive);
     let manager = Arc::new(manager);
     info!("instance manager ready");
 
@@ -231,11 +224,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // instead of silently killing hot-reload for the rest
                     // of the process lifetime.
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(skipped = n, "reload events lagged — resyncing watched files");
+                        warn!(
+                            skipped = n,
+                            "reload events lagged — resyncing watched files"
+                        );
                         reload::handle_config_reload(
-                            &config_path, &cfg, &apikeys, &manager, &last_mtime,
-                        ).await;
-                        reload::handle_apikeys_reload(&watched_apikeys, &apikeys, &last_ak_mtime).await;
+                            &config_path,
+                            &cfg,
+                            &apikeys,
+                            &manager,
+                            &last_mtime,
+                        )
+                        .await;
+                        reload::handle_apikeys_reload(&watched_apikeys, &apikeys, &last_ak_mtime)
+                            .await;
                         continue;
                     }
                     // All senders dropped — watcher is gone (shutdown).
@@ -250,8 +252,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match (&changed, &cfg_p) {
                     (Some(c), Some(canon)) if c == canon => {
                         reload::handle_config_reload(
-                            &event.path, &cfg, &apikeys, &manager, &last_mtime,
-                        ).await;
+                            &event.path,
+                            &cfg,
+                            &apikeys,
+                            &manager,
+                            &last_mtime,
+                        )
+                        .await;
                     }
                     _ => {}
                 }
@@ -305,11 +312,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wait for shutdown signal.
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut sigint = signal(SignalKind::interrupt())
-            .expect("failed to register SIGINT handler");
-        let mut sigterm = signal(SignalKind::terminate())
-            .expect("failed to register SIGTERM handler");
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigint =
+            signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
         tokio::select! {
             _ = sigint.recv() => info!("received SIGINT"),
             _ = sigterm.recv() => info!("received SIGTERM"),

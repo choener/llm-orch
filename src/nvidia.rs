@@ -89,7 +89,11 @@ pub fn parse_csv(output: &str) -> Vec<GpuMetrics> {
 fn parse_row(index: usize, line: &str) -> Option<GpuMetrics> {
     let cols: Vec<&str> = line.split(',').map(str::trim).collect();
     if cols.len() < 8 {
-        debug!("nvidia-smi row has {} columns (expected 8): {:?}", cols.len(), line);
+        debug!(
+            "nvidia-smi row has {} columns (expected 8): {:?}",
+            cols.len(),
+            line
+        );
         return None;
     }
 

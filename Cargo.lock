@@ -833,6 +833,7 @@ name = "llm-orch"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "bytes",
  "clap",
  "futures-util",

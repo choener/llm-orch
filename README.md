@@ -107,6 +107,30 @@ aliases:
 ```
 When a client requests the `coder` model, `llm-orch` routes it to `deepseek-coder-7b` and injects the system prompt.
 
+### Audio models (audio.cpp)
+`llm-orch` can front [audio.cpp](https://github.com/0xShug0/audio.cpp) (`audiocpp_server`) for TTS and speech-to-text, exposing the OpenAI-compatible endpoints `POST /v1/audio/speech`, `POST /v1/audio/transcriptions` (JSON and multipart), and `GET /v1/audio/voices`. Audio models are regular models: spawned on demand (one `audiocpp_server` process per model), evicted after `idle_ttl`, queued under load, and authenticated like everything else.
+
+Setup:
+1. **Author one `server.json` per audio model** (see `config.example-audiocpp.json`). The model `id` **must equal** the llm-orch model name — audiocpp validates the request's `model` field against it. Recommend `lazy_load: false` so llm-orch's `/health`-based readiness means the model is actually loaded. `host`/`port` in the file are placeholders; llm-orch overrides them at spawn time.
+2. **Download model weights with audio.cpp's own tooling** (`tools/model_manager_v2.py` or its WebUI) — llm-orch does not manage audio model files.
+3. **Add the `audiocpp` cmd alias and the model** (see `config.example.yaml`):
+```yaml
+cmd_aliases:
+  audiocpp: |
+    audiocpp_server
+      --config /etc/llm-orch/audio/{name}.json
+      --host 127.0.0.1
+      --port {port}
+      --backend vulkan
+models:
+  - name: "qwen3-tts"          # == id in /etc/llm-orch/audio/qwen3-tts.json
+    max_concurrent: 1          # audiocpp serializes requests per model
+    vram: 4000
+    idle_ttl: 300
+    cmd: "{audiocpp}"
+```
+`context_length` may be omitted for audio models. Responses are forwarded with the backend's Content-Type intact: WAV bytes, base64 JSON, SSE streams (TTS deltas, transcript deltas), or raw PCM all work; `stream=true` multipart transcriptions stream SSE. The bidirectional `/v1/audio/transcriptions/live` ingest endpoint is not proxied yet.
+
 ## ❄️ NixOS Module
 
 The flake exports `nixosModules.llm-orch` (also aliased as `nixosModules.default`), which runs llm-orch as a hardened systemd service:

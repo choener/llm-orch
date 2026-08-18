@@ -66,7 +66,9 @@ impl Config {
         let mut seen_names = HashSet::new();
         for m in &self.models {
             if m.name.is_empty() {
-                return Err(ConfigError::Validation("model name must not be empty".into()));
+                return Err(ConfigError::Validation(
+                    "model name must not be empty".into(),
+                ));
             }
             if !seen_names.insert(&m.name) {
                 return Err(ConfigError::Validation(format!(
@@ -161,7 +163,7 @@ impl Config {
         }
 
         // --- cmd_aliases ---
-        for reserved in ["port", "context_length"] {
+        for reserved in ["port", "context_length", "name"] {
             if self.cmd_aliases.contains_key(reserved) {
                 return Err(ConfigError::Validation(format!(
                     "cmd_aliases: '{}' is a reserved name",
@@ -211,10 +213,7 @@ impl Config {
         // --- devices ---
         if let Some(ref devs) = self.devices {
             let pci_slots = list_pci_slots();
-            let existing_slots: HashSet<&str> = pci_slots
-                .iter()
-                .map(|s| s.as_str())
-                .collect();
+            let existing_slots: HashSet<&str> = pci_slots.iter().map(|s| s.as_str()).collect();
             for (idx, slot) in &devs.vulkan {
                 if !existing_slots.contains(slot.as_str()) {
                     return Err(ConfigError::Validation(format!(
@@ -374,6 +373,10 @@ pub struct ModelConfig {
     pub name: String,
 
     /// Maximum context length (tokens).
+    /// Meaningless for non-LLM backends (e.g. audio.cpp TTS/ASR models),
+    /// which may omit it; only used for `{context_length}` cmd substitution
+    /// and `/v1/models` metadata.
+    #[serde(default = "default_context_length")]
     pub context_length: usize,
 
     /// Maximum number of backend instances of this model across all GPUs.
@@ -465,6 +468,9 @@ impl ModelConfig {
     }
 }
 
+fn default_context_length() -> usize {
+    4096
+}
 fn default_max_instances() -> usize {
     1
 }
@@ -511,9 +517,15 @@ pub struct AutoscaleConfig {
     pub cooldown_secs: u64,
 }
 
-fn default_autoscale_up() -> f64 { 0.7 }
-fn default_autoscale_down() -> f64 { 0.4 }
-fn default_autoscale_cooldown() -> u64 { 120 }
+fn default_autoscale_up() -> f64 {
+    0.7
+}
+fn default_autoscale_down() -> f64 {
+    0.4
+}
+fn default_autoscale_cooldown() -> u64 {
+    120
+}
 
 // ---------------------------------------------------------------------------
 // Device mapping
@@ -576,7 +588,9 @@ fn list_pci_slots() -> Vec<String> {
 
 /// Check whether a PCI slot name exists under `/sys/bus/pci/devices/`.
 fn pci_slot_exists(slot: &str) -> bool {
-    std::path::Path::new("/sys/bus/pci/devices").join(slot).exists()
+    std::path::Path::new("/sys/bus/pci/devices")
+        .join(slot)
+        .exists()
 }
 
 // ---------------------------------------------------------------------------
@@ -665,14 +679,27 @@ models:
     }
 
     #[test]
+    fn context_length_defaults_when_omitted() {
+        // Audio (non-LLM) models may omit context_length entirely.
+        let cfg = parse(BASE).unwrap();
+        assert_eq!(cfg.models[0].context_length, 4096);
+    }
+
+    #[test]
     fn rejects_zero_max_instances() {
-        let yaml = BASE.replace("cmd: \"sleep 3600\"", "cmd: \"sleep 3600\"\n    max_instances: 0");
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\n    max_instances: 0",
+        );
         expect_validation_error(&yaml, "max_instances must be > 0");
     }
 
     #[test]
     fn rejects_zero_max_concurrent() {
-        let yaml = BASE.replace("cmd: \"sleep 3600\"", "cmd: \"sleep 3600\"\n    max_concurrent: 0");
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\n    max_concurrent: 0",
+        );
         expect_validation_error(&yaml, "max_concurrent must be > 0");
     }
 
@@ -729,7 +756,7 @@ models:
 
     #[test]
     fn rejects_reserved_cmd_alias_names() {
-        for reserved in ["port", "context_length"] {
+        for reserved in ["port", "context_length", "name"] {
             let yaml = BASE.replace(
                 "apikeys_file: apikeys.txt",
                 &format!("apikeys_file: apikeys.txt\ncmd_aliases:\n  {reserved}: \"x\""),

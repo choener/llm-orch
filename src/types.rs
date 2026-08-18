@@ -380,15 +380,28 @@ mod tests {
 
     #[test]
     fn chat_request_round_trip_omits_stream_when_false() {
-        let input = r#"{"model":"m","temperature":0,"messages":[{"role":"system","content":"hi"}]}"#;
+        let input =
+            r#"{"model":"m","temperature":0,"messages":[{"role":"system","content":"hi"}]}"#;
         let req: ChatCompletionRequest = serde_json::from_str(input).unwrap();
         let output = serde_json::to_string(&req).unwrap();
         // stream=false must be absent (not serialized)
-        assert!(!output.contains("\"stream\":"), "stream should be absent: {}", output);
+        assert!(
+            !output.contains("\"stream\":"),
+            "stream should be absent: {}",
+            output
+        );
         // stream_options must be absent when None
-        assert!(!output.contains("stream_options"), "stream_options should be absent: {}", output);
+        assert!(
+            !output.contains("stream_options"),
+            "stream_options should be absent: {}",
+            output
+        );
         // temperature:0 must stay 0 (integer), not 0.0
-        assert!(output.contains("\"temperature\":0"), "temperature should be 0 int: {}", output);
+        assert!(
+            output.contains("\"temperature\":0"),
+            "temperature should be 0 int: {}",
+            output
+        );
     }
 
     #[test]
@@ -397,14 +410,22 @@ mod tests {
         let req: ChatCompletionRequest = serde_json::from_str(input).unwrap();
         let output = serde_json::to_string(&req).unwrap();
         let val: serde_json::Value = serde_json::from_str(&output).unwrap();
-        let keys: Vec<&str> = val.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        let keys: Vec<&str> = val
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|s| s.as_str())
+            .collect();
         // Declaration order: model, messages, temperature, top_p, ..., extra fields in insertion order
         assert_eq!(keys[0], "model");
         assert_eq!(keys[1], "messages");
         // prompt_cache_key and custom_flag are flattened extra — order preserved
         let pk_pos = keys.iter().position(|&k| k == "prompt_cache_key").unwrap();
         let cf_pos = keys.iter().position(|&k| k == "custom_flag").unwrap();
-        assert!(pk_pos < cf_pos, "prompt_cache_key should come before custom_flag");
+        assert!(
+            pk_pos < cf_pos,
+            "prompt_cache_key should come before custom_flag"
+        );
     }
 
     #[test]
@@ -412,7 +433,11 @@ mod tests {
         let input = r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
         let req: ChatCompletionRequest = serde_json::from_str(input).unwrap();
         let output = serde_json::to_string(&req).unwrap();
-        assert!(output.contains("\"stream\":true"), "stream=true must be present: {}", output);
+        assert!(
+            output.contains("\"stream\":true"),
+            "stream=true must be present: {}",
+            output
+        );
     }
 
     #[test]
@@ -438,11 +463,13 @@ mod tests {
                 {"role": "tool", "tool_call_id": "call_1", "content": "file1.txt"}
             ]
         });
-        let req: ChatCompletionRequest =
-            serde_json::from_value(input.clone()).unwrap();
+        let req: ChatCompletionRequest = serde_json::from_value(input.clone()).unwrap();
         let output = serde_json::to_value(&req).unwrap();
         // Every message-level field must survive verbatim.
-        assert_eq!(output, input, "message-level fields were lost in round-trip");
+        assert_eq!(
+            output, input,
+            "message-level fields were lost in round-trip"
+        );
     }
 
     #[test]
@@ -460,8 +487,7 @@ mod tests {
                 ]
             }]
         });
-        let req: ChatCompletionRequest =
-            serde_json::from_value(input.clone()).unwrap();
+        let req: ChatCompletionRequest = serde_json::from_value(input.clone()).unwrap();
         let output = serde_json::to_value(&req).unwrap();
         assert_eq!(output, input, "unknown content part was lost in round-trip");
     }
@@ -471,7 +497,11 @@ mod tests {
         let input = r#"{"model":"m","prompt":"hello","temperature":0,"top_p":1}"#;
         let req: CompletionRequest = serde_json::from_str(input).unwrap();
         let output = serde_json::to_string(&req).unwrap();
-        assert!(!output.contains("\"stream\":"), "stream should be absent: {}", output);
+        assert!(
+            !output.contains("\"stream\":"),
+            "stream should be absent: {}",
+            output
+        );
     }
 
     #[test]
@@ -489,7 +519,10 @@ mod tests {
         });
         let req: RerankRequest = serde_json::from_value(input.clone()).unwrap();
         let output = serde_json::to_value(&req).unwrap();
-        assert_eq!(output, input, "rerank request fields were lost in round-trip");
+        assert_eq!(
+            output, input,
+            "rerank request fields were lost in round-trip"
+        );
     }
 
     #[test]
@@ -497,7 +530,15 @@ mod tests {
         let input = r#"{"model":"m","query":"q","documents":["a"]}"#;
         let req: RerankRequest = serde_json::from_str(input).unwrap();
         let output = serde_json::to_string(&req).unwrap();
-        assert!(!output.contains("top_n"), "top_n should be absent: {}", output);
-        assert!(!output.contains("return_documents"), "return_documents should be absent: {}", output);
+        assert!(
+            !output.contains("top_n"),
+            "top_n should be absent: {}",
+            output
+        );
+        assert!(
+            !output.contains("return_documents"),
+            "return_documents should be absent: {}",
+            output
+        );
     }
 }

@@ -3,21 +3,24 @@
 // Central scheduler: owns the map of model → running instances, handles
 // spawning, slot acquisition, queueing, idle eviction, and shutdown.
 
-use crate::backend::{output_lines, poll_readiness, shutdown_child, spawn_process, Backend, DeviceKind, LlamaCppBackend, ReadyOutcome};
+use crate::backend::{
+    Backend, DeviceKind, LlamaCppBackend, ReadyOutcome, output_lines, poll_readiness,
+    shutdown_child, spawn_process,
+};
 use crate::config::ModelConfig;
 use crate::gpu::GpuMetrics;
-use crate::types::CompletionRecord;
 use crate::http_client;
 use crate::instance::{Instance, InstanceHandle, InstanceState, SlotGuard};
 use crate::keepalive::KeepAliveManager;
 use crate::port_alloc::PortAllocator;
+use crate::types::CompletionRecord;
 
 use reqwest::Client;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, watch, Mutex, Semaphore, oneshot};
+use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
 use tracing::{debug, error, info, warn};
 
 /// Maximum time a request may wait in the queue for a slot before failing.
@@ -150,25 +153,25 @@ impl ModelMetrics {
 
         let active_f = self.last_active as f64;
 
-        let alpha_1  = 1.0 - (-dt / 60.0_f64).exp();
-        let alpha_5  = 1.0 - (-dt / 300.0_f64).exp();
+        let alpha_1 = 1.0 - (-dt / 60.0_f64).exp();
+        let alpha_5 = 1.0 - (-dt / 300.0_f64).exp();
         let alpha_15 = 1.0 - (-dt / 900.0_f64).exp();
 
         // ── Load averages ───────────────────────────────────────────
-        self.load_m1  = self.load_m1  * (1.0 - alpha_1)  + active_f * alpha_1;
-        self.load_m5  = self.load_m5  * (1.0 - alpha_5)  + active_f * alpha_5;
+        self.load_m1 = self.load_m1 * (1.0 - alpha_1) + active_f * alpha_1;
+        self.load_m5 = self.load_m5 * (1.0 - alpha_5) + active_f * alpha_5;
         self.load_m15 = self.load_m15 * (1.0 - alpha_15) + active_f * alpha_15;
 
         // ── Request rate ───────────────────────────────────────────
         if completions_delta > 0 {
             let rate_per_min = (completions_delta as f64) / (dt / 60.0);
-            self.req_rate_m1  = self.req_rate_m1  * (1.0 - alpha_1)  + rate_per_min * alpha_1;
-            self.req_rate_m5  = self.req_rate_m5  * (1.0 - alpha_5)  + rate_per_min * alpha_5;
+            self.req_rate_m1 = self.req_rate_m1 * (1.0 - alpha_1) + rate_per_min * alpha_1;
+            self.req_rate_m5 = self.req_rate_m5 * (1.0 - alpha_5) + rate_per_min * alpha_5;
             self.req_rate_m15 = self.req_rate_m15 * (1.0 - alpha_15) + rate_per_min * alpha_15;
             self.completions_total += completions_delta;
         } else {
-            self.req_rate_m1  *= 1.0 - alpha_1;
-            self.req_rate_m5  *= 1.0 - alpha_5;
+            self.req_rate_m1 *= 1.0 - alpha_1;
+            self.req_rate_m5 *= 1.0 - alpha_5;
             self.req_rate_m15 *= 1.0 - alpha_15;
         }
 
@@ -219,11 +222,7 @@ fn cuda_device_maps(
     let Some(devs) = config.devices.as_ref() else {
         return (HashMap::new(), HashMap::new());
     };
-    let slots = devs
-        .cuda
-        .iter()
-        .map(|(k, v)| (*k, v.pci.clone()))
-        .collect();
+    let slots = devs.cuda.iter().map(|(k, v)| (*k, v.pci.clone())).collect();
     let static_vram = devs
         .cuda
         .iter()
@@ -430,7 +429,10 @@ impl InstanceManager {
     /// function only *awaits* the spawn's completion.  A client disconnect
     /// that drops this future therefore cannot abort a spawn half-way and
     /// strand a `Loading` instance that nothing would ever reap.
-    pub async fn get_or_spawn(self: &Arc<Self>, model_name: &str) -> Result<SlotGuard, AcquireError> {
+    pub async fn get_or_spawn(
+        self: &Arc<Self>,
+        model_name: &str,
+    ) -> Result<SlotGuard, AcquireError> {
         if self.is_blocked(model_name) {
             return Err(AcquireError::Blocked);
         }
@@ -463,7 +465,9 @@ impl InstanceManager {
                 // change that retired the only instance triggers a cold-start
                 // replacement spawn instead of queueing behind the drain.
                 let num_existing = {
-                    self.instances.read().unwrap()
+                    self.instances
+                        .read()
+                        .unwrap()
                         .get(model_name)
                         .map(|l| {
                             l.iter()
@@ -477,7 +481,10 @@ impl InstanceManager {
                 if num_existing == 0 {
                     true // cold start — always spawn immediately
                 } else {
-                    let load_m5 = self.model_metrics.read().unwrap()
+                    let load_m5 = self
+                        .model_metrics
+                        .read()
+                        .unwrap()
                         .get(model_name)
                         .map(|m| m.load_m5)
                         .unwrap_or(0.0);
@@ -524,9 +531,7 @@ impl InstanceManager {
             // Nothing exists that could ever wake a waiter — the spawn
             // failed (see logs) or everything left is retiring.
             Err(EnqueueError::NoInstances) => Err(AcquireError::Unavailable),
-            Err(EnqueueError::QueueFull | EnqueueError::Timeout) => {
-                Err(AcquireError::NoCapacity)
-            }
+            Err(EnqueueError::QueueFull | EnqueueError::Timeout) => Err(AcquireError::NoCapacity),
         }
     }
 
@@ -547,7 +552,10 @@ impl InstanceManager {
             .ok_or(AcquireError::Unavailable)?;
 
         // Already serving (or at least registered and routable)?
-        if self.find_ready_instance(model_name, cfg.max_concurrent).is_some() {
+        if self
+            .find_ready_instance(model_name, cfg.max_concurrent)
+            .is_some()
+        {
             return Ok(());
         }
 
@@ -555,7 +563,10 @@ impl InstanceManager {
         let budget = self.spawn_timeout + SPAWN_SERIAL_WINDOW + Duration::from_secs(30);
         let _ = tokio::time::timeout(budget, rx.changed()).await;
 
-        if self.find_ready_instance(model_name, cfg.max_concurrent).is_some() {
+        if self
+            .find_ready_instance(model_name, cfg.max_concurrent)
+            .is_some()
+        {
             Ok(())
         } else {
             Err(AcquireError::Unavailable)
@@ -624,11 +635,7 @@ impl InstanceManager {
     /// exceeds the budget.  On success the received guard already owns the
     /// slot (acquired by `wake_one`) — there is no acquire race on this
     /// side.
-    async fn enqueue(
-        &self,
-        model_name: &str,
-        max_depth: usize,
-    ) -> Result<SlotGuard, EnqueueError> {
+    async fn enqueue(&self, model_name: &str, max_depth: usize) -> Result<SlotGuard, EnqueueError> {
         let (tx, rx) = oneshot::channel();
         let id = self.next_queue_id.fetch_add(1, Ordering::Relaxed);
 
@@ -713,9 +720,7 @@ impl InstanceManager {
             .get(model_name)
             .map(|l| l.is_empty())
             .unwrap_or(true);
-        if none_left
-            && let Some(q) = self.queues.write().unwrap().get_mut(model_name)
-        {
+        if none_left && let Some(q) = self.queues.write().unwrap().get_mut(model_name) {
             q.clear();
         }
     }
@@ -853,8 +858,7 @@ impl InstanceManager {
         // without GPU restriction (competing on GPUs already occupied by
         // existing instances) or with too few devices (a multi-GPU model
         // would not fit in memory).
-        let has_device_pool =
-            !cfg.vulkan_devices.is_empty() || !cfg.cuda_devices.is_empty();
+        let has_device_pool = !cfg.vulkan_devices.is_empty() || !cfg.cuda_devices.is_empty();
         if has_device_pool && gpu_indices.len() < cfg.gpus {
             warn!(
                 model = %model_name,
@@ -1014,10 +1018,7 @@ impl InstanceManager {
         self.crash_counts.lock().unwrap().remove(model_name);
 
         // Monitor the child for unexpected exits (crash → unregister/block).
-        tokio::spawn(monitor_instance_exit(
-            handle.clone(),
-            self.crash_tx.clone(),
-        ));
+        tokio::spawn(monitor_instance_exit(handle.clone(), self.crash_tx.clone()));
 
         let instance_id = {
             let inst = handle.inner().lock().unwrap();
@@ -1034,8 +1035,10 @@ impl InstanceManager {
         fingerprint_with_aliases(&self.cmd_aliases.read().unwrap(), cfg)
     }
 
-    /// Resolve `cmd_aliases`, `{port}`, and `{context_length}` in the
-    /// model's command string.
+    /// Resolve `cmd_aliases`, `{port}`, `{context_length}`, and `{name}`
+    /// in the model's command string.  `{name}` substitutes the model's
+    /// config name, enabling generic cmd templates such as
+    /// `audiocpp_server --config /etc/llm-orch/audio/{name}.json …`.
     fn resolve_cmd(&self, cfg: &ModelConfig, port: u16) -> String {
         let mut resolved = cfg.cmd.clone();
         let cmd_aliases = self.cmd_aliases.read().unwrap();
@@ -1046,6 +1049,7 @@ impl InstanceManager {
         resolved
             .replace("{port}", &port.to_string())
             .replace("{context_length}", &cfg.context_length.to_string())
+            .replace("{name}", &cfg.name)
     }
 
     /// Pick the devices for a new instance from the model's device pool
@@ -1089,7 +1093,11 @@ impl InstanceManager {
         // own model's namespace map.  Instances of models no longer in
         // the config are treated as Vulkan (pre-removal semantics).
         let slot_for = |model: &str, idx: usize| -> Option<String> {
-            match model_kinds.get(model).copied().unwrap_or(DeviceKind::Vulkan) {
+            match model_kinds
+                .get(model)
+                .copied()
+                .unwrap_or(DeviceKind::Vulkan)
+            {
                 DeviceKind::Cuda => cuda_slots.get(&idx).cloned(),
                 DeviceKind::Vulkan => vulkan_slots.get(&idx).cloned(),
             }
@@ -1125,7 +1133,8 @@ impl InstanceManager {
             let model_configs = self.model_configs.read().unwrap();
             let mut used = HashMap::new();
             for (model_name, list) in instances.iter() {
-                let model_vram = model_configs.get(model_name)
+                let model_vram = model_configs
+                    .get(model_name)
                     .map(|c| c.vram * 1024 * 1024)
                     .unwrap_or(0);
                 for handle in list {
@@ -1339,7 +1348,8 @@ impl InstanceManager {
             shutdown_child(c, Duration::from_secs(5)).await;
         }
 
-        self.unregister_instance(model_name, handle, &gpu_indices).await;
+        self.unregister_instance(model_name, handle, &gpu_indices)
+            .await;
         true
     }
 
@@ -1465,11 +1475,7 @@ impl InstanceManager {
             inst.state = InstanceState::Failed;
             // The monitor already reaped the process via try_wait.
             let _ = inst.child.take();
-            (
-                inst.model_name.clone(),
-                was_ready,
-                inst.gpu_indices.clone(),
-            )
+            (inst.model_name.clone(), was_ready, inst.gpu_indices.clone())
         };
         let (id, port) = {
             let inst = handle.inner().lock().unwrap();
@@ -1484,7 +1490,8 @@ impl InstanceManager {
         );
         self.dump_recent_output(&handle);
 
-        self.unregister_instance(&model_name, &handle, &gpu_indices).await;
+        self.unregister_instance(&model_name, &handle, &gpu_indices)
+            .await;
 
         if !was_ready {
             self.note_pre_output_crash(&model_name);
@@ -1665,8 +1672,7 @@ impl InstanceManager {
                         list.iter()
                             .filter(|h| {
                                 let inst = h.inner().lock().unwrap();
-                                inst.state != InstanceState::Failed
-                                    && inst.config_fingerprint != fp
+                                inst.state != InstanceState::Failed && inst.config_fingerprint != fp
                             })
                             .cloned()
                             .collect()
@@ -1794,7 +1800,11 @@ impl InstanceManager {
             .read()
             .unwrap()
             .get(model_name)
-            .map(|list| list.iter().map(|h| h.inner().lock().unwrap().in_flight).sum())
+            .map(|list| {
+                list.iter()
+                    .map(|h| h.inner().lock().unwrap().in_flight)
+                    .sum()
+            })
             .unwrap_or(0);
         let queued = self.queue_depth(model_name);
         let active = in_flight + queued;
@@ -1855,11 +1865,7 @@ impl InstanceManager {
 
     /// Record a completed request in the per-model ring buffer.
     /// Keeps at most 5 entries per model, newest first.
-    pub fn record_completion(
-        &self,
-        model_name: &str,
-        record: CompletionRecord,
-    ) {
+    pub fn record_completion(&self, model_name: &str, record: CompletionRecord) {
         info!(
             model = %model_name,
             user = %record.api_user,
@@ -1876,9 +1882,7 @@ impl InstanceManager {
     }
 
     /// Snapshot of recent completions per model for the info endpoint.
-    pub fn recent_completions_snapshot(
-        &self,
-    ) -> HashMap<String, Vec<CompletionRecord>> {
+    pub fn recent_completions_snapshot(&self) -> HashMap<String, Vec<CompletionRecord>> {
         self.recent_completions
             .read()
             .unwrap()
@@ -1949,7 +1953,9 @@ impl InstanceManager {
             }
 
             let num_instances = {
-                self.instances.read().unwrap()
+                self.instances
+                    .read()
+                    .unwrap()
                     .get(model_name)
                     .map(|l| l.len())
                     .unwrap_or(0)
@@ -2035,7 +2041,12 @@ impl InstanceManager {
                 if m.load_m5 > a.scale_up_at * capacity {
                     // A request-driven spawn may already be in flight —
                     // don't double-spawn past the cap.
-                    if self.spawns_in_flight.read().unwrap().contains_key(model_name) {
+                    if self
+                        .spawns_in_flight
+                        .read()
+                        .unwrap()
+                        .contains_key(model_name)
+                    {
                         debug!(
                             model = %model_name,
                             "autoscale: spawn already in flight, skipping scale-up"
@@ -2052,7 +2063,9 @@ impl InstanceManager {
                     // (see `ensure_spawn`) which wakes parked waiters on
                     // success; requests subscribe to the entry directly.
                     let _rx = self.ensure_spawn(model_name, cfg);
-                    self.last_scale_action.write().unwrap()
+                    self.last_scale_action
+                        .write()
+                        .unwrap()
                         .insert(model_name.clone(), now);
                     continue;
                 }
@@ -2074,7 +2087,9 @@ impl InstanceManager {
                                 threshold = %(a.scale_down_at * reduced_cap),
                                 "autoscale: scaled down"
                             );
-                            self.last_scale_action.write().unwrap()
+                            self.last_scale_action
+                                .write()
+                                .unwrap()
                                 .insert(model_name.clone(), now);
                             break;
                         }
@@ -2186,11 +2201,9 @@ models:
 "#;
 
     fn test_manager() -> InstanceManager {
-        let config: crate::config::Config =
-            serde_yaml_ng::from_str(TEST_CONFIG_YAML).unwrap();
+        let config: crate::config::Config = serde_yaml_ng::from_str(TEST_CONFIG_YAML).unwrap();
         let gpu_snapshot = Arc::new(tokio::sync::RwLock::new(Vec::new()));
-        let (mgr, _release_rx, _crash_rx) =
-            InstanceManager::new(&config, gpu_snapshot, None);
+        let (mgr, _release_rx, _crash_rx) = InstanceManager::new(&config, gpu_snapshot, None);
         mgr
     }
 
@@ -2482,7 +2495,10 @@ models:
 
         mgr.remove_queued("m", 1);
 
-        assert!(rx1.await.is_err(), "removed waiter's sender must be dropped");
+        assert!(
+            rx1.await.is_err(),
+            "removed waiter's sender must be dropped"
+        );
         assert!(!rx2.is_terminated(), "other waiter must stay parked");
         assert_eq!(mgr.queue_depth("m"), 1);
     }
@@ -2502,8 +2518,15 @@ models:
                 .push(handle.clone());
             mgr.handle_crash(handle).await;
         }
-        assert!(mgr.is_blocked("m"), "model must be blocked after 3 pre-output crashes");
-        assert_eq!(instance_count(&mgr), 0, "crashed instances must be unregistered");
+        assert!(
+            mgr.is_blocked("m"),
+            "model must be blocked after 3 pre-output crashes"
+        );
+        assert_eq!(
+            instance_count(&mgr),
+            0,
+            "crashed instances must be unregistered"
+        );
     }
 
     #[tokio::test]
@@ -2521,8 +2544,15 @@ models:
                 .push(handle.clone());
             mgr.handle_crash(handle).await;
         }
-        assert!(!mgr.is_blocked("m"), "post-output crashes must not block the model");
-        assert_eq!(instance_count(&mgr), 0, "crashed instances must be unregistered");
+        assert!(
+            !mgr.is_blocked("m"),
+            "post-output crashes must not block the model"
+        );
+        assert_eq!(
+            instance_count(&mgr),
+            0,
+            "crashed instances must be unregistered"
+        );
     }
 
     #[tokio::test]
@@ -2539,7 +2569,11 @@ models:
             .push(handle.clone());
         mgr.handle_crash(handle).await;
         assert!(!mgr.is_blocked("m"));
-        assert_eq!(instance_count(&mgr), 1, "already-failed instance must be left alone");
+        assert_eq!(
+            instance_count(&mgr),
+            1,
+            "already-failed instance must be left alone"
+        );
     }
 
     #[tokio::test]
@@ -2598,11 +2632,14 @@ models:
             .push(handle);
         mgr.block_model("m");
 
-        let cfg_b: crate::config::Config =
-            serde_yaml_ng::from_str(TEST_CONFIG_YAML_B).unwrap();
+        let cfg_b: crate::config::Config = serde_yaml_ng::from_str(TEST_CONFIG_YAML_B).unwrap();
         mgr.reconcile_config(&cfg_b).await;
 
-        assert_eq!(instance_count(&mgr), 0, "removed model's instances must be unloaded");
+        assert_eq!(
+            instance_count(&mgr),
+            0,
+            "removed model's instances must be unloaded"
+        );
         assert!(!mgr.model_configs.read().unwrap().contains_key("m"));
         assert!(mgr.model_configs.read().unwrap().contains_key("n"));
         assert!(!mgr.is_blocked("m"), "reload must clear blocked flags");
@@ -2622,11 +2659,14 @@ models:
             .or_default()
             .push(handle.clone());
 
-        let cfg: crate::config::Config =
-            serde_yaml_ng::from_str(TEST_CONFIG_YAML).unwrap();
+        let cfg: crate::config::Config = serde_yaml_ng::from_str(TEST_CONFIG_YAML).unwrap();
         mgr.reconcile_config(&cfg).await;
 
-        assert_eq!(instance_count(&mgr), 1, "surviving model's instance must be kept");
+        assert_eq!(
+            instance_count(&mgr),
+            1,
+            "surviving model's instance must be kept"
+        );
         assert_eq!(
             handle.inner().lock().unwrap().state,
             InstanceState::Ready,
@@ -2728,8 +2768,7 @@ models:
 "#;
         let config: crate::config::Config = serde_yaml_ng::from_str(yaml).unwrap();
         let gpu_snapshot = Arc::new(tokio::sync::RwLock::new(Vec::new()));
-        let (mgr, _release_rx, _crash_rx) =
-            InstanceManager::new(&config, gpu_snapshot, None);
+        let (mgr, _release_rx, _crash_rx) = InstanceManager::new(&config, gpu_snapshot, None);
         let draining = make_handle(InstanceState::Failed, 1, Duration::ZERO);
         mgr.instances
             .write()
@@ -2784,7 +2823,11 @@ models:
             .push(handle);
 
         let result = mgr.enqueue("m", 8).await;
-        assert!(matches!(result, Err(EnqueueError::Timeout)), "got: {:?}", result.map(|_| "guard"));
+        assert!(
+            matches!(result, Err(EnqueueError::Timeout)),
+            "got: {:?}",
+            result.map(|_| "guard")
+        );
         assert_eq!(mgr.queue_depth("m"), 0, "timed-out waiter must self-remove");
     }
 
@@ -2817,16 +2860,12 @@ models:
 "#;
         let config: crate::config::Config = serde_yaml_ng::from_str(yaml).unwrap();
         let gpu_snapshot = Arc::new(tokio::sync::RwLock::new(Vec::new()));
-        let (mgr, _release_rx, _crash_rx) =
-            InstanceManager::new(&config, gpu_snapshot, None);
+        let (mgr, _release_rx, _crash_rx) = InstanceManager::new(&config, gpu_snapshot, None);
         let mgr = Arc::new(mgr);
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(15),
-            mgr.ensure_instance("m"),
-        )
-        .await
-        .expect("ensure_instance must not park");
+        let result = tokio::time::timeout(Duration::from_secs(15), mgr.ensure_instance("m"))
+            .await
+            .expect("ensure_instance must not park");
         assert!(matches!(result, Err(AcquireError::Unavailable)));
 
         mgr.block_model("m");
@@ -2838,8 +2877,7 @@ models:
 
     #[test]
     fn fingerprint_covers_cmd_aliases_devices_vram_context() {
-        let cfg: crate::config::Config =
-            serde_yaml_ng::from_str(TEST_CONFIG_YAML).unwrap();
+        let cfg: crate::config::Config = serde_yaml_ng::from_str(TEST_CONFIG_YAML).unwrap();
         let model = cfg.models[0].clone();
         let no_aliases = HashMap::new();
 
@@ -2973,7 +3011,11 @@ models:
 
         mgr.evaluate_autoscale().await;
 
-        assert_eq!(instance_count(&mgr), 1, "idle surplus instance must be evicted");
+        assert_eq!(
+            instance_count(&mgr),
+            1,
+            "idle surplus instance must be evicted"
+        );
         let instances = mgr.instances.read().unwrap();
         assert!(
             Arc::ptr_eq(instances["m"][0].inner(), busy.inner()),
@@ -3085,8 +3127,7 @@ models:
 "#;
 
     fn multi_gpu_manager() -> InstanceManager {
-        let config: crate::config::Config =
-            serde_yaml_ng::from_str(MULTI_GPU_YAML).unwrap();
+        let config: crate::config::Config = serde_yaml_ng::from_str(MULTI_GPU_YAML).unwrap();
         let snapshot = Arc::new(tokio::sync::RwLock::new(vec![
             gpu_metrics(0, "0000:01:00.0", 48000),
             gpu_metrics(1, "0000:02:00.0", 48000),
@@ -3111,7 +3152,13 @@ models:
     #[tokio::test]
     async fn select_picks_two_distinct_gpus_and_complement_for_second_instance() {
         let mgr = multi_gpu_manager();
-        let cfg = mgr.model_configs.read().unwrap().get("big").cloned().unwrap();
+        let cfg = mgr
+            .model_configs
+            .read()
+            .unwrap()
+            .get("big")
+            .cloned()
+            .unwrap();
 
         let first = mgr.select_gpus_for_model(&cfg).await;
         assert_eq!(first.len(), 2);
@@ -3158,7 +3205,13 @@ models:
         // gpus: 2, but one device is occupied by the same model — only one
         // candidate remains, so there is no valid placement.
         let mgr = multi_gpu_manager();
-        let cfg = mgr.model_configs.read().unwrap().get("big").cloned().unwrap();
+        let cfg = mgr
+            .model_configs
+            .read()
+            .unwrap()
+            .get("big")
+            .cloned()
+            .unwrap();
         register_ready(&mgr, "big", vec![0, 1], 54321);
         register_ready(&mgr, "big", vec![2], 54322);
 
@@ -3195,8 +3248,7 @@ models:
 "#;
 
     fn cuda_gpu_manager() -> InstanceManager {
-        let config: crate::config::Config =
-            serde_yaml_ng::from_str(CUDA_GPU_YAML).unwrap();
+        let config: crate::config::Config = serde_yaml_ng::from_str(CUDA_GPU_YAML).unwrap();
         let snapshot = Arc::new(tokio::sync::RwLock::new(vec![
             gpu_metrics(0, "0000:0a:00.0", 48000),
             gpu_metrics(1, "0000:0b:00.0", 48000),
@@ -3210,7 +3262,13 @@ models:
     #[tokio::test]
     async fn cuda_select_tiles_pool_across_instances() {
         let mgr = cuda_gpu_manager();
-        let cfg = mgr.model_configs.read().unwrap().get("big").cloned().unwrap();
+        let cfg = mgr
+            .model_configs
+            .read()
+            .unwrap()
+            .get("big")
+            .cloned()
+            .unwrap();
 
         let first = mgr.select_gpus_for_model(&cfg).await;
         assert_eq!(first.len(), 2);
@@ -3255,7 +3313,13 @@ models:
     #[tokio::test]
     async fn cuda_select_refuses_when_pool_cannot_satisfy_gpus() {
         let mgr = cuda_gpu_manager();
-        let cfg = mgr.model_configs.read().unwrap().get("big").cloned().unwrap();
+        let cfg = mgr
+            .model_configs
+            .read()
+            .unwrap()
+            .get("big")
+            .cloned()
+            .unwrap();
         register_ready(&mgr, "big", vec![0, 1], 54321);
         register_ready(&mgr, "big", vec![2], 54322);
 
@@ -3296,11 +3360,27 @@ models:
         let snapshot = Arc::new(tokio::sync::RwLock::new(vec![]));
         let (mgr, _r, _c) = InstanceManager::new(&config, snapshot, None);
 
-        let fits = mgr.model_configs.read().unwrap().get("fits").cloned().unwrap();
+        let fits = mgr
+            .model_configs
+            .read()
+            .unwrap()
+            .get("fits")
+            .cloned()
+            .unwrap();
         let placement = mgr.select_gpus_for_model(&fits).await;
-        assert_eq!(placement.len(), 1, "static vram_mb must enable placement without metrics");
+        assert_eq!(
+            placement.len(),
+            1,
+            "static vram_mb must enable placement without metrics"
+        );
 
-        let toobig = mgr.model_configs.read().unwrap().get("toobig").cloned().unwrap();
+        let toobig = mgr
+            .model_configs
+            .read()
+            .unwrap()
+            .get("toobig")
+            .cloned()
+            .unwrap();
         assert!(
             mgr.select_gpus_for_model(&toobig).await.is_empty(),
             "model exceeding the static total must find no placement"
@@ -3326,9 +3406,11 @@ models:
     cuda_devices: [0]
 "#;
         let config: crate::config::Config = serde_yaml_ng::from_str(yaml).unwrap();
-        let snapshot = Arc::new(tokio::sync::RwLock::new(vec![
-            gpu_metrics(0, "0000:0a:00.0", 48000),
-        ]));
+        let snapshot = Arc::new(tokio::sync::RwLock::new(vec![gpu_metrics(
+            0,
+            "0000:0a:00.0",
+            48000,
+        )]));
         let (mgr, _r, _c) = InstanceManager::new(&config, snapshot, None);
 
         let cfg = mgr.model_configs.read().unwrap().get("m").cloned().unwrap();
@@ -3364,10 +3446,9 @@ models:
 
     #[test]
     fn fingerprint_distinguishes_device_namespaces() {
-        let base: ModelConfig = serde_yaml_ng::from_str(
-            "name: m\ncontext_length: 4096\ncmd: \"sleep 1\"\nvram: 1000",
-        )
-        .unwrap();
+        let base: ModelConfig =
+            serde_yaml_ng::from_str("name: m\ncontext_length: 4096\ncmd: \"sleep 1\"\nvram: 1000")
+                .unwrap();
         let mut vk = base.clone();
         vk.vulkan_devices = vec![0];
         let mut cu = base.clone();
@@ -3395,6 +3476,19 @@ models:
         assert_eq!(
             mgr.resolve_cmd(&cfg, 9999),
             "run --ctx-size 8192 --port 9999"
+        );
+    }
+
+    #[test]
+    fn resolve_cmd_substitutes_name() {
+        let mgr = test_manager();
+        let cfg: ModelConfig = serde_yaml_ng::from_str(
+            "name: qwen3-tts\ncmd: \"audiocpp_server --config /etc/llm-orch/audio/{name}.json --port {port}\"",
+        )
+        .unwrap();
+        assert_eq!(
+            mgr.resolve_cmd(&cfg, 9123),
+            "audiocpp_server --config /etc/llm-orch/audio/qwen3-tts.json --port 9123"
         );
     }
 
@@ -3460,8 +3554,7 @@ models:
 "#;
         let config: crate::config::Config = serde_yaml_ng::from_str(yaml).unwrap();
         let gpu_snapshot = Arc::new(tokio::sync::RwLock::new(Vec::new()));
-        let (mgr, _release_rx, _crash_rx) =
-            InstanceManager::new(&config, gpu_snapshot, None);
+        let (mgr, _release_rx, _crash_rx) = InstanceManager::new(&config, gpu_snapshot, None);
         let mgr = Arc::new(mgr);
         let cfg = mgr.model_configs.read().unwrap().get("m").cloned().unwrap();
 

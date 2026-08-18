@@ -73,13 +73,28 @@ devices:
 # ---------------------------------------------------------------------------
 # Named `{key}` → value fragments substituted into model `cmd` fields.
 # Use `{alias_name}` in any model's `cmd` to include the alias value.
-# `{port}` is the only runtime placeholder — resolved at spawn time.
+# Runtime placeholders resolved at spawn time: `{port}` (allocated port),
+# `{context_length}` (the model's context_length), `{name}` (the model's
+# config name).
 cmd_aliases:
   llama: |
     llama-server
       --host 127.0.0.1
       --port {port}
       --n-gpu-layers 99
+
+  # audio.cpp (audiocpp_server) — one server process per model.  `{name}`
+  # resolves to the model's config name, so a single alias serves every
+  # audio model: name `qwen3-tts` → /etc/llm-orch/audio/qwen3-tts.json.
+  # The server.json's model `id` must equal the llm-orch model name
+  # (audiocpp validates the request's `model` field against it).
+  # See config.example-audiocpp.json for the server.json shape.
+  # audiocpp: |
+  #   audiocpp_server
+  #     --config /etc/llm-orch/audio/{name}.json
+  #     --host 127.0.0.1
+  #     --port {port}
+  #     --backend vulkan
 
 # ---------------------------------------------------------------------------
 # GPU keep-alive
@@ -204,6 +219,22 @@ models:
         --model /models/llava-13b-q4_k_m.gguf
         --mmproj /models/llava-13b-mmproj.gguf
         --ctx-size 4096
+
+  # --- Example 4: an audio.cpp model (TTS) ----------------------------------
+  # audio.cpp models are spawned as one audiocpp_server process per model,
+  # get the full lifecycle (idle-TTL eviction, queueing, auth), and are
+  # reachable via /v1/audio/speech, /v1/audio/transcriptions, and
+  # /v1/audio/voices.  context_length is meaningless here and omitted.
+  # Requires the `audiocpp` cmd_alias above and a matching
+  # /etc/llm-orch/audio/qwen3-tts.json (see config.example-audiocpp.json).
+  # - name: "qwen3-tts"          # must equal the `id` in the server.json
+  #   max_instances: 1
+  #   max_concurrent: 1          # audiocpp serializes requests per model
+  #   vram: 4000                 # declared VRAM usage (MB)
+  #   idle_ttl: 300
+  #   queue_depth: 5
+  #   # vulkan_devices: [0]      # uncomment for GPU placement
+  #   cmd: "{audiocpp}"
 
 # ---------------------------------------------------------------------------
 # Aliases

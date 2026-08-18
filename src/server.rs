@@ -11,11 +11,11 @@ use crate::handlers;
 use crate::scheduler::InstanceManager;
 
 use axum::{
+    Router,
     extract::{DefaultBodyLimit, FromRequestParts},
-    http::{header, request::Parts, StatusCode},
+    http::{StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Router,
 };
 use reqwest::Client;
 use std::net::SocketAddr;
@@ -63,6 +63,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/completions", post(handlers::completions))
         .route("/v1/embeddings", post(handlers::embeddings))
         .route("/v1/rerank", post(handlers::rerank))
+        // OpenAI-compatible audio endpoints (audio.cpp backends).
+        .route("/v1/audio/speech", post(handlers::audio_speech))
+        .route(
+            "/v1/audio/transcriptions",
+            post(handlers::audio_transcriptions),
+        )
+        .route("/v1/audio/voices", get(handlers::audio_voices))
         // Admin endpoints.
         .route("/admin/status", get(handlers::admin_status))
         .route("/admin/load", post(handlers::admin_load))
