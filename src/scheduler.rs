@@ -297,6 +297,14 @@ pub struct InstanceManager {
     /// Spawn readiness timeout.
     spawn_timeout: Duration,
 
+    /// Global unconditional idle reap timeout (seconds) — the "deep sleep"
+    /// bound: any instance idle past it is evicted.  The per-model
+    /// `idle_ttl` is only a make-room protection window (an instance idle
+    /// for less than that is never evicted to make room); this timeout is
+    /// what actually unloads idle models.  Swapped on config hot-reload.
+    /// See `docs/003-smart-handling.md`, decision 8.
+    drain_idle_timeout_secs: RwLock<u64>,
+
     /// Per-model EMA metrics (load & request rate).
     model_metrics: RwLock<HashMap<String, ModelMetrics>>,
 
@@ -404,6 +412,7 @@ impl InstanceManager {
             keepalive: RwLock::new(keepalive),
             crash_limit: 3,
             spawn_timeout: Duration::from_secs(120),
+            drain_idle_timeout_secs: RwLock::new(config.server.drain_idle_timeout_secs),
             model_metrics: RwLock::new(HashMap::new()),
             spawn_semaphore: Arc::new(Semaphore::new(1)),
             last_scale_action: RwLock::new(HashMap::new()),
@@ -1715,6 +1724,7 @@ impl InstanceManager {
         let (cuda_slots, cuda_vram_static) = cuda_device_maps(config);
         *self.cuda_slots.write().unwrap() = cuda_slots;
         *self.cuda_vram_static.write().unwrap() = cuda_vram_static;
+        *self.drain_idle_timeout_secs.write().unwrap() = config.server.drain_idle_timeout_secs;
         self.ports
             .lock()
             .await
@@ -1907,6 +1917,7 @@ impl InstanceManager {
         self.force_refresh();
         let now = Instant::now();
         let metrics = self.model_metrics_snapshot();
+        let drain_idle_timeout = *self.drain_idle_timeout_secs.read().unwrap();
 
         // Snapshot configs for the iteration (cheap clone, small structs).
         let configs: Vec<(String, ModelConfig)> = self
@@ -1969,23 +1980,29 @@ impl InstanceManager {
                 None => continue,
             };
 
-            // ── Final despawn (n → 0): idle-TTL on the last instance ────
+            // ── Final despawn (n → 0): global idle reap on the last
+            //    instance ────────────────────────────────────────────────
             // Always checked — does not require autoscale to be enabled.
             // The instance-level check is authoritative: Ready, no
-            // in-flight requests, and last_active at least idle_ttl ago —
-            // the configured TTL is honored exactly, independent of load
-            // EMA decay timescales.  Loading instances (spawn in progress)
-            // are excluded because their state != Ready and their
-            // last_active is fresh; remove_instance is atomic w.r.t. slot
-            // acquisition, so a request racing the despawn is a no-op.
+            // in-flight requests, and last_active at least
+            // drain_idle_timeout ago — the timeout is honored exactly,
+            // independent of load EMA decay timescales.  Loading instances
+            // (spawn in progress) are excluded because their state !=
+            // Ready and their last_active is fresh; remove_instance is
+            // atomic w.r.t. slot acquisition, so a request racing the
+            // despawn is a no-op.
             if num_instances == 1 {
                 let mut despawned = false;
                 if let Some(h) = self.pick_least_loaded(model_name) {
-                    if h.inner().lock().unwrap().is_idle_expired(cfg.idle_ttl) {
+                    if h.inner()
+                        .lock()
+                        .unwrap()
+                        .is_idle_expired(drain_idle_timeout)
+                    {
                         info!(
                             model = %model_name,
-                            ttl = cfg.idle_ttl,
-                            "idle TTL expired, despawning last instance"
+                            drain_idle_timeout,
+                            "drain idle timeout expired, despawning last instance"
                         );
                         despawned = self.remove_instance(model_name, &h).await;
                     }
@@ -2000,19 +2017,25 @@ impl InstanceManager {
             let a = match &cfg.autoscale {
                 Some(a) if a.enabled => a,
                 _ => {
-                    // No autoscale: TTL-evict surplus idle instances down
-                    // to one (the n → 0 despawn is handled above).
+                    // No autoscale: evict surplus idle instances down to
+                    // one once past the global drain idle timeout (the
+                    // n → 0 despawn is handled above).
                     let mut n = num_instances;
                     for handle in self.instances_by_load(model_name) {
                         if n <= 1 {
                             break;
                         }
-                        if handle.inner().lock().unwrap().is_idle_expired(cfg.idle_ttl) {
+                        if handle
+                            .inner()
+                            .lock()
+                            .unwrap()
+                            .is_idle_expired(drain_idle_timeout)
+                        {
                             info!(
                                 model = %model_name,
                                 inst = %handle.id(),
-                                ttl = cfg.idle_ttl,
-                                "idle TTL expired, evicting surplus instance"
+                                drain_idle_timeout,
+                                "drain idle timeout expired, evicting surplus instance"
                             );
                             if self.remove_instance(model_name, &handle).await {
                                 n -= 1;
@@ -2191,7 +2214,8 @@ mod tests {
     use super::*;
 
     const TEST_CONFIG_YAML: &str = r#"
-server: {}
+server:
+  drain_idle_timeout_secs: 60
 apikeys_file: apikeys.txt
 models:
   - name: m
@@ -2287,7 +2311,7 @@ models:
     async fn autoscale_keeps_instance_with_in_flight_request_alive() {
         // A long-running request produces no acquire/release events for many
         // minutes.  force_refresh at the start of evaluate_autoscale must
-        // bump last_activity (active > 0) so the idle TTL never trips
+        // bump last_activity (active > 0) so the idle reap never trips
         // mid-request.
         let mgr = Arc::new(test_manager());
         // Instance itself has been busy on one request for over an hour.
@@ -2311,7 +2335,7 @@ models:
     #[tokio::test]
     async fn autoscale_still_despawns_genuinely_idle_instance() {
         // The despawn path itself must keep working: Ready, no in-flight,
-        // idle past TTL at both instance and metrics level.
+        // idle past drain_idle_timeout at both instance and metrics level.
         let mgr = Arc::new(test_manager());
         let handle = make_handle(InstanceState::Ready, 0, Duration::from_secs(3600));
         register_with_stale_metrics(&mgr, &handle);
@@ -2964,12 +2988,12 @@ models:
     }
 
     #[tokio::test]
-    async fn short_idle_ttl_is_honored_for_last_instance() {
+    async fn short_drain_idle_timeout_is_honored_for_last_instance() {
         // Regression: the old despawn condition required load_m1 < 0.01,
         // which with τ=60 s takes ~5 min to decay regardless of the
-        // configured TTL — an idle_ttl of 30 s was silently clamped.
-        // The instance-level idle check honors the TTL exactly.
-        let mgr = Arc::new(test_manager()); // idle_ttl = 60 in TEST_CONFIG_YAML
+        // configured timeout — a short idle timeout was silently clamped.
+        // The instance-level idle check honors the timeout exactly.
+        let mgr = Arc::new(test_manager()); // drain_idle_timeout = 60 in TEST_CONFIG_YAML
         let handle = make_handle(InstanceState::Ready, 0, Duration::from_secs(120));
         mgr.instances
             .write()
@@ -2991,14 +3015,14 @@ models:
         assert_eq!(
             instance_count(&mgr),
             0,
-            "instance idle past its TTL must be despawned regardless of load EMAs"
+            "instance idle past drain_idle_timeout must be despawned regardless of load EMAs"
         );
     }
 
     #[tokio::test]
     async fn surplus_idle_instances_evicted_without_autoscale() {
-        // Models without autoscale config must still scale down: idle
-        // surplus instances are TTL-evicted, one instance is kept.
+        // Models without autoscale config must still scale down: surplus
+        // instances idle past drain_idle_timeout are evicted, one is kept.
         let mgr = Arc::new(test_manager());
         let idle = make_handle_on_gpus(vec![0], InstanceState::Ready, 0, Duration::from_secs(3600));
         let busy = make_handle_on_gpus(vec![1], InstanceState::Ready, 1, Duration::ZERO);
@@ -3025,7 +3049,8 @@ models:
 
     #[tokio::test]
     async fn surplus_fresh_instances_kept_without_autoscale() {
-        // Surplus instances that are NOT idle past TTL must be kept.
+        // Surplus instances that are NOT idle past drain_idle_timeout must
+        // be kept.
         let mgr = Arc::new(test_manager());
         let h1 = make_handle_on_gpus(vec![0], InstanceState::Ready, 0, Duration::ZERO);
         let h2 = make_handle_on_gpus(vec![1], InstanceState::Ready, 0, Duration::ZERO);

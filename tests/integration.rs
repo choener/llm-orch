@@ -29,8 +29,11 @@ fn temp_dir(tag: &str) -> PathBuf {
 }
 
 fn write_config(dir: &Path, listen_port: u16, models_yaml: &str) -> PathBuf {
+    // drain_idle_timeout_secs: 1 — the global idle reaper (the per-model
+    // idle_ttl is only a make-room protection window now); test servers
+    // must reap idle instances quickly.
     let config_yaml = format!(
-        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\napikeys_file: \"apikeys.txt\"\n{models_yaml}"
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\napikeys_file: \"apikeys.txt\"\n{models_yaml}"
     );
     let path = dir.join("config.yaml");
     std::fs::write(&path, config_yaml).unwrap();
@@ -156,15 +159,15 @@ async fn happy_path_stream_release_and_ttl_unload() {
     let completions = srv.manager.recent_completions_snapshot();
     assert_eq!(completions.get("m").map(|c| c.len()), Some(1));
 
-    // Idle TTL (1 s) evicts the instance — which transitively proves the
-    // in-flight slot was released: a leaked slot would keep the instance
-    // busy and block the IfIdle removal.
+    // The 1 s drain idle timeout evicts the instance — which transitively
+    // proves the in-flight slot was released: a leaked slot would keep the
+    // instance busy and block the IfIdle removal.
     tokio::time::sleep(Duration::from_millis(1200)).await;
     srv.manager.evaluate_autoscale().await;
     assert_eq!(
         srv.manager.instance_counts().get("m").copied(),
         Some(0),
-        "idle instance must be despawned after TTL"
+        "idle instance must be despawned after drain_idle_timeout"
     );
 }
 
@@ -659,6 +662,6 @@ async fn audio_model_idle_ttl_unload() {
     assert_eq!(
         srv.manager.instance_counts().get("audio-m").copied(),
         Some(0),
-        "idle audio instance must be despawned after TTL"
+        "idle audio instance must be despawned after drain_idle_timeout"
     );
 }
