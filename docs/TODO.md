@@ -1,15 +1,12 @@
 - [ ] `/v1/info` endpoint should return utilization of each card
-- [ ] Allow aliases to select between multiple models (design: `docs/003-smart-handling.md`), in the following order:
-    - take the first loaded model with a free slot
-    - load the first unloaded model that actually fits
-    - take the first loaded model and wait
-    - make it possible to set the desired behaviour (first loaded vs. first fitting)
-    - Needs some thinking, but here is the use case: I can fit one dense and one MoE model, or two
-      of each. Sometime two dense models are loaded and, say, firecrawl wants to summarise with the
-      MoE. Now not possible. firecrawl then should load the MoE.
-- [ ] Make duplicate unloading work (design: `docs/003-smart-handling.md`, victim class 3). I
-  currently get errors when Qwen3.8 27B is loaded twice, and the MoE want to load. This should
-  make the MoE wait, drain the less busy 27B and then load the MoE
+- [x] Allow aliases to select between multiple models (design + implementation:
+      `docs/003-smart-handling.md`) — ordered `targets` list, `policy: prefer_loaded |
+      prefer_order`, `make_room: none | evict_idle | drain_surplus`.
+    - Follow-up (not implemented): a global make-room default for *direct* (non-alias)
+      requests — doc 002's "load `9` over `2`" scenario.
+- [x] Make duplicate unloading work (`docs/003-smart-handling.md`, make-room victim class 3:
+      `make_room: drain_surplus` on an alias drains the less-busy duplicate, bounded by
+      `drain_timeout`, then loads the preferred model).
 - [ ] delay unloading the last model of a type, when "lazy-unload: true" is set. Consider Deepseek
   V4. That model takes a while to load, but also blocks all other models. Keep it loaded, unless a
   request to load another model comes in, once ttl and others would normally trigger unload. We

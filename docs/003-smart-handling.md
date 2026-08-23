@@ -1,7 +1,8 @@
 # Smart handling: multi-model aliases and make-room eviction
 
-Status: **design in progress** — this document captures the design space and the
-decisions taken. It must be updated to match reality after implementation.
+Status: **implemented**. Line-number references in "Current state" below are
+pre-implementation pointers; the mechanics sections describe the shipped
+behavior except where "Deviation" notes say otherwise.
 
 Related: `docs/002-gpu-selection.md` already sketched the drain-then-evict cycle
 for full GPUs ("`9` is requested while `1`/`2` occupy both cards"); this document
@@ -157,7 +158,9 @@ Request arrives for alias with candidates `C = [c1, c2, ...]` (config order).
 
 Per candidate, in order: warm slot → spawn-if-fits → make-room-and-spawn.
 Only advance to the next candidate when all three fail. After the loop,
-Pass C as above.
+Pass C as above.  (Implemented exactly like this: the global Pass A warm
+scan is skipped — a later candidate's warm slot must not preempt loading
+the preferred one.)
 
 ### Notes
 
@@ -189,8 +192,12 @@ Goal: free enough VRAM on a suitable device set so candidate `ci` fits.
    instance has no idle time, so the decision-8 staleness rule does not
    apply to this class — least-in-flight is the ordering.
 
-Never a victim: the last **busy** instance of any model; `Loading`
-instances (cancelling another spawn is v2 material).
+Never a victim: the last **busy** instance of any model; busy duplicates of
+the *requesting* model itself (draining those would be pointless churn);
+`Loading` instances (cancelling another spawn is v2 material).
+
+Deviation (implemented): the own-model exclusion for class 3 was made
+explicit during implementation — it is listed above.
 
 Within each class: least-recently-used first (last request completion).
 
@@ -253,6 +260,16 @@ evicts A) with multi-minute load times each way. Mitigations:
 None — all settled in v1 (decisions 1–10). Remaining follow-ups, post-v1:
 global `make_room` default for direct requests; anti-ping-pong refinement
 ("prefer evicting non-first-target models") if thrashing shows up.
+
+## Implementation notes (post-implementation)
+
+- `AliasInfo` in `/v1/info` now carries `targets: Vec<String>` (the
+  `target` / `has_system_prompt` fields are gone).  `/v1/models` alias
+  entries take their `context_length` from the first target.
+- `resolve_alias` returns `(candidates, policy, make_room, drain_timeout)`;
+  unknown alias/model (no candidate configured) still maps to 404.
+- All config knobs validated by `--check-config`; legacy scalar `target:`
+  keeps working.
 
 ## Implementation outline
 
