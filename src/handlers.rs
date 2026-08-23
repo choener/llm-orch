@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tracing::{debug, info, warn};
 
-use crate::config::AliasConfig;
+use crate::config::{AliasConfig, AliasPolicy, MakeRoomMode};
 use crate::debug_log::{DebugLogEntry, DebugStreamContext, ts_now};
 use crate::instance::SlotGuard;
 use crate::scheduler::{AcquireError, InstanceManager};
@@ -90,9 +90,10 @@ pub async fn list_models(
 
         // Aliases also appear as models.
         for a in &aliases {
-            let ctx = models
-                .iter()
-                .find(|m| m.name == a.target)
+            let ctx = a
+                .targets
+                .first()
+                .and_then(|t| models.iter().find(|m| &m.name == t))
                 .map(|m| m.context_length);
             data.push(ModelEntry {
                 id: a.name.clone(),
@@ -187,8 +188,7 @@ pub async fn info_endpoint(
             .iter()
             .map(|a| AliasInfo {
                 name: a.name.clone(),
-                target: a.target.clone(),
-                has_system_prompt: a.system_prompt.is_some(),
+                targets: a.targets.clone(),
             })
             .collect();
 
@@ -261,26 +261,20 @@ pub async fn chat_completions(
         model = %request.model,
     );
     async {
-        // ── 1. Resolve alias → underlying model. ────────────────────────────
+        // ── 1. Resolve alias → candidate models. ────────────────────────────
         //    Read config, extract what we need, drop the guard.
-        let (model_name, alias_system_prompt, alias_prompt_template) = {
+        //    Phase 1: only the first candidate is routed; Phase 4 switches
+        //    all call sites to `acquire_for_candidates`.
+        let (candidates, ..) = {
             let cfg = state.config.read().await;
             resolve_alias(&cfg.aliases, &request.model)
         }; // cfg read guard dropped — future is `Send`
+        let model_name = candidates.into_iter().next().unwrap_or_default();
 
         debug!(
             request_model = %request.model,
             resolved_model = %model_name,
-            has_system_prompt = alias_system_prompt.is_some(),
             "resolved model"
-        );
-
-        // ── 2. Apply alias prompt injection. ────────────────────────────────
-        //    Pure computation — no locks involved.
-        apply_alias_prompts(
-            &mut request.messages,
-            alias_system_prompt,
-            alias_prompt_template,
         );
 
         // ── 3. Verify the model exists in the config; extract debug_log and
@@ -487,22 +481,18 @@ pub async fn responses(
         model = %requested_model,
     );
     async {
-        // ── 1. Resolve alias → underlying model. ────────────────────────────
-        let (model_name, alias_system_prompt, alias_prompt_template) = {
+        // ── 1. Resolve alias → candidate models. ────────────────────────────
+        let (candidates, ..) = {
             let cfg = state.config.read().await;
             resolve_alias(&cfg.aliases, &requested_model)
         }; // cfg read guard dropped — future is `Send`
+        let model_name = candidates.into_iter().next().unwrap_or_default();
 
         debug!(
             request_model = %requested_model,
             resolved_model = %model_name,
-            has_system_prompt = alias_system_prompt.is_some(),
             "resolved model"
         );
-
-        // ── 2. Apply alias prompt injection (instructions / input). ─────────
-        //    Pure computation — no locks involved.
-        apply_alias_prompts_responses(&mut request, alias_system_prompt, alias_prompt_template);
 
         // ── 3. Verify the model exists; extract debug_log and timeouts. ─────
         let (debug_log_path, idle_timeout, total_timeout): (Option<std::path::PathBuf>, _, _) = {
@@ -697,13 +687,11 @@ pub async fn responses_input_tokens(
     );
     async {
         // ── 1. Resolve alias. ───────────────────────────────────────────────
-        let (model_name, alias_system_prompt, alias_prompt_template) = {
+        let (candidates, ..) = {
             let cfg = state.config.read().await;
             resolve_alias(&cfg.aliases, &requested_model)
         };
-
-        // Inject alias prompts so the count matches a real `responses` call.
-        apply_alias_prompts_responses(&mut request, alias_system_prompt, alias_prompt_template);
+        let model_name = candidates.into_iter().next().unwrap_or_default();
 
         // ── 2. Verify model exists; extract debug_log and the timeout. ──────
         let (debug_log_path, total_timeout): (Option<std::path::PathBuf>, _) = {
@@ -841,10 +829,11 @@ pub async fn completions(
     );
     async {
         // ── 1. Resolve alias. ───────────────────────────────────────────────
-        let (model_name, _alias_system_prompt, _alias_prompt_template) = {
+        let (candidates, ..) = {
             let cfg = state.config.read().await;
             resolve_alias(&cfg.aliases, &request.model)
         };
+        let model_name = candidates.into_iter().next().unwrap_or_default();
 
         // ── 2. Verify model exists; read the backend timeouts. ────────────
         let (idle_timeout, total_timeout) = {
@@ -943,10 +932,11 @@ pub async fn embeddings(
     );
     async {
         // ── 1. Resolve alias. ───────────────────────────────────────────────
-        let (model_name, _alias_system_prompt, _alias_prompt_template) = {
+        let (candidates, ..) = {
             let cfg = state.config.read().await;
             resolve_alias(&cfg.aliases, &request.model)
         };
+        let model_name = candidates.into_iter().next().unwrap_or_default();
 
         // ── 2. Verify model exists; read the backend timeout. ─────────────
         let total_timeout = {
@@ -1041,10 +1031,11 @@ pub async fn rerank(
     );
     async {
         // ── 1. Resolve alias. ───────────────────────────────────────────────
-        let (model_name, _alias_system_prompt, _alias_prompt_template) = {
+        let (candidates, ..) = {
             let cfg = state.config.read().await;
             resolve_alias(&cfg.aliases, &request.model)
         };
+        let model_name = candidates.into_iter().next().unwrap_or_default();
 
         let request_model = request.model.clone();
 
@@ -1215,10 +1206,11 @@ async fn acquire_audio_target(
     state: &AppState,
     request_model: &str,
 ) -> Result<AudioTarget, ApiError> {
-    let (model_name, _, _) = {
+    let (candidates, ..) = {
         let cfg = state.config.read().await;
         resolve_alias(&cfg.aliases, request_model)
     };
+    let model_name = candidates.into_iter().next().unwrap_or_default();
 
     let (debug_log_path, idle_timeout, total_timeout): (Option<std::path::PathBuf>, _, _) = {
         let cfg = state.config.read().await;
@@ -1840,122 +1832,32 @@ fn acquire_error(model_name: &str, e: AcquireError) -> ApiError {
     }
 }
 
-/// Resolve an alias name to its underlying model.
+/// Resolve a requested model name to its routing information.
 ///
-/// Returns `(model_name, optional_system_prompt, optional_prompt_template)`.
-/// If the name is not an alias, returns the name unchanged with `None` prompts.
+/// Returns `(candidates, policy, make_room, drain_timeout_secs)`:
+///
+/// - an alias resolves to its ordered target list and eviction settings;
+/// - any other name resolves to a one-element candidate list with
+///   make-room disabled — direct (non-alias) requests never evict
+///   (`docs/003-smart-handling.md`, decision 9).
 fn resolve_alias(
     aliases: &[AliasConfig],
     requested_model: &str,
-) -> (String, Option<String>, Option<String>) {
+) -> (Vec<String>, AliasPolicy, MakeRoomMode, u64) {
     if let Some(alias) = aliases.iter().find(|a| a.name == requested_model) {
         return (
-            alias.target.clone(),
-            alias.system_prompt.clone(),
-            alias.prompt_template.clone(),
+            alias.targets.clone(),
+            alias.policy,
+            alias.make_room,
+            alias.drain_timeout,
         );
     }
-    (requested_model.to_owned(), None, None)
-}
-
-/// Apply alias system prompt and/or prompt template injection to messages.
-fn apply_alias_prompts(
-    messages: &mut Vec<ChatMessage>,
-    system_prompt: Option<String>,
-    prompt_template: Option<String>,
-) {
-    if let Some(sp) = system_prompt {
-        let needs_injection = match messages.first() {
-            Some(m) if m.role == "system" => false,
-            _ => true,
-        };
-        if needs_injection {
-            messages.insert(
-                0,
-                ChatMessage {
-                    role: "system".into(),
-                    content: Some(MessageContent::Text(sp)),
-                    name: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    extra: serde_json::Map::new(),
-                },
-            );
-        }
-    }
-
-    if let Some(tmpl) = prompt_template {
-        if let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user") {
-            if let Some(MessageContent::Text(ref text)) = last_user.content {
-                let rendered = tmpl.replace("{prompt}", text);
-                last_user.content = Some(MessageContent::Text(rendered));
-            }
-        }
-    }
-}
-
-/// Apply alias system prompt and/or prompt template injection to a
-/// Responses API request body (`/v1/responses`).
-///
-/// - `system_prompt` becomes the `instructions` field — but only when the
-///   request doesn't already carry non-empty instructions (mirrors the chat
-///   completions rule of not overriding an existing system message).
-/// - `prompt_template` is applied to the last user input: a string `input`,
-///   or the last `input_text` part of the last `role:"user"` message item.
-///   Shapes we don't understand are left untouched (debug-logged).
-fn apply_alias_prompts_responses(
-    request: &mut serde_json::Value,
-    system_prompt: Option<String>,
-    prompt_template: Option<String>,
-) {
-    if let Some(sp) = system_prompt {
-        let has_instructions = request
-            .get("instructions")
-            .and_then(|v| v.as_str())
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
-        if !has_instructions {
-            request["instructions"] = serde_json::Value::String(sp);
-        }
-    }
-
-    if let Some(tmpl) = prompt_template {
-        match request.get_mut("input") {
-            Some(serde_json::Value::String(text)) => {
-                *text = tmpl.replace("{prompt}", text);
-            }
-            Some(serde_json::Value::Array(items)) => {
-                // Both the shorthand (`{"role":"user","content":"…"}`) and
-                // the item form (`{"type":"message","role":"user","content":[
-                // {"type":"input_text","text":"…"}]}`) carry a `role` field.
-                if let Some(item) = items
-                    .iter_mut()
-                    .rev()
-                    .find(|it| it.get("role").and_then(|r| r.as_str()) == Some("user"))
-                {
-                    match item.get_mut("content") {
-                        Some(serde_json::Value::String(text)) => {
-                            *text = tmpl.replace("{prompt}", text);
-                        }
-                        Some(serde_json::Value::Array(parts)) => {
-                            if let Some(part) = parts.iter_mut().rev().find(|p| {
-                                p.get("type").and_then(|t| t.as_str()) == Some("input_text")
-                            }) {
-                                if let Some(serde_json::Value::String(text)) = part.get_mut("text")
-                                {
-                                    *text = tmpl.replace("{prompt}", text);
-                                }
-                            }
-                        }
-                        _ => debug!(
-                            "responses alias: prompt_template skipped — unsupported content shape"
-                        ),
-                    }
-                }
-            }
-            _ => debug!("responses alias: prompt_template skipped — no usable input"),
-        }
-    }
+    (
+        vec![requested_model.to_owned()],
+        AliasPolicy::PreferLoaded,
+        MakeRoomMode::None,
+        0,
+    )
 }
 
 // ── Completion logging ───────────────────────────────────────────────────────

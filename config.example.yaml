@@ -31,6 +31,13 @@ server:
   # aborting the remaining connections.
   # shutdown_drain_timeout_secs: 60   # default
 
+  # Unconditional unload of idle instances after this many seconds without
+  # requests — the "deep sleep" bound for the GPUs.  The per-model
+  # `idle_ttl` is only a protection window against make-room eviction
+  # (an instance younger than that is never evicted to make room); this
+  # global timeout is what actually unloads idle models.
+  # drain_idle_timeout_secs: 3600     # default
+
 # ---------------------------------------------------------------------------
 # API keys
 # ---------------------------------------------------------------------------
@@ -239,18 +246,36 @@ models:
 # ---------------------------------------------------------------------------
 # Aliases
 # ---------------------------------------------------------------------------
-# Aliases present an alternative name that routes to an underlying model.
-# They appear in /v1/models so clients can discover them.
+# Aliases present an alternative name that routes to one or more underlying
+# models.  They appear in /v1/models so clients can discover them.
+#
+# `targets` is an ordered candidate list: later entries are spillover for
+# when an earlier entry cannot be served or loaded.  The legacy scalar
+# form `target: <name>` is still accepted as a one-element list.
+#
+# Per-alias settings (see docs/003-smart-handling.md):
+#   policy:      prefer_loaded (default) — serve from any already-loaded
+#                candidate before spawning; prefer_order — try candidates
+#                strictly in order (warm slot → spawn → make-room).
+#   make_room:   none | evict_idle (default) | drain_surplus — what may be
+#                evicted when the preferred candidate does not fit:
+#                evict_idle removes idle instances past their model's
+#                idle_ttl protection; drain_surplus additionally drains
+#                busy *duplicate* instances (never the last one serving a
+#                model).
+#   drain_timeout: bound (seconds, default 300) on waiting for a busy
+#                duplicate to drain when make_room: drain_surplus.
 aliases:
   - name: "qwen"
-    target: "qwen3-32b"
-    # Optional system prompt injected when this alias is used.
-    system_prompt: null
-    # system_prompt: "You are a helpful assistant."
-    # Optional prompt template (e.g. for chat format overrides).
-    prompt_template: null
+    target: "qwen3-32b"          # scalar form == targets: [qwen3-32b]
+
+  - name: "summarize"
+    # Prefer the big model; spill over to the small one when the big one
+    # cannot be served or loaded (make_room may evict stale idle instances
+    # to fit qwen3-32b).
+    targets: ["qwen3-32b", "deepseek-coder-7b"]
+    policy: prefer_loaded
+    make_room: evict_idle
 
   - name: "coder"
     target: "deepseek-coder-7b"
-    system_prompt: "You are an expert software engineer. Write clean, correct code."
-    prompt_template: null

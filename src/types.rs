@@ -226,8 +226,7 @@ pub struct ModelInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct AliasInfo {
     pub name: String,
-    pub target: String,
-    pub has_system_prompt: bool,
+    pub targets: Vec<String>,
 }
 
 // ── GPU status (for /admin/status) ───────────────────────────────────────────

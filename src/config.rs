@@ -135,6 +135,7 @@ impl Config {
 
         // --- aliases ---
         let model_names: HashSet<&str> = self.models.iter().map(|m| m.name.as_str()).collect();
+        let alias_names: HashSet<&str> = self.aliases.iter().map(|a| a.name.as_str()).collect();
         let mut seen_aliases = HashSet::new();
         for a in &self.aliases {
             if a.name.is_empty() {
@@ -148,17 +149,40 @@ impl Config {
                     a.name
                 )));
             }
-            if a.target.is_empty() {
+            if a.targets.is_empty() {
                 return Err(ConfigError::Validation(format!(
-                    "alias '{}': target must not be empty",
+                    "alias '{}': targets must not be empty",
                     a.name
                 )));
             }
-            if !model_names.contains(a.target.as_str()) {
+            if a.drain_timeout == 0 {
                 return Err(ConfigError::Validation(format!(
-                    "alias '{}' targets unknown model '{}'",
-                    a.name, a.target
+                    "alias '{}': drain_timeout must be > 0",
+                    a.name
                 )));
+            }
+            for t in &a.targets {
+                if t.is_empty() {
+                    return Err(ConfigError::Validation(format!(
+                        "alias '{}': target names must not be empty",
+                        a.name
+                    )));
+                }
+                // Chaining check first: an alias target that names another
+                // alias would otherwise fail with the less helpful
+                // "unknown model" error.
+                if alias_names.contains(t.as_str()) {
+                    return Err(ConfigError::Validation(format!(
+                        "alias '{}' targets alias '{}' — aliases cannot chain",
+                        a.name, t
+                    )));
+                }
+                if !model_names.contains(t.as_str()) {
+                    return Err(ConfigError::Validation(format!(
+                        "alias '{}' targets unknown model '{}'",
+                        a.name, t
+                    )));
+                }
             }
         }
 
@@ -329,6 +353,14 @@ pub struct ServerConfig {
     /// before aborting the remaining connections.
     #[serde(default = "default_shutdown_drain_timeout")]
     pub shutdown_drain_timeout_secs: u64,
+
+    /// Unconditional reap of idle instances after this many seconds without
+    /// requests — the "deep sleep" bound.  The per-model `idle_ttl` is only
+    /// a protection window for make-room eviction; this global timeout is
+    /// what actually unloads idle models.
+    /// See `docs/003-smart-handling.md`, decision 8.
+    #[serde(default = "default_drain_idle_timeout")]
+    pub drain_idle_timeout_secs: u64,
 }
 
 fn default_listen() -> String {
@@ -342,6 +374,9 @@ fn default_backend_idle_timeout() -> u64 {
 }
 fn default_shutdown_drain_timeout() -> u64 {
     60
+}
+fn default_drain_idle_timeout() -> u64 {
+    3600
 }
 
 /// Port allocation strategy for backend instances.
@@ -626,21 +661,82 @@ fn default_keepalive_sleep() -> u64 {
 // Aliases
 // ---------------------------------------------------------------------------
 
+/// How a multi-target alias picks among its candidate models.
+/// See `docs/003-smart-handling.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AliasPolicy {
+    /// Serve from any already-loaded candidate (in target order) before
+    /// spawning anything; fall back to loading, then to queueing.
+    #[default]
+    PreferLoaded,
+    /// Try candidates strictly in order: warm slot, spawn, make-room —
+    /// only advance to the next candidate when all three fail.
+    PreferOrder,
+}
+
+/// What an alias may evict to make room for a candidate that does not fit.
+/// See `docs/003-smart-handling.md`, victim classes 1–3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MakeRoomMode {
+    /// Never evict; fail/queue as before.
+    None,
+    /// Evict idle instances past their model's `idle_ttl` protection window.
+    #[default]
+    EvictIdle,
+    /// Additionally drain busy *surplus duplicate* instances (never the last
+    /// serving instance of a model), bounded by the alias's `drain_timeout`.
+    DrainSurplus,
+}
+
+/// Deserialize a field that accepts either a single string or a sequence of
+/// strings, normalizing to `Vec<String>`.
+fn string_or_seq<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AliasConfig {
     /// The alias name — appears in `/v1/models` and can be used in API requests.
     pub name: String,
 
-    /// Target model name (must match a `ModelConfig::name`).
-    pub target: String,
+    /// Ordered candidate model names (each must match a `ModelConfig::name`).
+    /// Later entries are spillover for when an earlier entry cannot be
+    /// served or loaded.  The legacy scalar form `target: <name>` is
+    /// accepted as a one-element list.
+    #[serde(alias = "target", deserialize_with = "string_or_seq")]
+    pub targets: Vec<String>,
 
-    /// Optional system prompt injected when this alias is used.
+    /// Candidate selection policy.
     #[serde(default)]
-    pub system_prompt: Option<String>,
+    pub policy: AliasPolicy,
 
-    /// Optional prompt template override (e.g. chat format).
+    /// What may be evicted to make room for a candidate that does not fit.
     #[serde(default)]
-    pub prompt_template: Option<String>,
+    pub make_room: MakeRoomMode,
+
+    /// Bound (seconds) on waiting for a busy surplus duplicate to drain
+    /// before giving up on a make-room plan.  Only relevant with
+    /// `make_room: drain_surplus`.
+    #[serde(default = "default_drain_timeout")]
+    pub drain_timeout: u64,
+}
+
+fn default_drain_timeout() -> u64 {
+    300
 }
 // ── Tests ────────────────────────────────────────────────────────────────────
 
@@ -907,5 +1003,92 @@ models:
             "apikeys_file: apikeys.txt\nkeep_alive:\n  amd:\n    cmd: \"  \"\n    sleep: 5",
         );
         expect_validation_error(&yaml, "keep_alive.amd.cmd must not be empty");
+    }
+
+    // ── Aliases ─────────────────────────────────────────────────────
+
+    #[test]
+    fn accepts_scalar_target_as_one_element_targets() {
+        let yaml = BASE.replace(
+            "apikeys_file: apikeys.txt",
+            "apikeys_file: apikeys.txt\naliases:\n  - name: a\n    target: m",
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.aliases[0].targets, vec!["m".to_owned()]);
+        // Defaults.
+        assert_eq!(cfg.aliases[0].policy, AliasPolicy::PreferLoaded);
+        assert_eq!(cfg.aliases[0].make_room, MakeRoomMode::EvictIdle);
+        assert_eq!(cfg.aliases[0].drain_timeout, 300);
+    }
+
+    #[test]
+    fn accepts_targets_list_with_explicit_settings() {
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\n  - name: m2\n    context_length: 4096\n    cmd: \"sleep 3600\"",
+        )
+        .replace(
+            "apikeys_file: apikeys.txt",
+            "apikeys_file: apikeys.txt\naliases:\n  - name: a\n    targets: [m, m2]\n    policy: prefer_order\n    make_room: drain_surplus\n    drain_timeout: 60",
+        );
+        let cfg = parse(&yaml).unwrap();
+        let a = &cfg.aliases[0];
+        assert_eq!(a.targets, vec!["m".to_owned(), "m2".to_owned()]);
+        assert_eq!(a.policy, AliasPolicy::PreferOrder);
+        assert_eq!(a.make_room, MakeRoomMode::DrainSurplus);
+        assert_eq!(a.drain_timeout, 60);
+    }
+
+    #[test]
+    fn rejects_empty_targets_list() {
+        let yaml = BASE.replace(
+            "apikeys_file: apikeys.txt",
+            "apikeys_file: apikeys.txt\naliases:\n  - name: a\n    targets: []",
+        );
+        expect_validation_error(&yaml, "targets must not be empty");
+    }
+
+    #[test]
+    fn rejects_unknown_alias_target() {
+        let yaml = BASE.replace(
+            "apikeys_file: apikeys.txt",
+            "apikeys_file: apikeys.txt\naliases:\n  - name: a\n    targets: [m, nope]",
+        );
+        expect_validation_error(&yaml, "alias 'a' targets unknown model 'nope'");
+    }
+
+    #[test]
+    fn rejects_alias_chaining() {
+        let yaml = BASE.replace(
+            "apikeys_file: apikeys.txt",
+            "apikeys_file: apikeys.txt\naliases:\n  - name: a\n    target: m\n  - name: b\n    targets: [a]",
+        );
+        expect_validation_error(&yaml, "aliases cannot chain");
+    }
+
+    #[test]
+    fn rejects_zero_drain_timeout() {
+        let yaml = BASE.replace(
+            "apikeys_file: apikeys.txt",
+            "apikeys_file: apikeys.txt\naliases:\n  - name: a\n    target: m\n    drain_timeout: 0",
+        );
+        expect_validation_error(&yaml, "drain_timeout must be > 0");
+    }
+
+    #[test]
+    fn ignores_removed_alias_prompt_keys() {
+        // Old configs with system_prompt / prompt_template keep loading —
+        // serde ignores the now-unknown keys.
+        let yaml = BASE.replace(
+            "apikeys_file: apikeys.txt",
+            "apikeys_file: apikeys.txt\naliases:\n  - name: a\n    target: m\n    system_prompt: hi\n    prompt_template: \"{prompt}\"",
+        );
+        parse(&yaml).unwrap();
+    }
+
+    #[test]
+    fn drain_idle_timeout_defaults_to_3600() {
+        let cfg = parse(BASE).unwrap();
+        assert_eq!(cfg.server.drain_idle_timeout_secs, 3600);
     }
 }
