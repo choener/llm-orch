@@ -134,6 +134,17 @@ models:
     queue_depth: 20           # max queued requests before returning 429
     vulkan_devices: [0]       # run on Vulkan device 0
 
+    # Load-based autoscaling (see the README "Autoscaling" section).  The
+    # thresholds are fractions of max_concurrent × instances: with
+    # max_concurrent: 4, a second instance spawns once the 5-minute load
+    # average exceeds 0.7 × 4 = 2.8 concurrent requests, and it is
+    # despawned again once the 15-minute average drops below 0.4 × 4 = 1.6.
+    autoscale:
+      enabled: true
+      scale_up_at: 0.7        # spawn when load_m5 > 0.7 × max_concurrent × n
+      scale_down_at: 0.4      # despawn when load_m15 < 0.4 × max_concurrent × (n − 1)
+      cooldown_secs: 120      # min. seconds between any two scale actions
+
     cmd: |
       {llama}
         --model /models/qwen3-32b-q4_k_m.gguf

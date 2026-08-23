@@ -70,6 +70,103 @@ In `config.yaml`, each model definition controls its lifecycle:
 - `idle_ttl`: Seconds to keep the model loaded after the last request.
 - `vulkan_devices`: The pool of GPU indices this model is allowed to use.
 
+### Autoscaling
+
+Per-model load-based autoscaling adjusts the number of parallel instances of a
+model to sustained demand. It complements the default lifecycle (spawn on first
+request, unload after idle) and is configured per model:
+
+```yaml
+models:
+  - name: "qwen3-32b"
+    max_instances: 2        # hard cap on parallel instances
+    max_concurrent: 4       # slots per instance - the capacity denominator
+    autoscale:
+      enabled: true
+      scale_up_at: 0.7
+      scale_down_at: 0.4
+      cooldown_secs: 120
+```
+
+The `autoscale` block is optional. Omit it (or set `enabled: false`) and the
+model follows the plain lifecycle: spawned on demand, surplus idle instances
+evicted past the global drain timeout, and no proactive scale-up.
+
+**How it works.** The scheduler tracks Unix-style load averages per model -
+exponentially weighted moving averages of *concurrent in-flight requests*
+(`load_m1` / `load_m5` / `load_m15`), updated on every slot acquire/release
+(event-driven, no polling). A background task re-evaluates every model every
+30 seconds:
+
+- **Scale up (n -> n+1):** when `load_m5 > scale_up_at * max_concurrent * n`
+  (and `n < max_instances` and a GPU with enough free VRAM exists), a new
+  instance is spawned. The same gate applies on the request path: a request
+  that finds no free slot only triggers a spawn when the gate passes, and
+  otherwise queues. Cold start (zero instances) always spawns immediately.
+- **Scale down (n -> n-1):** when `load_m15 < scale_down_at *
+  max_concurrent * (n - 1)`, the least-loaded *idle* instance is despawned.
+  In-flight requests are never interrupted; busy instances are skipped.
+- **Unload (n -> 0):** autoscaling never removes the last instance - that
+  happens after `server.drain_idle_timeout_secs` without requests (default
+  3600 s), the same path used when autoscaling is disabled.
+
+The hysteresis - scale-up on the fast 5-minute EMA and the higher threshold,
+scale-down on the slow 15-minute EMA and the lower threshold - plus the
+per-model `cooldown_secs` are what keep the instance count from flapping on
+bursts.
+
+**Parameters to watch.**
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `autoscale.enabled` | - | Master switch for load-based scaling. |
+| `autoscale.scale_up_at` | `0.7` | Spawn when `load_m5` exceeds this fraction of `max_concurrent * instances`. |
+| `autoscale.scale_down_at` | `0.4` | Despawn when `load_m15` drops below this fraction of `max_concurrent * (instances - 1)`. |
+| `autoscale.cooldown_secs` | `120` | Minimum seconds between any two scale actions for the model. |
+| `max_instances` | `1` | Hard cap on scale-up (VRAM permitting). |
+| `max_concurrent` | `4` | Slots per instance - **the denominator of every threshold**. |
+| `queue_depth` | `10` | Where excess requests go while the gate refuses to spawn; 429 when full. |
+| `server.drain_idle_timeout_secs` | `3600` | The only n -> 0 mechanism. |
+| `vram` * `gpus` | - | Per-instance VRAM reservation; scale-up is also bounded by free VRAM in the device pool. |
+
+The one that bites in practice is `max_concurrent`: because every threshold
+is relative to it, the *useful* parallelism per instance belongs there, not
+the theoretical maximum. Worked example - a 27B-class model that fits x2 on
+your GPUs:
+
+- `max_concurrent: 4`, one instance, defaults: the scale-up threshold is
+  `0.7 * 4 * 1 = 2.8`. Two steady parallel requests give a load of about 2.0
+  - below the threshold **forever**, so a second instance is never spawned.
+- Set `max_concurrent: 2` (two is all one instance of this model can usefully
+  handle): the threshold becomes `0.7 * 2 = 1.4 < 2.0`, and the second
+  instance spawns once two parallel requests are sustained.
+- Alternatively, lower `scale_up_at` to *strictly* below
+  `load / (max_concurrent * instances)`. The comparison is a strict `>`, so
+  to scale up at exactly 2.0 concurrent on 4.0 of capacity you need
+  `scale_up_at < 0.5` (e.g. `0.49`) - not `0.5`.
+- Load must be *sustained*: `load_m5` has a ~5-minute time constant, so a
+  burst of a few minutes only moves it partway (after 5 minutes it has
+  reached about 63% of a step change). Short spikes queue instead of scaling.
+- While the gate refuses to spawn, excess requests queue up to `queue_depth`
+  and then start getting 429s - watch `queue_depth_used` to see if that is
+  what is happening to you.
+
+**Observing autoscaling.** `GET /v1/info` and `GET /admin/status` (see
+`scripts/get-status.sh`) report the decision inputs per model:
+
+```bash
+scripts/get-status.sh | jq '.models[] | {name, instance_count, max_instances,
+  load_m5, load_m15, queue_depth_used, blocked}'
+```
+
+Compare `load_m5` against `scale_up_at * max_concurrent * instance_count` and
+`load_m15` against `scale_down_at * max_concurrent * (instance_count - 1)` -
+that is exactly the decision the autoscaler makes. With `RUST_LOG=info` you
+also get the decision log lines: `autoscale: scaling up (load_m5=..., threshold=...)`,
+`autoscale: scaled down (load_m15=..., threshold=...)`, and `drain idle timeout
+expired, ...` for the n -> 0 unload. Actions are sparse by design: evaluated
+every 30 s and at most one per `cooldown_secs`.
+
 ### CUDA (NVIDIA) devices
 Device placement works for NVIDIA GPUs with full parity to the Vulkan path:
 
