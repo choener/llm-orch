@@ -7,7 +7,7 @@ use crate::backend::{
     Backend, DeviceKind, LlamaCppBackend, ReadyOutcome, output_lines, poll_readiness,
     shutdown_child, spawn_process,
 };
-use crate::config::ModelConfig;
+use crate::config::{AliasPolicy, MakeRoomMode, ModelConfig};
 use crate::gpu::GpuMetrics;
 use crate::http_client;
 use crate::instance::{Instance, InstanceHandle, InstanceState, SlotGuard};
@@ -16,7 +16,7 @@ use crate::port_alloc::PortAllocator;
 use crate::types::CompletionRecord;
 
 use reqwest::Client;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -442,30 +442,169 @@ impl InstanceManager {
         self: &Arc<Self>,
         model_name: &str,
     ) -> Result<SlotGuard, AcquireError> {
-        if self.is_blocked(model_name) {
-            return Err(AcquireError::Blocked);
+        // Direct (non-alias) requests are a one-element candidate list with
+        // make-room disabled — decision 9 of docs/003-smart-handling.md.
+        self.acquire_for_candidates(
+            std::slice::from_ref(&model_name.to_owned()),
+            AliasPolicy::PreferLoaded,
+            MakeRoomMode::None,
+            0,
+        )
+        .await
+        .map(|(_, guard)| guard)
+    }
+
+    /// Acquire an instance slot for one of `candidates` (in preference
+    /// order), returning the chosen model name alongside the slot guard.
+    /// Multi-model alias routing — see `docs/003-smart-handling.md`.
+    ///
+    /// Selection (`prefer_loaded`): any warm slot in order → first
+    /// candidate spawnable *without* eviction → first candidate spawnable
+    /// *with* make-room eviction → queue on the first loaded candidate.
+    /// `prefer_order` instead tries each candidate fully (warm slot →
+    /// spawn → make-room) before advancing to the next.
+    ///
+    /// Unknown and blocked candidates are skipped (traced); only when
+    /// *every* candidate is unusable does the call fail.
+    pub async fn acquire_for_candidates(
+        self: &Arc<Self>,
+        candidates: &[String],
+        policy: AliasPolicy,
+        make_room: MakeRoomMode,
+        drain_timeout: u64,
+    ) -> Result<(String, SlotGuard), AcquireError> {
+        // Resolve configs for all candidates; skip unknown/blocked ones.
+        // No awaits while the configs guard is held.
+        let mut resolved: Vec<(String, ModelConfig)> = Vec::new();
+        let mut any_blocked = false;
+        {
+            let configs = self.model_configs.read().unwrap();
+            for name in candidates {
+                if self.is_blocked(name) {
+                    any_blocked = true;
+                    debug!(model = %name, "candidate skipped — model blocked");
+                    continue;
+                }
+                match configs.get(name) {
+                    Some(cfg) => resolved.push((name.clone(), cfg.clone())),
+                    None => debug!(model = %name, "candidate skipped — unknown model"),
+                }
+            }
+        }
+        if resolved.is_empty() {
+            return Err(if any_blocked {
+                AcquireError::Blocked
+            } else {
+                AcquireError::Unavailable
+            });
         }
 
-        // Clone the model config out of the lock — it may be swapped by a
-        // config reload at any time, and the guard must not be held across
-        // the awaits below.
-        let cfg = self
-            .model_configs
-            .read()
-            .unwrap()
-            .get(model_name)
-            .cloned()
-            .ok_or(AcquireError::Unavailable)?;
+        match policy {
+            AliasPolicy::PreferLoaded => {
+                // Pass A: first candidate with a warm slot.
+                for (name, cfg) in &resolved {
+                    if let Some(guard) = self.acquire_ready_slot(name, cfg.max_concurrent) {
+                        return Ok((name.clone(), guard));
+                    }
+                }
+                // Pass B, round 1: first candidate spawnable *without*
+                // eviction — a spillover candidate that fits for free beats
+                // evicting for a more preferred one (decision 6).
+                for (name, cfg) in &resolved {
+                    if !self.should_spawn(name, cfg) {
+                        continue;
+                    }
+                    if !self.spawn_feasible(cfg, &HashSet::new()).await {
+                        debug!(model = %name, "candidate does not fit without eviction");
+                        continue;
+                    }
+                    if let Some(guard) = self.spawn_and_acquire(name, cfg).await {
+                        return Ok((name.clone(), guard));
+                    }
+                }
+                // Pass B, round 2: make-room eviction, in candidate order.
+                if make_room != MakeRoomMode::None {
+                    for (name, cfg) in &resolved {
+                        if !self.should_spawn(name, cfg) {
+                            continue;
+                        }
+                        if self.spawn_feasible(cfg, &HashSet::new()).await {
+                            // Round 1 already tried (and failed) to spawn
+                            // this one — don't retry immediately.
+                            continue;
+                        }
+                        match self.plan_make_room(cfg, make_room).await {
+                            Some(plan) => {
+                                self.execute_make_room(&plan, drain_timeout).await;
+                                if let Some(guard) = self.spawn_and_acquire(name, cfg).await {
+                                    return Ok((name.clone(), guard));
+                                }
+                            }
+                            None => {
+                                debug!(model = %name, "no make-room plan frees enough VRAM")
+                            }
+                        }
+                    }
+                }
+            }
+            AliasPolicy::PreferOrder => {
+                // Per candidate, in order: warm slot → spawn → make-room.
+                // Only advance to the next candidate when all three fail.
+                for (name, cfg) in &resolved {
+                    if let Some(guard) = self.acquire_ready_slot(name, cfg.max_concurrent) {
+                        return Ok((name.clone(), guard));
+                    }
+                    if !self.should_spawn(name, cfg) {
+                        continue;
+                    }
+                    if self.spawn_feasible(cfg, &HashSet::new()).await {
+                        if let Some(guard) = self.spawn_and_acquire(name, cfg).await {
+                            return Ok((name.clone(), guard));
+                        }
+                    } else if make_room != MakeRoomMode::None {
+                        match self.plan_make_room(cfg, make_room).await {
+                            Some(plan) => {
+                                self.execute_make_room(&plan, drain_timeout).await;
+                                if let Some(guard) = self.spawn_and_acquire(name, cfg).await {
+                                    return Ok((name.clone(), guard));
+                                }
+                            }
+                            None => {
+                                debug!(model = %name, "no make-room plan frees enough VRAM")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pass C: wait — queue on the first *loaded* candidate (a release
+        // or spawn event can wake a parked waiter); when nothing is loaded,
+        // on the first candidate, which fails fast if nothing can ever
+        // wake the queue (current single-model semantics).
+        let (queue_name, queue_cfg) = resolved
+            .iter()
+            .find(|(n, _)| self.has_routable_instance(n))
+            .unwrap_or(&resolved[0]);
+        debug!(
+            model = %queue_name,
+            "no candidate could serve or be loaded — queueing"
+        );
+        match self.enqueue(queue_name, queue_cfg.queue_depth).await {
+            Ok(guard) => Ok((queue_name.clone(), guard)),
+            // Nothing exists that could ever wake a waiter — the spawn
+            // failed (see logs) or everything left is retiring.
+            Err(EnqueueError::NoInstances) => Err(AcquireError::Unavailable),
+            Err(EnqueueError::QueueFull | EnqueueError::Timeout) => Err(AcquireError::NoCapacity),
+        }
+    }
+
+    /// Autoscale spawn gate: only spawn if sustained load exceeds the
+    /// threshold (always true for cold-start — zero existing instances —
+    /// and when autoscale is disabled or absent).
+    fn should_spawn(&self, model_name: &str, cfg: &ModelConfig) -> bool {
         let max_concurrent = cfg.max_concurrent;
-
-        // Fast path: find a ready instance with spare capacity.
-        if let Some(guard) = self.acquire_ready_slot(model_name, max_concurrent) {
-            return Ok(guard);
-        }
-
-        // Autoscale spawn gate: only spawn if sustained load exceeds
-        // threshold (skip for cold-start, i.e. zero existing instances).
-        let should_spawn = if let Some(ref a) = cfg.autoscale {
+        if let Some(ref a) = cfg.autoscale {
             if !a.enabled {
                 true
             } else {
@@ -514,33 +653,270 @@ impl InstanceManager {
             }
         } else {
             true // no autoscale config — spawn immediately
-        };
+        }
+    }
 
-        // Slow path: ensure a spawn is running and await its completion.
-        if should_spawn {
-            let mut rx = self.ensure_spawn(model_name, &cfg);
-            // Bound the wait: spawn timeout + serialized window + margin for
-            // semaphore queueing and process setup.
-            let budget = self.spawn_timeout + SPAWN_SERIAL_WINDOW + Duration::from_secs(30);
-            // The entry's sender is dropped when the spawn task finishes —
-            // success or failure — which resolves `changed()` with an error.
-            let _ = tokio::time::timeout(budget, rx.changed()).await;
-            // Retry the fast path once: after a successful spawn the fresh
-            // instance is Ready with spare capacity.  On failure (or if
-            // competing requests filled it first) fall through to the
-            // queue — which fails fast when no instance exists at all.
-            if let Some(guard) = self.acquire_ready_slot(model_name, max_concurrent) {
-                return Ok(guard);
+    /// Spawn-feasibility dry-run: would `try_spawn` get past the instance
+    /// cap and the device-pool check right now, assuming the instances in
+    /// `excluding` (make-room victims) were gone?
+    ///
+    /// Racy by nature — another spawn may grab the VRAM between this check
+    /// and the actual spawn; `try_spawn` re-checks under the spawn
+    /// semaphore and simply fails then, which the caller handles.
+    async fn spawn_feasible(&self, cfg: &ModelConfig, excluding: &HashSet<String>) -> bool {
+        // Instance cap (mirrors try_spawn): retiring (`Failed`) instances
+        // and planned make-room victims don't count.
+        {
+            let instances = self.instances.read().unwrap();
+            if let Some(list) = instances.get(&cfg.name) {
+                let active = list
+                    .iter()
+                    .filter(|h| {
+                        let inst = h.inner().lock().unwrap();
+                        inst.state != InstanceState::Failed && !excluding.contains(&inst.id)
+                    })
+                    .count();
+                if active >= cfg.max_instances {
+                    return false;
+                }
             }
         }
+        // Without a device pool there is nothing to check — the spawn
+        // proceeds unpinned (CPU or unrestricted GPUs).
+        let has_device_pool = !cfg.vulkan_devices.is_empty() || !cfg.cuda_devices.is_empty();
+        if !has_device_pool {
+            return true;
+        }
+        self.select_gpus_inner(cfg, excluding).await.len() >= cfg.gpus
+    }
 
-        // Queue path: all instances busy and at cap.
-        match self.enqueue(model_name, cfg.queue_depth).await {
-            Ok(guard) => Ok(guard),
-            // Nothing exists that could ever wake a waiter — the spawn
-            // failed (see logs) or everything left is retiring.
-            Err(EnqueueError::NoInstances) => Err(AcquireError::Unavailable),
-            Err(EnqueueError::QueueFull | EnqueueError::Timeout) => Err(AcquireError::NoCapacity),
+    /// Ensure a spawn for `model_name` is running, await its completion
+    /// (bounded), then try the fast path once.  `None` on spawn failure or
+    /// when competing requests filled the fresh instance first — the
+    /// caller decides whether to try the next candidate or queue.
+    async fn spawn_and_acquire(
+        self: &Arc<Self>,
+        model_name: &str,
+        cfg: &ModelConfig,
+    ) -> Option<SlotGuard> {
+        let mut rx = self.ensure_spawn(model_name, cfg);
+        // Bound the wait: spawn timeout + serialized window + margin for
+        // semaphore queueing and process setup.
+        let budget = self.spawn_timeout + SPAWN_SERIAL_WINDOW + Duration::from_secs(30);
+        // The entry's sender is dropped when the spawn task finishes —
+        // success or failure — which resolves `changed()` with an error.
+        let _ = tokio::time::timeout(budget, rx.changed()).await;
+        // Retry the fast path once: after a successful spawn the fresh
+        // instance is Ready with spare capacity.  On failure (or if
+        // competing requests filled it first) the caller falls through.
+        self.acquire_ready_slot(model_name, cfg.max_concurrent)
+    }
+
+    /// Whether the model has at least one routable (non-retiring)
+    /// instance — i.e. a release or spawn event could wake a queued waiter.
+    fn has_routable_instance(&self, model_name: &str) -> bool {
+        self.instances
+            .read()
+            .unwrap()
+            .get(model_name)
+            .map(|l| {
+                l.iter()
+                    .any(|h| h.inner().lock().unwrap().state != InstanceState::Failed)
+            })
+            .unwrap_or(false)
+    }
+
+    // ── make-room eviction (docs/003-smart-handling.md) ──────────────────
+
+    /// Plan the victim set that frees enough VRAM for `cfg` to spawn.
+    /// Victims are accumulated in class order (idle surplus duplicates →
+    /// idle last instances → busy surplus duplicates), least-recently-used
+    /// first within a class, re-checking feasibility after each addition.
+    /// `Some(plan)` — possibly empty — means spawning works after the plan
+    /// is executed; `None` means no allowed eviction gets there.
+    async fn plan_make_room(
+        &self,
+        cfg: &ModelConfig,
+        mode: MakeRoomMode,
+    ) -> Option<Vec<MakeRoomVictim>> {
+        if mode == MakeRoomMode::None {
+            return None;
+        }
+        let mut excluding: HashSet<String> = HashSet::new();
+        let mut plan = Vec::new();
+        loop {
+            if self.spawn_feasible(cfg, &excluding).await {
+                return Some(plan);
+            }
+            match self.next_make_room_victim(&cfg.name, mode, &excluding) {
+                Some(victim) => {
+                    debug!(
+                        model = %cfg.name,
+                        victim_model = %victim.model_name,
+                        victim_inst = %victim.handle.id(),
+                        drain = victim.drain,
+                        "make-room: planned victim"
+                    );
+                    excluding.insert(victim.handle.id());
+                    plan.push(victim);
+                }
+                None => return None,
+            }
+        }
+    }
+
+    /// Pick the next make-room victim not already in `excluding`, in
+    /// victim-class order.  Idle instances (classes 1–2) are only eligible
+    /// once idle past their model's `idle_ttl` protection window.  Busy
+    /// duplicates (class 3, `drain_surplus` only) are never taken from the
+    /// requesting model itself and never leave a model without a serving
+    /// instance.
+    fn next_make_room_victim(
+        &self,
+        requesting_model: &str,
+        mode: MakeRoomMode,
+        excluding: &HashSet<String>,
+    ) -> Option<MakeRoomVictim> {
+        struct Snap {
+            model_name: String,
+            handle: InstanceHandle,
+            last_active: Instant,
+            in_flight: usize,
+            ready: bool,
+        }
+        let mut snaps: Vec<Snap> = Vec::new();
+        {
+            let instances = self.instances.read().unwrap();
+            for (model_name, list) in instances.iter() {
+                for h in list {
+                    let inst = h.inner().lock().unwrap();
+                    if inst.state == InstanceState::Failed || excluding.contains(&inst.id) {
+                        continue;
+                    }
+                    snaps.push(Snap {
+                        model_name: model_name.clone(),
+                        handle: h.clone(),
+                        last_active: inst.last_active,
+                        in_flight: inst.in_flight,
+                        ready: inst.state == InstanceState::Ready,
+                    });
+                }
+            }
+        }
+        // Non-retiring instances per model (excluding planned victims) —
+        // the "surplus" reference count.
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for s in &snaps {
+            *counts.entry(s.model_name.as_str()).or_default() += 1;
+        }
+        let idle_ttl_of = |model_name: &str| {
+            self.model_configs
+                .read()
+                .unwrap()
+                .get(model_name)
+                .map(|c| c.idle_ttl)
+                .unwrap_or(0)
+        };
+        // Idle victims (classes 1–2): Ready, no in-flight, past their
+        // model's protection window; least-recently-used first.
+        let mut idle: Vec<&Snap> = snaps
+            .iter()
+            .filter(|s| {
+                s.ready
+                    && s.in_flight == 0
+                    && s.last_active.elapsed().as_secs() >= idle_ttl_of(&s.model_name)
+            })
+            .collect();
+        idle.sort_by_key(|s| s.last_active);
+        // Class 1: idle surplus duplicates of any model.
+        if let Some(s) = idle.iter().find(|s| counts[s.model_name.as_str()] >= 2) {
+            return Some(MakeRoomVictim {
+                model_name: s.model_name.clone(),
+                handle: s.handle.clone(),
+                drain: false,
+            });
+        }
+        // Class 2: idle last instances.
+        if let Some(s) = idle.first() {
+            return Some(MakeRoomVictim {
+                model_name: s.model_name.clone(),
+                handle: s.handle.clone(),
+                drain: false,
+            });
+        }
+        // Class 3: busy surplus duplicates (drain_surplus only) — never
+        // from the requesting model itself, never the last serving
+        // instance of a model; least-busy first.
+        if mode == MakeRoomMode::DrainSurplus
+            && let Some(s) = snaps
+                .iter()
+                .filter(|s| {
+                    s.model_name != requesting_model
+                        && s.in_flight > 0
+                        && counts[s.model_name.as_str()] >= 2
+                })
+                .min_by_key(|s| s.in_flight)
+        {
+            return Some(MakeRoomVictim {
+                model_name: s.model_name.clone(),
+                handle: s.handle.clone(),
+                drain: true,
+            });
+        }
+        None
+    }
+
+    /// Execute a make-room plan: evict idle victims immediately, drain
+    /// busy duplicates with a per-victim bounded wait (`drain_timeout`
+    /// seconds).  Victims are re-validated implicitly — `remove_instance`
+    /// is a no-op when the instance became busy in the meantime, and a
+    /// timed-out drain leaves the instance draining (reaped once idle);
+    /// the subsequent spawn attempt simply fails and the caller advances.
+    async fn execute_make_room(&self, plan: &[MakeRoomVictim], drain_timeout: u64) {
+        for victim in plan {
+            if victim.drain {
+                info!(
+                    model = %victim.model_name,
+                    inst = %victim.handle.id(),
+                    "make-room: draining busy surplus instance"
+                );
+                self.drain_instance(&victim.model_name, &victim.handle)
+                    .await;
+                let deadline = Instant::now() + Duration::from_secs(drain_timeout);
+                loop {
+                    self.reap_drained(&victim.model_name).await;
+                    let gone = !self
+                        .instances
+                        .read()
+                        .unwrap()
+                        .get(&victim.model_name)
+                        .map(|l| {
+                            l.iter()
+                                .any(|h| Arc::ptr_eq(h.inner(), victim.handle.inner()))
+                        })
+                        .unwrap_or(false);
+                    if gone {
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        warn!(
+                            model = %victim.model_name,
+                            inst = %victim.handle.id(),
+                            "make-room: drain timed out — continuing anyway"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            } else {
+                info!(
+                    model = %victim.model_name,
+                    inst = %victim.handle.id(),
+                    "make-room: evicting idle instance"
+                );
+                self.remove_instance(&victim.model_name, &victim.handle)
+                    .await;
+            }
         }
     }
 
@@ -1070,6 +1446,17 @@ impl InstanceManager {
     /// Per-GPU accounting is keyed by PCI slot so Vulkan and CUDA
     /// indices can never alias each other.
     async fn select_gpus_for_model(&self, model_cfg: &ModelConfig) -> Vec<usize> {
+        self.select_gpus_inner(model_cfg, &HashSet::new()).await
+    }
+
+    /// GPU selection with a set of instance IDs to ignore (planned
+    /// make-room victims) — their VRAM and GPU occupancy are treated as
+    /// already freed.  Used by `plan_make_room` to simulate evictions.
+    async fn select_gpus_inner(
+        &self,
+        model_cfg: &ModelConfig,
+        excluding: &HashSet<String>,
+    ) -> Vec<usize> {
         let kind = model_cfg.device_kind();
         let pool = match kind {
             DeviceKind::Cuda => &model_cfg.cuda_devices,
@@ -1122,10 +1509,11 @@ impl InstanceManager {
             "selecting GPU"
         );
 
-        let occupied: std::collections::HashSet<String> = {
+        let occupied: HashSet<String> = {
             let instances = self.instances.read().unwrap();
             if let Some(list) = instances.get(&model_cfg.name) {
                 list.iter()
+                    .filter(|h| !excluding.contains(&h.inner().lock().unwrap().id))
                     .flat_map(|h| {
                         let inst = h.inner().lock().unwrap();
                         inst.gpu_indices.clone()
@@ -1133,7 +1521,7 @@ impl InstanceManager {
                     .filter_map(|idx| slot_for(&model_cfg.name, idx))
                     .collect()
             } else {
-                std::collections::HashSet::new()
+                HashSet::new()
             }
         };
 
@@ -1148,6 +1536,9 @@ impl InstanceManager {
                     .unwrap_or(0);
                 for handle in list {
                     let inst = handle.inner().lock().unwrap();
+                    if excluding.contains(&inst.id) {
+                        continue;
+                    }
                     // Attribute the full declared VRAM to *every* occupied
                     // GPU — conservative, but prevents oversubscription
                     // when a multi-device instance spans several GPUs.
@@ -1225,6 +1616,9 @@ impl InstanceManager {
             for (model_name, list) in instances.iter() {
                 for handle in list {
                     let inst = handle.inner().lock().unwrap();
+                    if excluding.contains(&inst.id) {
+                        continue;
+                    }
                     for &idx in &inst.gpu_indices {
                         if let Some(slot) = slot_for(model_name, idx) {
                             *counts.entry(slot).or_default() += 1;
@@ -2144,6 +2538,15 @@ impl InstanceManager {
         list.sort_by_key(|h| h.inner().lock().unwrap().in_flight);
         list
     }
+}
+
+/// One make-room eviction step (docs/003-smart-handling.md, victim
+/// classes 1–3): idle victims are removed outright; busy surplus
+/// duplicates are drained (bounded by the alias's `drain_timeout`).
+struct MakeRoomVictim {
+    model_name: String,
+    handle: InstanceHandle,
+    drain: bool,
 }
 
 // ── Spawn bookkeeping ────────────────────────────────────────────────────────
@@ -3623,5 +4026,555 @@ models:
         // Second call: no panic, no state change.
         mgr.unregister_instance("m", &handle, &[0]).await;
         assert_eq!(instance_count(&mgr), 0);
+    }
+
+    // ── Multi-model alias routing (docs/003-smart-handling.md) ───────────
+
+    /// Two spawn-failing models (`true` exits instantly), no device pools.
+    const TWO_MODEL_YAML: &str = r#"
+server: {}
+apikeys_file: apikeys.txt
+models:
+  - name: m1
+    context_length: 4096
+    cmd: "true"
+  - name: m2
+    context_length: 4096
+    cmd: "true"
+"#;
+
+    fn two_model_manager() -> InstanceManager {
+        let config: crate::config::Config = serde_yaml_ng::from_str(TWO_MODEL_YAML).unwrap();
+        let gpu_snapshot = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+        let (mgr, _release_rx, _crash_rx) = InstanceManager::new(&config, gpu_snapshot, None);
+        mgr
+    }
+
+    /// Three 48 GB GPUs; `moe` needs 30 GB (pool 0–1), `dense` needs
+    /// 20 GB (pool 0–2).  Two dense instances on GPUs 0–1 leave only
+    /// 28 GB free there, so `moe` cannot fit without eviction — while
+    /// `dense` can still spawn on the free GPU 2.
+    const MAKEROOM_YAML: &str = r#"
+server: {}
+apikeys_file: apikeys.txt
+devices:
+  vulkan:
+    0: "0000:01:00.0"
+    1: "0000:02:00.0"
+    2: "0000:03:00.0"
+models:
+  - name: moe
+    context_length: 4096
+    cmd: "true"
+    idle_ttl: 60
+    vram: 30000
+    gpus: 1
+    vulkan_devices: [0, 1]
+  - name: dense
+    context_length: 4096
+    cmd: "true"
+    idle_ttl: 60
+    vram: 20000
+    gpus: 1
+    max_instances: 3
+    queue_depth: 0
+    vulkan_devices: [0, 1, 2]
+"#;
+
+    fn makeroom_manager() -> InstanceManager {
+        let config: crate::config::Config = serde_yaml_ng::from_str(MAKEROOM_YAML).unwrap();
+        let snapshot = Arc::new(tokio::sync::RwLock::new(vec![
+            gpu_metrics(0, "0000:01:00.0", 48000),
+            gpu_metrics(1, "0000:02:00.0", 48000),
+            gpu_metrics(2, "0000:03:00.0", 48000),
+        ]));
+        let (mgr, _release_rx, _crash_rx) = InstanceManager::new(&config, snapshot, None);
+        mgr
+    }
+
+    fn cands(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn register_inst(
+        mgr: &InstanceManager,
+        model: &str,
+        gpus: Vec<usize>,
+        in_flight: usize,
+        idle_for: Duration,
+    ) -> InstanceHandle {
+        let mut inst = Instance::new(model, gpus, 54321, None);
+        inst.state = InstanceState::Ready;
+        inst.in_flight = in_flight;
+        inst.last_active = Instant::now() - idle_for;
+        let h = InstanceHandle::new(inst);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry(model.to_owned())
+            .or_default()
+            .push(h.clone());
+        h
+    }
+
+    fn registered_count(mgr: &InstanceManager, model: &str) -> usize {
+        mgr.instances
+            .read()
+            .unwrap()
+            .get(model)
+            .map(|l| l.len())
+            .unwrap_or(0)
+    }
+
+    fn crash_count(mgr: &InstanceManager, model: &str) -> usize {
+        mgr.crash_counts
+            .lock()
+            .unwrap()
+            .get(model)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn candidates_warm_slot_follows_order() {
+        let mgr = Arc::new(two_model_manager());
+        register_inst(&mgr, "m1", vec![], 0, Duration::ZERO);
+        register_inst(&mgr, "m2", vec![], 0, Duration::ZERO);
+
+        let (name, guard) = mgr
+            .acquire_for_candidates(
+                &cands(&["m1", "m2"]),
+                AliasPolicy::PreferLoaded,
+                MakeRoomMode::EvictIdle,
+                300,
+            )
+            .await
+            .unwrap();
+        assert_eq!(name, "m1", "first candidate with a warm slot wins");
+        drop(guard);
+
+        let (name, _guard) = mgr
+            .acquire_for_candidates(
+                &cands(&["m2", "m1"]),
+                AliasPolicy::PreferLoaded,
+                MakeRoomMode::EvictIdle,
+                300,
+            )
+            .await
+            .unwrap();
+        assert_eq!(name, "m2", "reversed order reverses the pick");
+    }
+
+    #[tokio::test]
+    async fn candidates_skip_unknown_and_blocked() {
+        let mgr = Arc::new(two_model_manager());
+        register_inst(&mgr, "m2", vec![], 0, Duration::ZERO);
+
+        // Unknown candidate is skipped, the known one serves.
+        let (name, _guard) = mgr
+            .acquire_for_candidates(
+                &cands(&["nope", "m2"]),
+                AliasPolicy::PreferLoaded,
+                MakeRoomMode::EvictIdle,
+                300,
+            )
+            .await
+            .unwrap();
+        assert_eq!(name, "m2");
+
+        // All unknown → Unavailable.
+        let res = mgr
+            .acquire_for_candidates(
+                &cands(&["nope"]),
+                AliasPolicy::PreferLoaded,
+                MakeRoomMode::EvictIdle,
+                300,
+            )
+            .await;
+        assert!(matches!(res, Err(AcquireError::Unavailable)));
+
+        // All blocked → Blocked (single-model get_or_spawn semantics).
+        mgr.block_model("m2");
+        let res = mgr
+            .acquire_for_candidates(
+                &cands(&["nope", "m2"]),
+                AliasPolicy::PreferLoaded,
+                MakeRoomMode::EvictIdle,
+                300,
+            )
+            .await;
+        assert!(matches!(res, Err(AcquireError::Blocked)));
+    }
+
+    #[tokio::test]
+    async fn candidates_spawn_failure_falls_through_to_unavailable() {
+        // Nothing loaded; both candidates fail to spawn (cmd "true" exits
+        // instantly).  Pass C queues on the first candidate, which fails
+        // fast — nothing could ever wake the waiter.
+        let mgr = Arc::new(two_model_manager());
+        let res = tokio::time::timeout(
+            Duration::from_secs(15),
+            mgr.acquire_for_candidates(
+                &cands(&["m1", "m2"]),
+                AliasPolicy::PreferLoaded,
+                MakeRoomMode::EvictIdle,
+                300,
+            ),
+        )
+        .await
+        .expect("must not park");
+        assert!(matches!(res, Err(AcquireError::Unavailable)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn candidates_queue_on_first_loaded_candidate() {
+        // m1 blocked (skipped), m2 loaded but full.  Pass C must queue on
+        // m2 — the loaded candidate — where the wait times out
+        // (NoCapacity), rather than on m1, which would fail fast
+        // (Unavailable).
+        let mgr = Arc::new(two_model_manager());
+        mgr.block_model("m1");
+        register_inst(&mgr, "m2", vec![], 4, Duration::ZERO); // max_concurrent = 4
+
+        let res = mgr
+            .acquire_for_candidates(
+                &cands(&["m1", "m2"]),
+                AliasPolicy::PreferLoaded,
+                MakeRoomMode::EvictIdle,
+                300,
+            )
+            .await;
+        assert!(
+            matches!(res, Err(AcquireError::NoCapacity)),
+            "queued on the loaded candidate → timeout, got: {:?}",
+            res.map(|_| "guard")
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_feasible_respects_instance_cap() {
+        let mgr = test_manager(); // model "m", no device pool, max_instances = 1
+        let cfg = mgr.model_configs.read().unwrap().get("m").cloned().unwrap();
+
+        assert!(mgr.spawn_feasible(&cfg, &HashSet::new()).await);
+
+        let handle = make_handle(InstanceState::Ready, 0, Duration::ZERO);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle.clone());
+        assert!(
+            !mgr.spawn_feasible(&cfg, &HashSet::new()).await,
+            "at cap → infeasible"
+        );
+
+        // Retiring (Failed) instances don't count toward the cap.
+        handle.inner().lock().unwrap().state = InstanceState::Failed;
+        assert!(mgr.spawn_feasible(&cfg, &HashSet::new()).await);
+    }
+
+    #[tokio::test]
+    async fn plan_make_room_evicts_stale_idle_surplus() {
+        let mgr = makeroom_manager();
+        let moe = mgr
+            .model_configs
+            .read()
+            .unwrap()
+            .get("moe")
+            .cloned()
+            .unwrap();
+        // Two stale dense instances tile both GPUs (28 GB free each) —
+        // moe (30 GB) fits nowhere.
+        let older = register_inst(&mgr, "dense", vec![0], 0, Duration::from_secs(7200));
+        let _newer = register_inst(&mgr, "dense", vec![1], 0, Duration::from_secs(3600));
+        assert!(!mgr.spawn_feasible(&moe, &HashSet::new()).await);
+
+        let plan = mgr
+            .plan_make_room(&moe, MakeRoomMode::EvictIdle)
+            .await
+            .expect("one eviction must suffice");
+        assert_eq!(plan.len(), 1, "one freed GPU fits the moe");
+        assert!(!plan[0].drain, "idle victim is removed, not drained");
+        assert_eq!(plan[0].model_name, "dense");
+        assert!(
+            Arc::ptr_eq(plan[0].handle.inner(), older.inner()),
+            "least-recently-used victim first"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_make_room_respects_protection_window() {
+        let mgr = makeroom_manager();
+        let moe = mgr
+            .model_configs
+            .read()
+            .unwrap()
+            .get("moe")
+            .cloned()
+            .unwrap();
+        // Fresh dense instances (idle_ttl = 60 s protection) must never
+        // be evicted to make room.
+        register_inst(&mgr, "dense", vec![0], 0, Duration::ZERO);
+        register_inst(&mgr, "dense", vec![1], 0, Duration::ZERO);
+
+        assert!(
+            mgr.plan_make_room(&moe, MakeRoomMode::EvictIdle)
+                .await
+                .is_none(),
+            "instances inside their idle_ttl window are protected"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_make_room_drains_busy_surplus_only_when_allowed() {
+        let mgr = makeroom_manager();
+        let moe = mgr
+            .model_configs
+            .read()
+            .unwrap()
+            .get("moe")
+            .cloned()
+            .unwrap();
+        // Both dense instances busy — no idle victim exists.
+        let less_busy = register_inst(&mgr, "dense", vec![0], 1, Duration::ZERO);
+        let _more_busy = register_inst(&mgr, "dense", vec![1], 2, Duration::ZERO);
+
+        assert!(
+            mgr.plan_make_room(&moe, MakeRoomMode::EvictIdle)
+                .await
+                .is_none(),
+            "evict_idle must not touch busy instances"
+        );
+
+        let plan = mgr
+            .plan_make_room(&moe, MakeRoomMode::DrainSurplus)
+            .await
+            .expect("draining one busy duplicate frees a GPU");
+        assert_eq!(plan.len(), 1);
+        assert!(plan[0].drain, "busy duplicate is drained, not removed");
+        assert!(
+            Arc::ptr_eq(plan[0].handle.inner(), less_busy.inner()),
+            "least-busy duplicate is drained first"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_make_room_never_drains_last_serving_instance() {
+        let mgr = makeroom_manager();
+        let moe = mgr
+            .model_configs
+            .read()
+            .unwrap()
+            .get("moe")
+            .cloned()
+            .unwrap();
+        // A single busy dense instance: draining it would take the model
+        // offline for its own in-flight traffic.  The moe instance keeps
+        // GPU 1 occupied (and is itself busy, but own-model drains are
+        // off-limits).
+        register_inst(&mgr, "dense", vec![0], 1, Duration::ZERO);
+        register_inst(&mgr, "moe", vec![1], 1, Duration::ZERO);
+        assert!(!mgr.spawn_feasible(&moe, &HashSet::new()).await);
+
+        assert!(
+            mgr.plan_make_room(&moe, MakeRoomMode::DrainSurplus)
+                .await
+                .is_none(),
+            "the last busy instance of a model is never a victim"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_make_room_never_drains_own_model() {
+        let mgr = makeroom_manager();
+        let moe = mgr
+            .model_configs
+            .read()
+            .unwrap()
+            .get("moe")
+            .cloned()
+            .unwrap();
+        // Two busy moe duplicates occupy both GPUs (18 GB free each).
+        register_inst(&mgr, "moe", vec![0], 1, Duration::ZERO);
+        register_inst(&mgr, "moe", vec![1], 1, Duration::ZERO);
+        assert!(!mgr.spawn_feasible(&moe, &HashSet::new()).await);
+
+        assert!(
+            mgr.plan_make_room(&moe, MakeRoomMode::DrainSurplus)
+                .await
+                .is_none(),
+            "busy duplicates of the requesting model itself are off-limits"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_make_room_evicts_then_attempts_spawn() {
+        // End-to-end Pass B round 2: moe does not fit (28 GB free per
+        // GPU), a stale idle dense instance is evicted, then the moe spawn
+        // is attempted (and fails — cmd "true").
+        let mgr = Arc::new(makeroom_manager());
+        let stale = register_inst(&mgr, "dense", vec![0], 0, Duration::from_secs(3600));
+        let busy = register_inst(&mgr, "dense", vec![1], 4, Duration::ZERO); // full
+
+        let res = tokio::time::timeout(
+            Duration::from_secs(15),
+            mgr.acquire_for_candidates(
+                &cands(&["moe"]),
+                AliasPolicy::PreferLoaded,
+                MakeRoomMode::EvictIdle,
+                300,
+            ),
+        )
+        .await
+        .expect("must not park");
+        assert!(matches!(res, Err(AcquireError::Unavailable)));
+        assert_eq!(crash_count(&mgr, "moe"), 1, "moe spawn must be attempted");
+        assert_eq!(registered_count(&mgr, "dense"), 1, "stale instance evicted");
+        assert!(
+            mgr.instances.read().unwrap()["dense"]
+                .iter()
+                .any(|h| Arc::ptr_eq(h.inner(), busy.inner())),
+            "busy instance untouched"
+        );
+        assert!(
+            !mgr.instances.read().unwrap()["dense"]
+                .iter()
+                .any(|h| Arc::ptr_eq(h.inner(), stale.inner())),
+            "stale instance gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_prefer_loaded_spawns_fitting_candidate_without_eviction() {
+        // Decision 6: a spillover candidate that fits *without* eviction
+        // beats evicting for the preferred candidate.  Both dense
+        // instances are full (28 GB free per GPU): moe (30 GB) cannot fit
+        // without eviction, dense (20 GB, max_instances 3) can — with
+        // make_room disabled, dense must be spawned and nothing evicted.
+        let mgr = Arc::new(makeroom_manager());
+        register_inst(&mgr, "dense", vec![0], 4, Duration::from_secs(3600));
+        register_inst(&mgr, "dense", vec![1], 4, Duration::from_secs(3600));
+
+        let res = tokio::time::timeout(
+            Duration::from_secs(15),
+            mgr.acquire_for_candidates(
+                &cands(&["moe", "dense"]),
+                AliasPolicy::PreferLoaded,
+                MakeRoomMode::None,
+                300,
+            ),
+        )
+        .await
+        .expect("must not park");
+        // dense spawn fails (cmd "true"); Pass C queues on dense (loaded,
+        // queue_depth 0) → NoCapacity.
+        assert!(matches!(res, Err(AcquireError::NoCapacity)));
+        assert_eq!(crash_count(&mgr, "dense"), 1, "dense spawn attempted");
+        assert_eq!(crash_count(&mgr, "moe"), 0, "moe spawn never attempted");
+        assert_eq!(registered_count(&mgr, "dense"), 2, "nothing evicted");
+    }
+
+    #[tokio::test]
+    async fn acquire_prefer_order_makes_room_for_first_candidate() {
+        // Two stale idle dense instances tile the moe pool.  prefer_order
+        // tries moe fully — including make-room eviction — before
+        // advancing to dense: one dense instance is evicted and the moe
+        // spawn attempted; when it fails (cmd "true"), the remaining
+        // dense instance serves via its warm slot.
+        let mgr = Arc::new(makeroom_manager());
+        register_inst(&mgr, "dense", vec![0], 0, Duration::from_secs(3600));
+        register_inst(&mgr, "dense", vec![1], 0, Duration::from_secs(3600));
+
+        let (name, _guard) = tokio::time::timeout(
+            Duration::from_secs(15),
+            mgr.acquire_for_candidates(
+                &cands(&["moe", "dense"]),
+                AliasPolicy::PreferOrder,
+                MakeRoomMode::EvictIdle,
+                300,
+            ),
+        )
+        .await
+        .expect("must not park")
+        .expect("dense must serve after the failed moe spawn");
+        assert_eq!(name, "dense", "spillover candidate serves at the end");
+        assert_eq!(crash_count(&mgr, "moe"), 1, "moe spawn attempted first");
+        assert_eq!(
+            registered_count(&mgr, "dense"),
+            1,
+            "one stale dense instance evicted to make room for moe"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_make_room_drain_completes_when_victim_goes_idle() {
+        let mgr = makeroom_manager();
+        let moe = mgr
+            .model_configs
+            .read()
+            .unwrap()
+            .get("moe")
+            .cloned()
+            .unwrap();
+        let victim = register_inst(&mgr, "dense", vec![0], 1, Duration::ZERO);
+        register_inst(&mgr, "dense", vec![1], 2, Duration::ZERO);
+
+        let plan = mgr
+            .plan_make_room(&moe, MakeRoomMode::DrainSurplus)
+            .await
+            .expect("a busy duplicate must be drainable");
+        assert_eq!(plan.len(), 1);
+
+        // Simulate the victim's in-flight request completing shortly after
+        // the drain starts.
+        let v = victim.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            v.inner().lock().unwrap().in_flight = 0;
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), mgr.execute_make_room(&plan, 5))
+            .await
+            .expect("drain must complete well within the timeout");
+        assert_eq!(
+            registered_count(&mgr, "dense"),
+            1,
+            "drained victim reaped once idle"
+        );
+        assert!(
+            mgr.spawn_feasible(&moe, &HashSet::new()).await,
+            "moe fits after the drain"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_make_room_drain_timeout_leaves_instance_draining() {
+        let mgr = makeroom_manager();
+        let moe = mgr
+            .model_configs
+            .read()
+            .unwrap()
+            .get("moe")
+            .cloned()
+            .unwrap();
+        let victim = register_inst(&mgr, "dense", vec![0], 1, Duration::ZERO); // never idles
+        register_inst(&mgr, "dense", vec![1], 2, Duration::ZERO);
+
+        let plan = mgr
+            .plan_make_room(&moe, MakeRoomMode::DrainSurplus)
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(10), mgr.execute_make_room(&plan, 1))
+            .await
+            .expect("a stuck drain must be abandoned after drain_timeout");
+        assert_eq!(
+            victim.inner().lock().unwrap().state,
+            InstanceState::Failed,
+            "timed-out drain leaves the instance draining (reaped once idle)"
+        );
+        assert_eq!(registered_count(&mgr, "dense"), 2, "nothing reaped yet");
     }
 }
