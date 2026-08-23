@@ -261,49 +261,55 @@ pub async fn chat_completions(
         model = %request.model,
     );
     async {
-        // ── 1. Resolve alias → candidate models. ────────────────────────────
-        //    Read config, extract what we need, drop the guard.
-        //    Phase 1: only the first candidate is routed; Phase 4 switches
-        //    all call sites to `acquire_for_candidates`.
-        let (candidates, ..) = {
+        // ── 1. Resolve alias → candidate models; extract the backend
+        //    timeouts.  Read config, extract what we need, drop the guard.
+        let request_model = request.model.clone();
+        let (candidates, policy, make_room, drain_timeout, idle_timeout, total_timeout) = {
             let cfg = state.config.read().await;
-            resolve_alias(&cfg.aliases, &request.model)
+            let (c, p, mr, dt) = resolve_alias(&cfg.aliases, &request.model);
+            if !c.iter().any(|n| cfg.models.iter().any(|m| &m.name == n)) {
+                return Err(ApiError::ModelNotFound(request_model.clone()));
+            }
+            (
+                c,
+                p,
+                mr,
+                dt,
+                std::time::Duration::from_secs(cfg.server.backend_idle_timeout_secs),
+                std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs),
+            )
         }; // cfg read guard dropped — future is `Send`
-        let model_name = candidates.into_iter().next().unwrap_or_default();
 
         debug!(
-            request_model = %request.model,
-            resolved_model = %model_name,
-            "resolved model"
+            request_model = %request_model,
+            candidates = ?candidates,
+            policy = ?policy,
+            make_room = ?make_room,
+            "resolved candidates"
         );
 
-        // ── 3. Verify the model exists in the config; extract debug_log and
-        //    the backend timeouts. ─
-        let request_model = request.model.clone();
-        let (debug_log_path, idle_timeout, total_timeout): (Option<std::path::PathBuf>, _, _) = {
+        // ── 2. Acquire an instance slot on one of the candidates (or queue).
+        let (model_name, guard) = state
+            .manager
+            .acquire_for_candidates(&candidates, policy, make_room, drain_timeout)
+            .await
+            .map_err(|e| acquire_error(&request_model, e))?;
+
+        // ── 3. Per-model debug log for the *chosen* model. ──────────────────
+        let debug_log_path: Option<std::path::PathBuf> = {
             let cfg = state.config.read().await;
-            let idle = std::time::Duration::from_secs(cfg.server.backend_idle_timeout_secs);
-            let total = std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs);
-            match cfg.models.iter().find(|m| m.name == model_name) {
-                Some(m) => (m.debug_log.clone(), idle, total),
-                None => return Err(ApiError::ModelNotFound(model_name)),
-            }
+            cfg.models
+                .iter()
+                .find(|m| m.name == model_name)
+                .and_then(|m| m.debug_log.clone())
         }; // cfg read guard dropped
 
-        // ── 4. Acquire an instance slot (or queue). ─────────────────────────
-        let guard = state
-            .manager
-            .get_or_spawn(&model_name)
-            .await
-            .map_err(|e| acquire_error(&model_name, e))?;
-
-        // Capture instance ID now that we hold the slot guard.
+        // ── 4. Capture instance ID and port. ───────────────────────────────
         let instance_id = {
             let inst = guard.handle().inner().lock().unwrap();
             inst.id.clone()
         }; // inner lock dropped — `guard` itself is still alive
 
-        // ── 5. Read the port from the instance. ────────────────────────────
         let port = {
             let inst = guard.handle().inner().lock().unwrap();
             inst.port
@@ -311,7 +317,7 @@ pub async fn chat_completions(
 
         let backend_url = format!("http://127.0.0.1:{}/v1/chat/completions", port);
 
-        // ── 6. Forward the request. ─────────────────────────────────────────
+        // ── 5. Forward the request. ─────────────────────────────────────────
         // Forward the *resolved* model name to the backend, not the alias —
         // strict backends validate the model field.
         request.model = model_name.clone();
@@ -481,44 +487,54 @@ pub async fn responses(
         model = %requested_model,
     );
     async {
-        // ── 1. Resolve alias → candidate models. ────────────────────────────
-        let (candidates, ..) = {
+        // ── 1. Resolve alias → candidate models; extract the backend
+        //    timeouts. ───────────────────────────────────────────────────────
+        let (candidates, policy, make_room, drain_timeout, idle_timeout, total_timeout) = {
             let cfg = state.config.read().await;
-            resolve_alias(&cfg.aliases, &requested_model)
+            let (c, p, mr, dt) = resolve_alias(&cfg.aliases, &requested_model);
+            if !c.iter().any(|n| cfg.models.iter().any(|m| &m.name == n)) {
+                return Err(ApiError::ModelNotFound(requested_model.clone()));
+            }
+            (
+                c,
+                p,
+                mr,
+                dt,
+                std::time::Duration::from_secs(cfg.server.backend_idle_timeout_secs),
+                std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs),
+            )
         }; // cfg read guard dropped — future is `Send`
-        let model_name = candidates.into_iter().next().unwrap_or_default();
 
         debug!(
             request_model = %requested_model,
-            resolved_model = %model_name,
-            "resolved model"
+            candidates = ?candidates,
+            policy = ?policy,
+            make_room = ?make_room,
+            "resolved candidates"
         );
 
-        // ── 3. Verify the model exists; extract debug_log and timeouts. ─────
-        let (debug_log_path, idle_timeout, total_timeout): (Option<std::path::PathBuf>, _, _) = {
+        // ── 2. Acquire an instance slot on one of the candidates (or queue).
+        let (model_name, guard) = state
+            .manager
+            .acquire_for_candidates(&candidates, policy, make_room, drain_timeout)
+            .await
+            .map_err(|e| acquire_error(&requested_model, e))?;
+
+        // ── 3. Per-model debug log for the *chosen* model. ──────────────────
+        let debug_log_path: Option<std::path::PathBuf> = {
             let cfg = state.config.read().await;
-            let idle = std::time::Duration::from_secs(cfg.server.backend_idle_timeout_secs);
-            let total = std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs);
-            match cfg.models.iter().find(|m| m.name == model_name) {
-                Some(m) => (m.debug_log.clone(), idle, total),
-                None => return Err(ApiError::ModelNotFound(model_name)),
-            }
+            cfg.models
+                .iter()
+                .find(|m| m.name == model_name)
+                .and_then(|m| m.debug_log.clone())
         }; // cfg read guard dropped
 
-        // ── 4. Acquire an instance slot (or queue). ─────────────────────────
-        let guard = state
-            .manager
-            .get_or_spawn(&model_name)
-            .await
-            .map_err(|e| acquire_error(&model_name, e))?;
-
-        // Capture instance ID now that we hold the slot guard.
+        // ── 4. Capture instance ID and port. ────────────────────────────────
         let instance_id = {
             let inst = guard.handle().inner().lock().unwrap();
             inst.id.clone()
         }; // inner lock dropped — `guard` itself is still alive
 
-        // ── 5. Read the port from the instance. ─────────────────────────────
         let port = {
             let inst = guard.handle().inner().lock().unwrap();
             inst.port
@@ -526,7 +542,7 @@ pub async fn responses(
 
         let backend_url = format!("http://127.0.0.1:{}/v1/responses", port);
 
-        // ── 6. Forward the *resolved* model name to the backend, not the
+        // ── 5. Forward the *resolved* model name to the backend, not the
         //    alias — strict backends validate the model field. ───────────────
         request["model"] = serde_json::Value::String(model_name.clone());
 
@@ -686,29 +702,37 @@ pub async fn responses_input_tokens(
         model = %requested_model,
     );
     async {
-        // ── 1. Resolve alias. ───────────────────────────────────────────────
-        let (candidates, ..) = {
+        // ── 1. Resolve alias → candidates; extract the backend timeout. ─────
+        let (candidates, policy, make_room, drain_timeout, total_timeout) = {
             let cfg = state.config.read().await;
-            resolve_alias(&cfg.aliases, &requested_model)
-        };
-        let model_name = candidates.into_iter().next().unwrap_or_default();
-
-        // ── 2. Verify model exists; extract debug_log and the timeout. ──────
-        let (debug_log_path, total_timeout): (Option<std::path::PathBuf>, _) = {
-            let cfg = state.config.read().await;
-            let total = std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs);
-            match cfg.models.iter().find(|m| m.name == model_name) {
-                Some(m) => (m.debug_log.clone(), total),
-                None => return Err(ApiError::ModelNotFound(model_name)),
+            let (c, p, mr, dt) = resolve_alias(&cfg.aliases, &requested_model);
+            if !c.iter().any(|n| cfg.models.iter().any(|m| &m.name == n)) {
+                return Err(ApiError::ModelNotFound(requested_model.clone()));
             }
+            (
+                c,
+                p,
+                mr,
+                dt,
+                std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs),
+            )
         };
 
-        // ── 3. Acquire instance slot. ───────────────────────────────────────
-        let guard = state
+        // ── 2. Acquire an instance slot on one of the candidates (or queue).
+        let (model_name, guard) = state
             .manager
-            .get_or_spawn(&model_name)
+            .acquire_for_candidates(&candidates, policy, make_room, drain_timeout)
             .await
-            .map_err(|e| acquire_error(&model_name, e))?;
+            .map_err(|e| acquire_error(&requested_model, e))?;
+
+        // ── 3. Per-model debug log for the *chosen* model. ──────────────────
+        let debug_log_path: Option<std::path::PathBuf> = {
+            let cfg = state.config.read().await;
+            cfg.models
+                .iter()
+                .find(|m| m.name == model_name)
+                .and_then(|m| m.debug_log.clone())
+        };
 
         let instance_id = {
             let inst = guard.handle().inner().lock().unwrap();
@@ -828,32 +852,29 @@ pub async fn completions(
         model = %request.model,
     );
     async {
-        // ── 1. Resolve alias. ───────────────────────────────────────────────
-        let (candidates, ..) = {
+        // ── 1. Resolve alias → candidates; read the backend timeouts. ──────
+        let (candidates, policy, make_room, drain_timeout, idle_timeout, total_timeout) = {
             let cfg = state.config.read().await;
-            resolve_alias(&cfg.aliases, &request.model)
-        };
-        let model_name = candidates.into_iter().next().unwrap_or_default();
-
-        // ── 2. Verify model exists; read the backend timeouts. ────────────
-        let (idle_timeout, total_timeout) = {
-            let cfg = state.config.read().await;
-            let exists = cfg.models.iter().any(|m| m.name == model_name);
-            if !exists {
-                return Err(ApiError::ModelNotFound(model_name));
+            let (c, p, mr, dt) = resolve_alias(&cfg.aliases, &request.model);
+            if !c.iter().any(|n| cfg.models.iter().any(|m| &m.name == n)) {
+                return Err(ApiError::ModelNotFound(request.model.clone()));
             }
             (
+                c,
+                p,
+                mr,
+                dt,
                 std::time::Duration::from_secs(cfg.server.backend_idle_timeout_secs),
                 std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs),
             )
         };
 
-        // ── 3. Acquire instance slot. ───────────────────────────────────────
-        let guard = state
+        // ── 2. Acquire an instance slot on one of the candidates (or queue).
+        let (model_name, guard) = state
             .manager
-            .get_or_spawn(&model_name)
+            .acquire_for_candidates(&candidates, policy, make_room, drain_timeout)
             .await
-            .map_err(|e| acquire_error(&model_name, e))?;
+            .map_err(|e| acquire_error(&request.model, e))?;
 
         // Capture instance ID now that we hold the slot guard.
         let instance_id = {
@@ -931,32 +952,31 @@ pub async fn embeddings(
         model = %request.model,
     );
     async {
-        // ── 1. Resolve alias. ───────────────────────────────────────────────
-        let (candidates, ..) = {
+        // ── 1. Resolve alias → candidates; read the backend timeout. ───────
+        let (candidates, policy, make_room, drain_timeout, total_timeout) = {
             let cfg = state.config.read().await;
-            resolve_alias(&cfg.aliases, &request.model)
-        };
-        let model_name = candidates.into_iter().next().unwrap_or_default();
-
-        // ── 2. Verify model exists; read the backend timeout. ─────────────
-        let total_timeout = {
-            let cfg = state.config.read().await;
-            let exists = cfg.models.iter().any(|m| m.name == model_name);
-            if !exists {
-                return Err(ApiError::ModelNotFound(model_name));
+            let (c, p, mr, dt) = resolve_alias(&cfg.aliases, &request.model);
+            if !c.iter().any(|n| cfg.models.iter().any(|m| &m.name == n)) {
+                return Err(ApiError::ModelNotFound(request.model.clone()));
             }
-            std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs)
+            (
+                c,
+                p,
+                mr,
+                dt,
+                std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs),
+            )
         };
+
+        // ── 2. Acquire an instance slot on one of the candidates (or queue).
+        let (model_name, guard) = state
+            .manager
+            .acquire_for_candidates(&candidates, policy, make_room, drain_timeout)
+            .await
+            .map_err(|e| acquire_error(&request.model, e))?;
 
         // Forward the *resolved* model name to the backend, not the alias.
         request.model = model_name.clone();
-
-        // ── 3. Acquire instance slot. ───────────────────────────────────────
-        let guard = state
-            .manager
-            .get_or_spawn(&model_name)
-            .await
-            .map_err(|e| acquire_error(&model_name, e))?;
 
         // ── 4. Read port. ──────────────────────────────────────────────────
         let port = {
@@ -1030,34 +1050,42 @@ pub async fn rerank(
         model = %request.model,
     );
     async {
-        // ── 1. Resolve alias. ───────────────────────────────────────────────
-        let (candidates, ..) = {
+        // ── 1. Resolve alias → candidates; extract the backend timeout. ─────
+        let (candidates, policy, make_room, drain_timeout, total_timeout) = {
             let cfg = state.config.read().await;
-            resolve_alias(&cfg.aliases, &request.model)
+            let (c, p, mr, dt) = resolve_alias(&cfg.aliases, &request.model);
+            if !c.iter().any(|n| cfg.models.iter().any(|m| &m.name == n)) {
+                return Err(ApiError::ModelNotFound(request.model.clone()));
+            }
+            (
+                c,
+                p,
+                mr,
+                dt,
+                std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs),
+            )
         };
-        let model_name = candidates.into_iter().next().unwrap_or_default();
 
         let request_model = request.model.clone();
 
-        // ── 2. Verify model exists; extract debug_log and the backend timeout. ─
-        let (debug_log_path, total_timeout): (Option<std::path::PathBuf>, _) = {
+        // ── 2. Acquire an instance slot on one of the candidates (or queue).
+        let (model_name, guard) = state
+            .manager
+            .acquire_for_candidates(&candidates, policy, make_room, drain_timeout)
+            .await
+            .map_err(|e| acquire_error(&request_model, e))?;
+
+        // ── 3. Per-model debug log for the *chosen* model. ──────────────────
+        let debug_log_path: Option<std::path::PathBuf> = {
             let cfg = state.config.read().await;
-            let total = std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs);
-            match cfg.models.iter().find(|m| m.name == model_name) {
-                Some(m) => (m.debug_log.clone(), total),
-                None => return Err(ApiError::ModelNotFound(model_name)),
-            }
+            cfg.models
+                .iter()
+                .find(|m| m.name == model_name)
+                .and_then(|m| m.debug_log.clone())
         };
 
         // Forward the *resolved* model name to the backend, not the alias.
         request.model = model_name.clone();
-
-        // ── 3. Acquire instance slot. ───────────────────────────────────────
-        let guard = state
-            .manager
-            .get_or_spawn(&model_name)
-            .await
-            .map_err(|e| acquire_error(&model_name, e))?;
 
         // Capture instance ID now that we hold the slot guard.
         let instance_id = {
@@ -1206,27 +1234,36 @@ async fn acquire_audio_target(
     state: &AppState,
     request_model: &str,
 ) -> Result<AudioTarget, ApiError> {
-    let (candidates, ..) = {
+    let (candidates, policy, make_room, drain_timeout, idle_timeout, total_timeout) = {
         let cfg = state.config.read().await;
-        resolve_alias(&cfg.aliases, request_model)
-    };
-    let model_name = candidates.into_iter().next().unwrap_or_default();
-
-    let (debug_log_path, idle_timeout, total_timeout): (Option<std::path::PathBuf>, _, _) = {
-        let cfg = state.config.read().await;
-        let idle = std::time::Duration::from_secs(cfg.server.backend_idle_timeout_secs);
-        let total = std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs);
-        match cfg.models.iter().find(|m| m.name == model_name) {
-            Some(m) => (m.debug_log.clone(), idle, total),
-            None => return Err(ApiError::ModelNotFound(model_name)),
+        let (c, p, mr, dt) = resolve_alias(&cfg.aliases, request_model);
+        if !c.iter().any(|n| cfg.models.iter().any(|m| &m.name == n)) {
+            return Err(ApiError::ModelNotFound(request_model.to_owned()));
         }
+        (
+            c,
+            p,
+            mr,
+            dt,
+            std::time::Duration::from_secs(cfg.server.backend_idle_timeout_secs),
+            std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs),
+        )
     };
 
-    let guard = state
+    let (model_name, guard) = state
         .manager
-        .get_or_spawn(&model_name)
+        .acquire_for_candidates(&candidates, policy, make_room, drain_timeout)
         .await
-        .map_err(|e| acquire_error(&model_name, e))?;
+        .map_err(|e| acquire_error(request_model, e))?;
+
+    // Per-model debug log for the *chosen* model.
+    let debug_log_path: Option<std::path::PathBuf> = {
+        let cfg = state.config.read().await;
+        cfg.models
+            .iter()
+            .find(|m| m.name == model_name)
+            .and_then(|m| m.debug_log.clone())
+    };
 
     let (port, instance_id) = {
         let inst = guard.handle().inner().lock().unwrap();

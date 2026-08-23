@@ -665,3 +665,200 @@ async fn audio_model_idle_ttl_unload() {
         "idle audio instance must be despawned after drain_idle_timeout"
     );
 }
+
+// ── Multi-model aliases (docs/003-smart-handling.md) ─────────────────────────
+
+/// First real PCI slot (devices.cuda validation requires the slot to exist
+/// on the host).  None when no PCI bus is visible — the test skips.
+fn real_pci_slot() -> Option<String> {
+    let mut slots: Vec<String> = std::fs::read_dir("/sys/bus/pci/devices")
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    slots.sort();
+    slots.into_iter().next()
+}
+
+/// Two CUDA models on one 48 GB GPU: m1 takes 20 GB, m2 takes 40 GB — they
+/// cannot coexist.  Alias `smart` prefers m2 with spillover to m1.
+/// `idle_ttl: 1` makes instances make-room-evictable after ~1 s idle.
+fn alias_cuda_yaml(slot: &str) -> String {
+    format!(
+        "devices:\n  cuda:\n    0:\n      pci: \"{slot}\"\n      vram_mb: 48000\n\
+         models:\n\
+         \x20 - name: m1\n    context_length: 4096\n    cmd: \"{STUB_BIN} --port {{port}}\"\n    idle_ttl: 1\n    vram: 20000\n    gpus: 1\n    cuda_devices: [0]\n\
+         \x20 - name: m2\n    context_length: 4096\n    cmd: \"{STUB_BIN} --port {{port}}\"\n    idle_ttl: 1\n    vram: 40000\n    gpus: 1\n    cuda_devices: [0]\n\
+         aliases:\n  - name: smart\n    targets: [m2, m1]\n    policy: prefer_order\n    make_room: evict_idle\n"
+    )
+}
+
+fn chat_body(model: &str) -> serde_json::Value {
+    serde_json::json!({"model": model, "messages": [{"role": "user", "content": "hi"}]})
+}
+
+#[tokio::test]
+async fn alias_make_room_evicts_stale_idle_model() {
+    let Some(slot) = real_pci_slot() else { return };
+    let dir = temp_dir("alias-makeroom");
+    let srv = boot(&dir, "tester: secret-key\n", &alias_cuda_yaml(&slot)).await;
+    let client = reqwest::Client::new();
+
+    // Load m1 directly (20 GB of 48 GB — m2's 40 GB no longer fits).
+    let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&chat_body("m1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(srv.manager.instance_counts().get("m1").copied(), Some(1));
+
+    // m1 becomes evictable once idle past its idle_ttl protection window.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    // The alias prefers m2 → make-room evicts the stale m1 and loads m2.
+    let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&chat_body("smart"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(srv.manager.instance_counts().get("m2").copied(), Some(1));
+    assert_eq!(
+        srv.manager
+            .instance_counts()
+            .get("m1")
+            .copied()
+            .unwrap_or(0),
+        0,
+        "stale m1 must be evicted to make room for m2"
+    );
+}
+
+#[tokio::test]
+async fn direct_request_never_makes_room() {
+    let Some(slot) = real_pci_slot() else { return };
+    let dir = temp_dir("alias-direct");
+    let srv = boot(&dir, "tester: secret-key\n", &alias_cuda_yaml(&slot)).await;
+    let client = reqwest::Client::new();
+
+    let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&chat_body("m1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // A direct (non-alias) request for m2 must NOT evict m1 (decision 9):
+    // the spawn simply does not fit and the request fails fast.
+    let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&chat_body("m2"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503, "m2 does not fit next to m1");
+    assert_eq!(
+        srv.manager.instance_counts().get("m1").copied(),
+        Some(1),
+        "m1 must not be evicted by a direct request"
+    );
+    assert_eq!(
+        srv.manager
+            .instance_counts()
+            .get("m2")
+            .copied()
+            .unwrap_or(0),
+        0
+    );
+}
+
+/// Two plain models (no device pools) and an alias over both.
+fn alias_plain_yaml(targets: &str) -> String {
+    format!(
+        "models:\n\
+         \x20 - name: m1\n    context_length: 4096\n    cmd: \"{STUB_BIN} --port {{port}}\"\n    max_instances: 1\n\
+         \x20 - name: m2\n    context_length: 4096\n    cmd: \"{STUB_BIN} --port {{port}}\"\n    max_instances: 1\n\
+         aliases:\n  - name: any\n    targets: {targets}\n"
+    )
+}
+
+#[tokio::test]
+async fn alias_spawns_first_candidate_when_nothing_loaded() {
+    let dir = temp_dir("alias-first");
+    let srv = boot(&dir, "tester: secret-key\n", &alias_plain_yaml("[m1, m2]")).await;
+    let client = reqwest::Client::new();
+
+    let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&chat_body("any"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        srv.manager.instance_counts().get("m1").copied(),
+        Some(1),
+        "the first candidate is spawned"
+    );
+    assert_eq!(srv.manager.instance_counts().get("m2").copied(), None);
+
+    // Second request: warm slot on m1 — m2 still untouched.
+    let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&chat_body("any"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        srv.manager
+            .instance_counts()
+            .get("m2")
+            .copied()
+            .unwrap_or(0),
+        0
+    );
+}
+
+#[tokio::test]
+async fn alias_targets_hot_reloaded() {
+    let dir = temp_dir("alias-reload");
+    let srv = boot(&dir, "tester: secret-key\n", &alias_plain_yaml("[m1]")).await;
+    let client = reqwest::Client::new();
+    let config_path = dir.join("config.yaml");
+    let last_mtime = Arc::new(Mutex::new(None));
+
+    let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&chat_body("any"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(srv.manager.instance_counts().get("m1").copied(), Some(1));
+
+    // Atomically swap the alias target list and reload.
+    let updated = std::fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("targets: [m1]", "targets: [m2]");
+    let tmp = dir.join("config.yaml.tmp");
+    std::fs::write(&tmp, updated).unwrap();
+    std::fs::rename(&tmp, &config_path).unwrap();
+    reload::handle_config_reload(
+        &config_path,
+        &srv.config,
+        &srv.apikeys,
+        &srv.manager,
+        &last_mtime,
+    )
+    .await;
+
+    let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&chat_body("any"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        srv.manager.instance_counts().get("m2").copied(),
+        Some(1),
+        "the reloaded alias must route to m2"
+    );
+}
