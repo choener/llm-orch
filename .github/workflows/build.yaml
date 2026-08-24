@@ -1,0 +1,15 @@
+name: build
+on: [push, pull_request]
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Keep in sync with the rustc version the nix flake resolves to
+      # (check: nix develop .#default --command rustc --version)
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build
+      - name: Test
+        run: cargo test

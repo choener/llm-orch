@@ -1,7 +1,7 @@
 # TODO
 
 ## Goal
-Add a Forgejo Actions workflow that builds and tests llm-orch on the self-hosted `native` runner, using the Nix flake (no plain cargo builds in CI).
+CI for llm-orch building + testing via the Nix flake (no plain cargo builds in CI): Forgejo workflow (done, sections 1–3) and a GitHub Actions workflow doing the same (section 4).
 
 ## Tasks
 
@@ -20,7 +20,14 @@ Add a Forgejo Actions workflow that builds and tests llm-orch on the self-hosted
 ### 3. Commit
 - [x] Ensure `.forgejo/workflows/build.yaml` and this todo file are in the jj working copy; describe the change with `jj describe --stdin` (done — change `owqwzkmw`; note: global gitignore `.*` blocked auto-tracking, needed `jj file track --include-ignored`)
 
+### 4. GitHub Actions workflow (plain cargo — user switched from nix in CI)
+- [x] Create `.github/workflows/build.yaml`: `on: [push, pull_request]`, job `build-and-test` on `ubuntu-latest`; steps: `actions/checkout@v4` → `dtolnay/rust-toolchain@1.96.1` (matches the flake's current rustc) → `Swatinem/rust-cache@v2` → `cargo build` → `cargo test`
+- [x] Validate locally: YAML parse (python3 + pyyaml) + `actionlint` via `nix shell nixpkgs#actionlint` (exit 0, no findings); `cargo build` + `cargo test` via devshell pass (145 unit + 18 integration)
+- [x] Track with `jj file track --include-ignored` (global gitignore `.*` blocks dotfile auto-tracking) and describe with `jj describe --stdin`
+  - (Note: an external `jj new` ran mid-session — likely the user's editor jj integration — creating intermediate change `wluzrkxs` holding only a plan-file diff; left as-is, not restructured)
+
 ## Notes
+- GitHub: plain cargo (not nix) per user decision — `dtolnay/rust-toolchain@1.96.1` (flake's current rustc via nixos-unstable; bump the pin when the flake's rustc changes) + `Swatinem/rust-cache@v2` for registry/target caching. Forgejo workflow stays nix-based (its `native` runner only has nix).
 - Example followed: `~/git/nix/os-configuration/default/.forgejo/workflows/build.yaml` (`on: [push]`, `runs-on: native`, nix-based steps). Forgejo instance: cheyenne (`git.<fqdn>`), actions enabled, single `native` runner (hostPackages: bash, git, nix, nixos-rebuild, ...).
 - User decisions: triggers = push + pull_request; scope = build + test only (no clippy/fmt steps for now); build mechanism = nix flake only, no plain cargo in CI.
 - Flake: `packages.default` = `rustPlatform.buildRustPackage` (Cargo.lock committed); `devShells.default` has cargo/rustc/clippy/rustfmt.
