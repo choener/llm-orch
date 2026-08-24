@@ -81,8 +81,8 @@ devices:
 # Named `{key}` → value fragments substituted into model `cmd` fields.
 # Use `{alias_name}` in any model's `cmd` to include the alias value.
 # Runtime placeholders resolved at spawn time: `{port}` (allocated port),
-# `{context_length}` (the model's context_length), `{name}` (the model's
-# config name).
+# `{context_length}` (the model's context_length), `{max_concurrent}`
+# (the model's max_concurrent), `{name}` (the model's config name).
 cmd_aliases:
   llama: |
     llama-server
@@ -149,6 +149,7 @@ models:
       {llama}
         --model /models/qwen3-32b-q4_k_m.gguf
         --ctx-size {context_length}   # substituted from the model's context_length
+        --parallel {max_concurrent}   # substituted from the model's max_concurrent
 
   # --- Example 2: a model too large for one GPU — spans two ----------------
   # `gpus: 2` splits the model evenly across two devices (llama.cpp's

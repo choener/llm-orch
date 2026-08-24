@@ -1420,9 +1420,9 @@ impl InstanceManager {
         fingerprint_with_aliases(&self.cmd_aliases.read().unwrap(), cfg)
     }
 
-    /// Resolve `cmd_aliases`, `{port}`, `{context_length}`, and `{name}`
-    /// in the model's command string.  `{name}` substitutes the model's
-    /// config name, enabling generic cmd templates such as
+    /// Resolve `cmd_aliases`, `{port}`, `{context_length}`, `{max_concurrent}`,
+    /// and `{name}` in the model's command string.  `{name}` substitutes
+    /// the model's config name, enabling generic cmd templates such as
     /// `audiocpp_server --config /etc/llm-orch/audio/{name}.json …`.
     fn resolve_cmd(&self, cfg: &ModelConfig, port: u16) -> String {
         let mut resolved = cfg.cmd.clone();
@@ -1434,6 +1434,7 @@ impl InstanceManager {
         resolved
             .replace("{port}", &port.to_string())
             .replace("{context_length}", &cfg.context_length.to_string())
+            .replace("{max_concurrent}", &cfg.max_concurrent.to_string())
             .replace("{name}", &cfg.name)
     }
 
@@ -3905,6 +3906,16 @@ models:
             mgr.resolve_cmd(&cfg, 9999),
             "run --ctx-size 8192 --port 9999"
         );
+    }
+
+    #[test]
+    fn resolve_cmd_substitutes_max_concurrent() {
+        let mgr = test_manager();
+        let cfg: ModelConfig = serde_yaml_ng::from_str(
+            "name: x\nmax_concurrent: 8\ncmd: \"run --parallel {max_concurrent}\"",
+        )
+        .unwrap();
+        assert_eq!(mgr.resolve_cmd(&cfg, 9999), "run --parallel 8");
     }
 
     #[test]

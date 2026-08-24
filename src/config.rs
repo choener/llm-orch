@@ -187,7 +187,7 @@ impl Config {
         }
 
         // --- cmd_aliases ---
-        for reserved in ["port", "context_length", "name"] {
+        for reserved in ["port", "context_length", "max_concurrent", "name"] {
             if self.cmd_aliases.contains_key(reserved) {
                 return Err(ConfigError::Validation(format!(
                     "cmd_aliases: '{}' is a reserved name",
@@ -419,6 +419,7 @@ pub struct ModelConfig {
     pub max_instances: usize,
 
     /// Maximum concurrent requests a single instance can handle.
+    /// Also substituted for `{max_concurrent}` in `cmd` at spawn time.
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
 
@@ -449,8 +450,9 @@ pub struct ModelConfig {
 
     /// Subprocess command line.  Shell-style quoting / whitespace separation.
     /// `{alias_name}` placeholders are resolved from `cmd_aliases` at spawn
-    /// time; `{port}` is replaced with the allocated port number and
-    /// `{context_length}` with the model's declared `context_length`.
+    /// time; `{port}` is replaced with the allocated port number,
+    /// `{context_length}` with the model's declared `context_length`, and
+    /// `{max_concurrent}` with the model's declared `max_concurrent`.
     pub cmd: String,
 
     /// Vulkan device indices this model can be placed on (from `devices.vulkan`).
@@ -852,7 +854,7 @@ models:
 
     #[test]
     fn rejects_reserved_cmd_alias_names() {
-        for reserved in ["port", "context_length", "name"] {
+        for reserved in ["port", "context_length", "max_concurrent", "name"] {
             let yaml = BASE.replace(
                 "apikeys_file: apikeys.txt",
                 &format!("apikeys_file: apikeys.txt\ncmd_aliases:\n  {reserved}: \"x\""),
