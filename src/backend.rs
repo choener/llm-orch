@@ -64,6 +64,33 @@ impl Default for LlamaCppBackend {
     }
 }
 
+impl LlamaCppBackend {
+    /// Enforce CPU-only execution for a deviceless llama.cpp spawn.
+    ///
+    /// llama.cpp's default is to offload as many layers as fit, so a
+    /// CPU-only model must explicitly pass `--n-gpu-layers 0`.  The flag
+    /// is appended when the resolved command line declares no offload
+    /// count; an existing declaration is left untouched (config
+    /// validation already rejects non-zero values for CPU-only models, so
+    /// a present value is either 0 or the config was never validated —
+    /// either way appending a duplicate flag would be wrong).
+    ///
+    /// Only llama.cpp programs are touched — the program basename must
+    /// start with `llama-`.  Other backends (e.g. `audiocpp_server`)
+    /// select their compute device through their own interface and must
+    /// never receive llama.cpp flags.
+    pub fn enforce_cpu_offload(program: &str, args: &mut Vec<String>) {
+        let basename = program.rsplit('/').next().unwrap_or(program);
+        if !basename.starts_with("llama-") {
+            return;
+        }
+        if llama_offload_decl(args) != OffloadDecl::Absent {
+            return;
+        }
+        args.extend(["--n-gpu-layers".to_string(), "0".to_string()]);
+    }
+}
+
 impl Backend for LlamaCppBackend {
     fn gpu_args(&self, _indices: &[usize]) -> Vec<String> {
         Vec::new()
@@ -84,6 +111,61 @@ impl Backend for LlamaCppBackend {
             .join(",");
         vec![(var.into(), list)]
     }
+}
+
+// ── CPU-offload enforcement (llama.cpp command lines) ──────────────────────
+
+/// The outcome of scanning a resolved llama.cpp command line (program
+/// excluded) for an explicit GPU-offload declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffloadDecl {
+    /// No offload flag in the command line.
+    Absent,
+    /// Offload flag with a parsed layer count (`-1` = "as much as fits").
+    Layers(i64),
+    /// Offload flag present, but its value is missing or not an integer.
+    Invalid,
+}
+
+/// Offload-layer flags recognized in a llama.cpp command line.
+const OFFLOAD_FLAGS: [&str; 3] = ["--n-gpu-layers", "-ngl", "--n-offload"];
+
+/// Scan `args` (the resolved command line without the program) for an
+/// explicit GPU-offload declaration.
+///
+/// Recognizes `--n-gpu-layers`, `-ngl`, and `--n-offload` in both
+/// `--flag value` and `--flag=value` forms.  A value that parses as an
+/// integer (including negatives like `-1` = "as much as fits") is a value,
+/// not another flag.  If the flag appears more than once, the last
+/// declaration wins (llama.cpp's usual last-value-wins parsing).
+pub fn llama_offload_decl(args: &[String]) -> OffloadDecl {
+    let mut last: Option<OffloadDecl> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let (flag, inline) = match args[i].split_once('=') {
+            Some((f, v)) => (f, Some(v)),
+            None => (args[i].as_str(), None),
+        };
+        if OFFLOAD_FLAGS.contains(&flag) {
+            match inline {
+                Some(v) => {
+                    last = Some(match v.parse::<i64>() {
+                        Ok(n) => OffloadDecl::Layers(n),
+                        Err(_) => OffloadDecl::Invalid,
+                    });
+                }
+                None => match args.get(i + 1).and_then(|v| v.parse::<i64>().ok()) {
+                    Some(n) => {
+                        last = Some(OffloadDecl::Layers(n));
+                        i += 1; // consume the value token
+                    }
+                    None => last = Some(OffloadDecl::Invalid),
+                },
+            }
+        }
+        i += 1;
+    }
+    last.unwrap_or(OffloadDecl::Absent)
 }
 
 // ── Process helpers (shared) ─────────────────────────────────────────────────
@@ -302,6 +384,68 @@ mod tests {
         for kind in [DeviceKind::Vulkan, DeviceKind::Cuda] {
             assert!(LlamaCppBackend::new(kind).gpu_env(&[]).is_empty());
         }
+    }
+
+    fn s(values: &[&str]) -> Vec<String> {
+        values.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn offload_decl_scans_flag_forms() {
+        use OffloadDecl::*;
+        assert_eq!(llama_offload_decl(&s(&[])), Absent);
+        assert_eq!(llama_offload_decl(&s(&["--model", "m.gguf"])), Absent);
+        assert_eq!(
+            llama_offload_decl(&s(&["--n-gpu-layers", "99"])),
+            Layers(99)
+        );
+        assert_eq!(llama_offload_decl(&s(&["--n-gpu-layers", "0"])), Layers(0));
+        assert_eq!(llama_offload_decl(&s(&["--n-gpu-layers=42"])), Layers(42));
+        assert_eq!(llama_offload_decl(&s(&["-ngl", "99"])), Layers(99));
+        // A negative value is a value, not another flag.
+        assert_eq!(llama_offload_decl(&s(&["-ngl", "-1"])), Layers(-1));
+        assert_eq!(llama_offload_decl(&s(&["--n-offload", "7"])), Layers(7));
+        assert_eq!(llama_offload_decl(&s(&["--n-gpu-layers"])), Invalid);
+        assert_eq!(llama_offload_decl(&s(&["--n-gpu-layers", "abc"])), Invalid);
+        assert_eq!(
+            llama_offload_decl(&s(&["--n-gpu-layers", "--model"])),
+            Invalid
+        );
+        // Last declaration wins.
+        assert_eq!(
+            llama_offload_decl(&s(&["--n-gpu-layers", "99", "-ngl", "0"])),
+            Layers(0)
+        );
+    }
+
+    #[test]
+    fn enforce_cpu_offload_appends_for_llama_programs() {
+        for prog in ["llama-server", "/opt/llama/llama-server"] {
+            let mut args = s(&["--model", "m.gguf"]);
+            LlamaCppBackend::enforce_cpu_offload(prog, &mut args);
+            assert!(
+                args.ends_with(&["--n-gpu-layers".to_string(), "0".to_string()]),
+                "{prog}: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn enforce_cpu_offload_respects_existing_declaration() {
+        // 0: redundant.  99: config validation should have rejected it —
+        // either way, never produce a duplicate flag.
+        for value in ["0", "99"] {
+            let mut args = s(&["--n-gpu-layers", value]);
+            LlamaCppBackend::enforce_cpu_offload("llama-server", &mut args);
+            assert_eq!(args, s(&["--n-gpu-layers", value]));
+        }
+    }
+
+    #[test]
+    fn enforce_cpu_offload_leaves_other_backends_alone() {
+        let mut args = s(&["--config", "x.json", "--backend", "cpu"]);
+        LlamaCppBackend::enforce_cpu_offload("audiocpp_server", &mut args);
+        assert_eq!(args, s(&["--config", "x.json", "--backend", "cpu"]));
     }
 
     #[tokio::test]

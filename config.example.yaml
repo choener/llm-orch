@@ -90,6 +90,16 @@ cmd_aliases:
       --port {port}
       --n-gpu-layers 99
 
+  # CPU-only variant of the llama alias.  Models without a device pool
+  # (no vulkan_devices/cuda_devices) are CPU-only: llm-orch pins no GPU
+  # and injects --n-gpu-layers 0 itself when the command declares no
+  # offload count — stating it here keeps the command self-documenting.
+  llama-cpu: |
+    llama-server
+      --host 127.0.0.1
+      --port {port}
+      --n-gpu-layers 0
+
   # audio.cpp (audiocpp_server) — one server process per model.  `{name}`
   # resolves to the model's config name, so a single alias serves every
   # audio model: name `qwen3-tts` → /etc/llm-orch/audio/qwen3-tts.json.
@@ -205,19 +215,23 @@ models:
   #       --ctx-size 32768
 
   # --- Example 3: a smaller model — runs on CPU ----------------------------
+  # No device pool = CPU-only: llm-orch pins no GPU and enforces
+  # --n-gpu-layers 0 (declared in the {llama-cpu} alias).  `ram` declares
+  # the system RAM footprint — weights plus KV cache at the configured
+  # context length (informational today).
   - name: "deepseek-coder-7b"
     context_length: 16384
     max_instances: 1
     max_concurrent: 8
     priority: 50
-    vram: 8000
-    ram: 0
+    vram: 0
+    ram: 6000
     idle_ttl: 120             # unload after 2 min
     queue_depth: 10
-    # vulkan_devices: [0]     # uncomment for GPU offload
+    # vulkan_devices: [0]     # uncomment (and use {llama}) for GPU offload
 
     cmd: |
-      {llama}
+      {llama-cpu}
         --model /models/deepseek-coder-7b-q4_k_m.gguf
         --ctx-size 16384
 

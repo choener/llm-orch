@@ -1261,6 +1261,13 @@ impl InstanceManager {
         let model_backend = LlamaCppBackend::new(cfg.device_kind());
         let mut args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
         args.extend(model_backend.gpu_args(&gpu_indices));
+        // CPU-only spawn: enforce no GPU offload.  llama.cpp's default is
+        // to offload as many layers as fit, so without this the model
+        // would silently load onto GPU 0.  No-op for non-llama programs
+        // and for commands that already declare the offload count.
+        if gpu_indices.is_empty() {
+            LlamaCppBackend::enforce_cpu_offload(prog, &mut args);
+        }
         let envs = model_backend.gpu_env(&gpu_indices);
 
         // Spawn.
@@ -1425,17 +1432,7 @@ impl InstanceManager {
     /// the model's config name, enabling generic cmd templates such as
     /// `audiocpp_server --config /etc/llm-orch/audio/{name}.json …`.
     fn resolve_cmd(&self, cfg: &ModelConfig, port: u16) -> String {
-        let mut resolved = cfg.cmd.clone();
-        let cmd_aliases = self.cmd_aliases.read().unwrap();
-        for (key, value) in cmd_aliases.iter() {
-            let placeholder = format!("{{{}}}", key);
-            resolved = resolved.replace(&placeholder, value);
-        }
-        resolved
-            .replace("{port}", &port.to_string())
-            .replace("{context_length}", &cfg.context_length.to_string())
-            .replace("{max_concurrent}", &cfg.max_concurrent.to_string())
-            .replace("{name}", &cfg.name)
+        crate::config::resolve_model_cmd(&self.cmd_aliases.read().unwrap(), cfg, port)
     }
 
     /// Pick the devices for a new instance from the model's device pool

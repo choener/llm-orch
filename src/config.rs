@@ -125,6 +125,17 @@ impl Config {
                         m.name, m.gpus
                     )));
                 }
+                // A CPU-only llama.cpp model must not request GPU offload in
+                // its command: llama.cpp's default is to offload as many
+                // layers as fit, so the contradiction would silently load
+                // onto GPU 0.  Rejected here, at config load, rather than
+                // guessing at intent at spawn time.
+                if let Some(declared) = cpu_cmd_offload_decl(&self.cmd_aliases, m) {
+                    return Err(ConfigError::Validation(format!(
+                        "model '{}': CPU-only (no device pool) but its command requests GPU offload ({declared}) — add vulkan_devices/cuda_devices or drop the flag (use a CPU alias)",
+                        m.name
+                    )));
+                }
             } else if m.gpus > pool_len {
                 return Err(ConfigError::Validation(format!(
                     "model '{}': gpus ({}) exceeds {} count ({})",
@@ -505,6 +516,55 @@ impl ModelConfig {
     }
 }
 
+/// Resolve the model's `cmd_aliases` and the runtime placeholders
+/// (`{port}`, `{context_length}`, `{max_concurrent}`, `{name}`) in its
+/// command string.  `{port}` is the instance's allocated port; config
+/// validation calls this with a placeholder (0) since the port is only
+/// known at spawn time and never affects flag detection.
+pub fn resolve_model_cmd(
+    cmd_aliases: &HashMap<String, String>,
+    cfg: &ModelConfig,
+    port: u16,
+) -> String {
+    let mut resolved = cfg.cmd.clone();
+    for (key, value) in cmd_aliases.iter() {
+        let placeholder = format!("{{{}}}", key);
+        resolved = resolved.replace(&placeholder, value);
+    }
+    resolved
+        .replace("{port}", &port.to_string())
+        .replace("{context_length}", &cfg.context_length.to_string())
+        .replace("{max_concurrent}", &cfg.max_concurrent.to_string())
+        .replace("{name}", &cfg.name)
+}
+
+/// Detect a GPU-offload request in a CPU-only model's resolved command
+/// line.  Returns a human-readable description of the offending
+/// declaration (e.g. `--n-gpu-layers 99`) when the command runs a
+/// llama.cpp program and declares a non-zero (or unparseable) offload
+/// count; `None` otherwise.
+///
+/// Non-llama.cpp programs (e.g. `audiocpp_server`) select their compute
+/// device through their own interface (`server.json`'s `backend` field)
+/// and are not checked.
+fn cpu_cmd_offload_decl(cmd_aliases: &HashMap<String, String>, m: &ModelConfig) -> Option<String> {
+    let resolved = resolve_model_cmd(cmd_aliases, m, 0);
+    let parts = shlex::split(&resolved)?;
+    let program = parts.first()?;
+    let basename = program.rsplit('/').next().unwrap_or(program);
+    if !basename.starts_with("llama-") {
+        return None;
+    }
+    use crate::backend::OffloadDecl;
+    match crate::backend::llama_offload_decl(&parts[1..]) {
+        OffloadDecl::Layers(n) if n != 0 => Some(format!("--n-gpu-layers {n}")),
+        OffloadDecl::Invalid => {
+            Some("an unparseable offload flag (--n-gpu-layers / -ngl / --n-offload)".to_string())
+        }
+        _ => None,
+    }
+}
+
 fn default_context_length() -> usize {
     4096
 }
@@ -841,6 +901,85 @@ models:
     fn rejects_multi_gpu_for_cpu_model() {
         let yaml = BASE.replace("cmd: \"sleep 3600\"", "cmd: \"sleep 3600\"\n    gpus: 2");
         expect_validation_error(&yaml, "CPU-only models must use gpus: 1");
+    }
+
+    #[test]
+    fn rejects_cpu_llama_model_requesting_offload() {
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"llama-server --model m.gguf --n-gpu-layers 99\"",
+        );
+        expect_validation_error(
+            &yaml,
+            "CPU-only (no device pool) but its command requests GPU offload (--n-gpu-layers 99)",
+        );
+    }
+
+    #[test]
+    fn rejects_cpu_llama_model_auto_offload() {
+        // -1 = "offload as much as fits" — a conflict for a CPU-only model.
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"llama-server --model m.gguf -ngl -1\"",
+        );
+        expect_validation_error(&yaml, "requests GPU offload (--n-gpu-layers -1)");
+    }
+
+    #[test]
+    fn rejects_cpu_llama_model_offload_equals_form() {
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"llama-server --model m.gguf --n-gpu-layers=99\"",
+        );
+        expect_validation_error(&yaml, "requests GPU offload (--n-gpu-layers 99)");
+    }
+
+    #[test]
+    fn rejects_cpu_llama_model_offload_hidden_in_alias() {
+        // The offload flag may hide inside a cmd alias.
+        let yaml = r#"
+server: {}
+apikeys_file: apikeys.txt
+cmd_aliases:
+  llama: |
+    llama-server
+      --port {port}
+      --n-gpu-layers 99
+models:
+  - name: m
+    context_length: 4096
+    cmd: "{llama} --model m.gguf"
+"#;
+        expect_validation_error(yaml, "requests GPU offload (--n-gpu-layers 99)");
+    }
+
+    #[test]
+    fn accepts_cpu_llama_model_explicit_zero_offload() {
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"llama-server --model m.gguf --n-gpu-layers 0\"",
+        );
+        parse(&yaml).unwrap();
+    }
+
+    #[test]
+    fn accepts_cpu_llama_model_without_offload_flag() {
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"llama-server --model m.gguf\"",
+        );
+        parse(&yaml).unwrap();
+    }
+
+    #[test]
+    fn accepts_cpu_audiocpp_model() {
+        // Non-llama.cpp backends select their device through their own
+        // interface — the offload check must not apply to them.
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"audiocpp_server --config x.json --backend vulkan\"",
+        );
+        parse(&yaml).unwrap();
     }
 
     #[test]
