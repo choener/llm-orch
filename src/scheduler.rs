@@ -10,23 +10,18 @@ use crate::backend::{
 use crate::config::{AliasPolicy, MakeRoomMode, ModelConfig};
 use crate::gpu::GpuMetrics;
 use crate::http_client;
-use crate::instance::{Instance, InstanceHandle, InstanceState, SlotGuard};
+use crate::instance::{Instance, InstanceHandle, InstanceLoadPurpose, InstanceState, SlotGuard};
 use crate::keepalive::KeepAliveManager;
 use crate::port_alloc::PortAllocator;
-use crate::types::CompletionRecord;
+use crate::types::{CompletionRecord, QueueStatus, RequestState, RequestStatus};
 
 use reqwest::Client;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
 use tracing::{debug, error, info, warn};
-
-/// Maximum time a request may wait in the queue for a slot before failing.
-/// Without a bound, a lost wakeup (or simply sustained saturation) would
-/// park the HTTP request forever.
-const QUEUE_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long a spawn holds the global spawn semaphore while waiting for
 /// readiness.  Covers process start + initial load — the window where
@@ -35,20 +30,710 @@ const QUEUE_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// slow model cannot head-of-line block spawns of every other model.
 const SPAWN_SERIAL_WINDOW: Duration = Duration::from_secs(15);
 
-/// A parked waiter: unique id (for timeout self-removal) plus the channel
-/// used to deliver an already-acquired slot once capacity frees up.  The
-/// `SlotGuard` *is* the slot (acquired by `wake_one` under the instance
-/// lock), so a woken waiter can never lose the acquire race.
-type WaitQueue = VecDeque<(u64, oneshot::Sender<SlotGuard>)>;
+/// Snapshot of the logical route captured when a request enters a queue.
+/// Physical instance handles are deliberately absent: migration may replace
+/// every backend for the model before this route is assigned.
+#[derive(Debug, Clone)]
+struct QueueRouteSnapshot {
+    logical_model: String,
+    candidates: Vec<String>,
+    policy: AliasPolicy,
+    make_room: MakeRoomMode,
+    drain_timeout_secs: u64,
+    max_concurrent: usize,
+    generation: u64,
+    migration_id: Option<u64>,
+    request_id: Option<String>,
+}
+
+/// Terminal conditions delivered through a queue assignment channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueueTerminalError {
+    Deadline,
+    ModelRemoved,
+    MigrationFailed,
+    Shutdown,
+}
+
+/// A logical queued request and its assignment channel.
+struct QueueEntry {
+    id: u64,
+    route: QueueRouteSnapshot,
+    enqueued_at: Instant,
+    deadline: Option<Instant>,
+    assignment: oneshot::Sender<Result<(String, SlotGuard), QueueTerminalError>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+type WaitQueue = VecDeque<QueueEntry>;
+
+/// Owns a queued request while its assignment future is alive.  Dropping
+/// the ticket marks the entry cancelled and removes it immediately, so a
+/// disconnected client does not consume queue depth until the next wake.
+struct QueueTicket {
+    manager: Arc<InstanceManager>,
+    model_name: String,
+    id: u64,
+    cancelled: Arc<AtomicBool>,
+    expired: Arc<AtomicBool>,
+    request_id: Option<String>,
+}
+
+impl QueueTicket {
+    fn mark_expired(&self) {
+        self.expired.store(true, Ordering::Release);
+        self.cancelled.store(true, Ordering::Release);
+        self.manager
+            .scheduler_metrics
+            .queue_expired_total
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(request_id) = &self.request_id {
+            self.manager.update_request_state(
+                request_id,
+                RequestState::Expired,
+                None,
+                Some("queue wait deadline expired"),
+            );
+        }
+    }
+}
+
+impl Drop for QueueTicket {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        if self.manager.remove_queued(&self.model_name, self.id)
+            && !self.expired.load(Ordering::Acquire)
+        {
+            self.manager
+                .scheduler_metrics
+                .queue_cancelled_total
+                .fetch_add(1, Ordering::Relaxed);
+            if let Some(request_id) = &self.request_id {
+                self.manager.update_request_state(
+                    request_id,
+                    RequestState::Cancelled,
+                    None,
+                    Some("client disconnected while queued"),
+                );
+            }
+            debug!(model = %self.model_name, queue_id = self.id, "queue entry cancelled");
+        }
+    }
+}
+
+/// The result of registering a slow admission request.
+pub(crate) struct PendingAssignment {
+    receiver: oneshot::Receiver<Result<(String, SlotGuard), QueueTerminalError>>,
+    deadline: Option<Instant>,
+    _ticket: QueueTicket,
+}
+
+impl PendingAssignment {
+    pub(crate) async fn wait(self) -> Result<(String, SlotGuard), AcquireError> {
+        let PendingAssignment {
+            receiver,
+            deadline,
+            _ticket: ticket,
+        } = self;
+        let result = match deadline {
+            Some(deadline) => {
+                let wait = deadline.saturating_duration_since(Instant::now());
+                match tokio::time::timeout(wait, receiver).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        ticket.mark_expired();
+                        return Err(AcquireError::QueueTimeout);
+                    }
+                }
+            }
+            None => receiver.await,
+        };
+        match result {
+            Ok(Ok((model_name, guard))) => Ok((model_name, guard)),
+            Ok(Err(QueueTerminalError::Deadline)) => {
+                ticket.mark_expired();
+                Err(AcquireError::QueueTimeout)
+            }
+            Err(_) => {
+                if let Some(request_id) = &ticket.request_id {
+                    ticket.manager.update_request_state(
+                        request_id,
+                        RequestState::Cancelled,
+                        None,
+                        Some("queue assignment sender closed"),
+                    );
+                }
+                Err(AcquireError::NoCapacity)
+            }
+            Ok(Err(
+                QueueTerminalError::ModelRemoved
+                | QueueTerminalError::MigrationFailed
+                | QueueTerminalError::Shutdown,
+            )) => {
+                if let Some(request_id) = &ticket.request_id {
+                    ticket.manager.update_request_state(
+                        request_id,
+                        RequestState::Failed,
+                        None,
+                        Some("queued model became unavailable"),
+                    );
+                }
+                Err(AcquireError::Unavailable)
+            }
+        }
+    }
+}
+
+/// Either an immediately acquired slot or a queue-backed assignment future.
+pub(crate) enum Admission {
+    Assigned(String, SlotGuard),
+    Waiting(PendingAssignment),
+}
+
+/// Slow work to start after a queue entry has been registered.
+enum AdmissionDemand {
+    Spawn {
+        model_name: String,
+        cfg: ModelConfig,
+    },
+    LegacyMakeRoom {
+        model_name: String,
+        cfg: ModelConfig,
+        candidates: Vec<String>,
+        mode: MakeRoomMode,
+        drain_timeout_secs: u64,
+    },
+    Migration {
+        model_name: String,
+        cfg: ModelConfig,
+    },
+}
+
+/// The operation that owns a GPU reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservationPurpose {
+    /// A request-driven or autoscaling backend spawn.
+    NormalSpawn,
+    /// A temporary replacement backend for a migration.
+    MigrationReplacement,
+    /// The target backend load of a make-room admission transaction.
+    LargeModelAdmission,
+}
+
+/// Lifecycle phase of a GPU reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservationPhase {
+    /// Placement has been selected but process startup has not begun.
+    Planned,
+    /// The reservation is held while a backend is loading.
+    Loading,
+    /// A migration replacement is ready while the old backend drains.
+    WaitingForDrain,
+    /// The logical route handoff or target admission has committed.
+    Committed,
+}
+
+/// Cleanup metadata attached to every reservation entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReservationCleanup {
+    /// Token used by the owning coordinator to release a whole reservation
+    /// set idempotently, even if a load-failure cleanup races another path.
+    pub token: u64,
+    /// Optional stale-operation deadline.  The coordinator owns enforcing
+    /// this deadline; the table only stores it as cleanup metadata.
+    pub expires_at: Option<Instant>,
+}
+
+/// One reservation request, potentially covering multiple PCI slots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservationRequest {
+    pub transition_id: u64,
+    pub purpose: ReservationPurpose,
+    pub model: String,
+    pub pci_slots: Vec<String>,
+    pub vram_per_slot: u64,
+    pub phase: ReservationPhase,
+    pub cleanup: ReservationCleanup,
+}
+
+/// One per-PCI-slot reservation entry.
+///
+/// A multi-GPU placement creates one entry per PCI slot so projected usage
+/// follows the same conservative accounting rule as registered instances.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuReservation {
+    pub transition_id: u64,
+    pub purpose: ReservationPurpose,
+    pub model: String,
+    pub pci_slot: String,
+    pub vram_per_slot: u64,
+    pub phase: ReservationPhase,
+    pub cleanup: ReservationCleanup,
+}
+
+/// A deterministic physical placement together with projected VRAM usage.
+///
+/// The current selector produces identical peak and final projections because
+/// it represents one ordinary spawn.  Migration planning will use the same
+/// shape for a multi-phase transaction where peak usage includes both the old
+/// and replacement backends while final usage does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementSnapshot {
+    /// Backend device indices in deterministic launch order.
+    pub device_indices: Vec<usize>,
+    /// PCI slots corresponding to `device_indices` in the same order.
+    pub pci_slots: Vec<String>,
+    /// Projected per-slot VRAM after the placement commits.
+    pub projected_final_vram: HashMap<String, u64>,
+    /// Maximum per-slot VRAM during the placement operation.
+    pub projected_peak_vram: HashMap<String, u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReservationKey {
+    transition_id: u64,
+    pci_slot: String,
+}
+
+/// Errors from an atomic reservation attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReservationError {
+    /// The same PCI slot occurred more than once in one placement.
+    DuplicateSlot(String),
+    /// Another reservation already owns this PCI slot.
+    AlreadyReserved {
+        transition_id: u64,
+        pci_slot: String,
+    },
+    /// The coordinator task has stopped, so no new reservation can be made.
+    CoordinatorUnavailable,
+}
+
+/// Scheduler-owned table of temporary GPU reservations.
+///
+/// The table deliberately does not decide whether a placement fits.  The
+/// coordinator performs capacity checks and then uses `reserve_placement` to
+/// commit all slots atomically; this type guarantees that a partial
+/// multi-GPU reservation can never be visible.
+#[derive(Debug, Default)]
+pub struct ReservationTable {
+    entries: HashMap<ReservationKey, GpuReservation>,
+}
+
+impl ReservationTable {
+    /// Reserve every slot in a placement atomically.
+    pub fn reserve_placement(
+        &mut self,
+        request: ReservationRequest,
+    ) -> Result<(), ReservationError> {
+        self.reserve_batch(vec![request])
+    }
+
+    /// Reserve several placements as one atomic transaction.  This is needed
+    /// by migration, which reserves both the temporary victim replacement and
+    /// the eventual target placement before changing either route.
+    pub fn reserve_batch(
+        &mut self,
+        requests: Vec<ReservationRequest>,
+    ) -> Result<(), ReservationError> {
+        let mut seen = HashSet::new();
+        for request in &requests {
+            for pci_slot in &request.pci_slots {
+                if !seen.insert(pci_slot.clone()) {
+                    return Err(ReservationError::DuplicateSlot(pci_slot.clone()));
+                }
+                if let Some(existing) = self
+                    .entries
+                    .values()
+                    .find(|reservation| reservation.pci_slot == *pci_slot)
+                {
+                    return Err(ReservationError::AlreadyReserved {
+                        transition_id: existing.transition_id,
+                        pci_slot: pci_slot.clone(),
+                    });
+                }
+            }
+        }
+
+        for request in requests {
+            for pci_slot in request.pci_slots {
+                let key = ReservationKey {
+                    transition_id: request.transition_id,
+                    pci_slot: pci_slot.clone(),
+                };
+                self.entries.insert(
+                    key,
+                    GpuReservation {
+                        transition_id: request.transition_id,
+                        purpose: request.purpose,
+                        model: request.model.clone(),
+                        pci_slot,
+                        vram_per_slot: request.vram_per_slot,
+                        phase: request.phase,
+                        cleanup: request.cleanup,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Update the phase for all entries owned by a transition.
+    ///
+    /// Returns `true` when at least one entry was updated.  Empty CPU
+    /// placements therefore have no phase entry to update.
+    pub fn set_phase(&mut self, transition_id: u64, phase: ReservationPhase) -> bool {
+        let mut updated = false;
+        for reservation in self.entries.values_mut() {
+            if reservation.transition_id == transition_id {
+                reservation.phase = phase;
+                updated = true;
+            }
+        }
+        updated
+    }
+
+    /// Return projected reserved VRAM by PCI slot, optionally excluding one
+    /// transition's own reservations for a dry-run.
+    pub fn usage_by_slot(&self, excluding_transition: Option<u64>) -> HashMap<String, u64> {
+        let mut usage = HashMap::new();
+        for reservation in self.entries.values() {
+            if excluding_transition == Some(reservation.transition_id) {
+                continue;
+            }
+            *usage.entry(reservation.pci_slot.clone()).or_default() += reservation.vram_per_slot;
+        }
+        usage
+    }
+
+    /// Snapshot current entries without exposing the table's internal keys.
+    pub fn snapshot(&self) -> Vec<GpuReservation> {
+        self.entries.values().cloned().collect()
+    }
+
+    /// Release all entries for a transition.  Safe to call repeatedly.
+    pub fn release_transition(&mut self, transition_id: u64) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|_, reservation| reservation.transition_id != transition_id);
+        before - self.entries.len()
+    }
+
+    /// Release all entries with a cleanup token.  Safe to call repeatedly and
+    /// useful when cleanup is driven by a lease rather than a transition ID.
+    pub fn release_cleanup_token(&mut self, token: u64) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|_, reservation| reservation.cleanup.token != token);
+        before - self.entries.len()
+    }
+
+    /// Release reservations for one model.  Used when a config reload removes
+    /// a model before any associated transition can reach a commit point.
+    pub fn release_model(&mut self, model: &str) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|_, reservation| reservation.model != model);
+        before - self.entries.len()
+    }
+
+    /// Release every reservation.  Shutdown uses this after stopping loads.
+    pub fn release_all(&mut self) -> usize {
+        let count = self.entries.len();
+        self.entries.clear();
+        count
+    }
+
+    /// Remove entries whose cleanup deadline has passed.
+    pub fn release_expired(&mut self, now: Instant) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|_, reservation| {
+            reservation
+                .cleanup
+                .expires_at
+                .map(|deadline| deadline > now)
+                .unwrap_or(true)
+        });
+        before - self.entries.len()
+    }
+
+    /// Return the next cleanup deadline, if any.
+    pub fn next_expiry(&self) -> Option<Instant> {
+        self.entries
+            .values()
+            .filter_map(|reservation| reservation.cleanup.expires_at)
+            .min()
+    }
+}
+
+/// Commands processed by the single scheduler admission coordinator.
+///
+/// The coordinator owns the mutable reservation table and transition ID
+/// source.  Callers never mutate reservation state directly; they submit a
+/// command and await the result, so reservation commits are serialized even
+/// while backend startup is awaiting readiness elsewhere.
+enum CoordinatorCommand {
+    AllocateTransition {
+        reply: oneshot::Sender<u64>,
+    },
+    ReservePlacement {
+        request: ReservationRequest,
+        reply: oneshot::Sender<Result<(), ReservationError>>,
+    },
+    ReserveBatch {
+        requests: Vec<ReservationRequest>,
+        reply: oneshot::Sender<Result<(), ReservationError>>,
+    },
+    SetPhase {
+        transition_id: u64,
+        phase: ReservationPhase,
+        reply: oneshot::Sender<bool>,
+    },
+    Usage {
+        excluding_transition: Option<u64>,
+        reply: oneshot::Sender<HashMap<String, u64>>,
+    },
+    Snapshot {
+        reply: oneshot::Sender<Vec<GpuReservation>>,
+    },
+    ReleaseTransition {
+        transition_id: u64,
+        reply: oneshot::Sender<usize>,
+    },
+    ReleaseToken {
+        token: u64,
+        reply: oneshot::Sender<usize>,
+    },
+    ReleaseModel {
+        model: String,
+        reply: oneshot::Sender<usize>,
+    },
+    ReleaseAll {
+        reply: oneshot::Sender<usize>,
+    },
+}
+
+/// Handle used by the manager to submit commands to the coordinator task.
+#[derive(Clone)]
+struct CoordinatorHandle {
+    tx: mpsc::UnboundedSender<CoordinatorCommand>,
+}
+
+impl CoordinatorHandle {
+    fn start() -> Self {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // `InstanceManager::new` is also used by a few synchronous unit
+        // tests that only exercise pure helpers.  There is no useful
+        // reservation work to perform without a runtime, so close the
+        // command receiver there rather than panicking during construction.
+        if tokio::runtime::Handle::try_current().is_err() {
+            drop(rx);
+            return Self { tx };
+        }
+        let coordinator = async move {
+            let mut reservations = ReservationTable::default();
+            let mut next_transition_id = 0u64;
+            loop {
+                let command = if let Some(deadline) = reservations.next_expiry() {
+                    let wait = deadline.saturating_duration_since(Instant::now());
+                    tokio::select! {
+                        command = rx.recv() => command,
+                        _ = tokio::time::sleep(wait) => {
+                            reservations.release_expired(Instant::now());
+                            continue;
+                        }
+                    }
+                } else {
+                    rx.recv().await
+                };
+                let Some(command) = command else {
+                    break;
+                };
+                match command {
+                    CoordinatorCommand::AllocateTransition { reply } => {
+                        let id = next_transition_id;
+                        next_transition_id = next_transition_id.wrapping_add(1);
+                        let _ = reply.send(id);
+                    }
+                    CoordinatorCommand::ReservePlacement { request, reply } => {
+                        let _ = reply.send(reservations.reserve_placement(request));
+                    }
+                    CoordinatorCommand::ReserveBatch { requests, reply } => {
+                        let _ = reply.send(reservations.reserve_batch(requests));
+                    }
+                    CoordinatorCommand::SetPhase {
+                        transition_id,
+                        phase,
+                        reply,
+                    } => {
+                        let _ = reply.send(reservations.set_phase(transition_id, phase));
+                    }
+                    CoordinatorCommand::Usage {
+                        excluding_transition,
+                        reply,
+                    } => {
+                        let _ = reply.send(reservations.usage_by_slot(excluding_transition));
+                    }
+                    CoordinatorCommand::Snapshot { reply } => {
+                        let _ = reply.send(reservations.snapshot());
+                    }
+                    CoordinatorCommand::ReleaseTransition {
+                        transition_id,
+                        reply,
+                    } => {
+                        let _ = reply.send(reservations.release_transition(transition_id));
+                    }
+                    CoordinatorCommand::ReleaseToken { token, reply } => {
+                        let _ = reply.send(reservations.release_cleanup_token(token));
+                    }
+                    CoordinatorCommand::ReleaseModel { model, reply } => {
+                        let _ = reply.send(reservations.release_model(&model));
+                    }
+                    CoordinatorCommand::ReleaseAll { reply } => {
+                        let _ = reply.send(reservations.release_all());
+                    }
+                }
+            }
+        };
+        tokio::spawn(coordinator);
+        Self { tx }
+    }
+
+    async fn allocate_transition_id(&self) -> Option<u64> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(CoordinatorCommand::AllocateTransition { reply })
+            .ok()?;
+        response.await.ok()
+    }
+
+    async fn reserve_placement(&self, request: ReservationRequest) -> Result<(), ReservationError> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(CoordinatorCommand::ReservePlacement { request, reply })
+            .map_err(|_| ReservationError::CoordinatorUnavailable)?;
+        response
+            .await
+            .map_err(|_| ReservationError::CoordinatorUnavailable)?
+    }
+
+    async fn reserve_batch(
+        &self,
+        requests: Vec<ReservationRequest>,
+    ) -> Result<(), ReservationError> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(CoordinatorCommand::ReserveBatch { requests, reply })
+            .map_err(|_| ReservationError::CoordinatorUnavailable)?;
+        response
+            .await
+            .map_err(|_| ReservationError::CoordinatorUnavailable)?
+    }
+
+    async fn set_phase(&self, transition_id: u64, phase: ReservationPhase) -> bool {
+        let (reply, response) = oneshot::channel();
+        if self
+            .tx
+            .send(CoordinatorCommand::SetPhase {
+                transition_id,
+                phase,
+                reply,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        response.await.unwrap_or(false)
+    }
+
+    async fn usage(&self, excluding_transition: Option<u64>) -> HashMap<String, u64> {
+        let (reply, response) = oneshot::channel();
+        if self
+            .tx
+            .send(CoordinatorCommand::Usage {
+                excluding_transition,
+                reply,
+            })
+            .is_err()
+        {
+            return HashMap::new();
+        }
+        response.await.unwrap_or_default()
+    }
+
+    async fn snapshot(&self) -> Vec<GpuReservation> {
+        let (reply, response) = oneshot::channel();
+        if self
+            .tx
+            .send(CoordinatorCommand::Snapshot { reply })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        response.await.unwrap_or_default()
+    }
+
+    async fn release_transition(&self, transition_id: u64) -> usize {
+        let (reply, response) = oneshot::channel();
+        if self
+            .tx
+            .send(CoordinatorCommand::ReleaseTransition {
+                transition_id,
+                reply,
+            })
+            .is_err()
+        {
+            return 0;
+        }
+        response.await.unwrap_or(0)
+    }
+
+    async fn release_token(&self, token: u64) -> usize {
+        let (reply, response) = oneshot::channel();
+        if self
+            .tx
+            .send(CoordinatorCommand::ReleaseToken { token, reply })
+            .is_err()
+        {
+            return 0;
+        }
+        response.await.unwrap_or(0)
+    }
+
+    async fn release_model(&self, model: String) -> usize {
+        let (reply, response) = oneshot::channel();
+        if self
+            .tx
+            .send(CoordinatorCommand::ReleaseModel { model, reply })
+            .is_err()
+        {
+            return 0;
+        }
+        response.await.unwrap_or(0)
+    }
+
+    async fn release_all(&self) -> usize {
+        let (reply, response) = oneshot::channel();
+        if self
+            .tx
+            .send(CoordinatorCommand::ReleaseAll { reply })
+            .is_err()
+        {
+            return 0;
+        }
+        response.await.unwrap_or(0)
+    }
+}
 
 /// Why `get_or_spawn` could not provide an instance slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcquireError {
     /// The model is crash-blocked.
     Blocked,
-    /// Instances exist but all are busy, and the queue is full or the
-    /// wait timed out.
+    /// Instances exist but all are busy, and the queue is full.
     NoCapacity,
+    /// An accepted waiter reached its configured maximum queue wait.
+    QueueTimeout,
     /// No instance could be provided at all: the model is unknown to the
     /// manager (e.g. removed by a concurrent config reload), its spawn
     /// failed (see server logs), or all remaining instances are retiring.
@@ -63,6 +748,7 @@ enum EnqueueError {
     /// No routable instance exists — nothing could ever wake a waiter.
     NoInstances,
     /// The queue wait timed out.
+    #[cfg(test)]
     Timeout,
 }
 
@@ -76,6 +762,55 @@ enum RemovalMode {
     Drain,
     /// Kill even busy instances (shutdown, reaping).
     Force,
+}
+
+// ── Request status registry ──────────────────────────────────────────────────
+
+const REQUEST_STATUS_MAX_ENTRIES: usize = 4096;
+const REQUEST_STATUS_RETENTION: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Default)]
+struct SchedulerCounters {
+    queue_enqueued_total: AtomicU64,
+    queue_assigned_total: AtomicU64,
+    queue_cancelled_total: AtomicU64,
+    queue_expired_total: AtomicU64,
+    migration_started_total: AtomicU64,
+    migration_completed_total: AtomicU64,
+    migration_failed_total: AtomicU64,
+    reservation_cleanup_total: AtomicU64,
+}
+
+impl SchedulerCounters {
+    fn snapshot(&self) -> crate::types::SchedulerMetrics {
+        crate::types::SchedulerMetrics {
+            queue_enqueued_total: self.queue_enqueued_total.load(Ordering::Relaxed),
+            queue_assigned_total: self.queue_assigned_total.load(Ordering::Relaxed),
+            queue_cancelled_total: self.queue_cancelled_total.load(Ordering::Relaxed),
+            queue_expired_total: self.queue_expired_total.load(Ordering::Relaxed),
+            migration_started_total: self.migration_started_total.load(Ordering::Relaxed),
+            migration_completed_total: self.migration_completed_total.load(Ordering::Relaxed),
+            migration_failed_total: self.migration_failed_total.load(Ordering::Relaxed),
+            reservation_cleanup_total: self.reservation_cleanup_total.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct RequestStatusRecord {
+    status: RequestStatus,
+    created_at: Instant,
+    terminal_at: Option<Instant>,
+}
+
+fn request_state_is_terminal(state: RequestState) -> bool {
+    matches!(
+        state,
+        RequestState::Completed
+            | RequestState::Expired
+            | RequestState::Cancelled
+            | RequestState::Shutdown
+            | RequestState::Failed
+    )
 }
 
 // ── Model metrics (tickless EMA) ────────────────────────────────────────────
@@ -191,7 +926,7 @@ impl ModelMetrics {
 /// instances.
 ///
 /// Instances whose stored fingerprint no longer matches the current
-/// config are retired on reload (marked `Failed`/draining) and replaced
+/// config are retired on reload (marked `Draining`) and replaced
 /// on demand.  Runtime-only value — never persisted, so `DefaultHasher`'s
 /// version instability is irrelevant.
 fn fingerprint_with_aliases(cmd_aliases: &HashMap<String, String>, cfg: &ModelConfig) -> u64 {
@@ -265,6 +1000,20 @@ pub struct InstanceManager {
     /// Unique id source for queue entries (used for timeout self-removal).
     next_queue_id: AtomicU64,
 
+    /// Single serialized admission coordinator.  It owns transition IDs and
+    /// the reservation table, while backend startup continues outside the
+    /// command loop so unrelated loads are not blocked on readiness.
+    coordinator: CoordinatorHandle,
+
+    /// Incremented after each validated config reconciliation.  Migration
+    /// tasks capture the epoch and roll back at safe pre-handoff points if a
+    /// reload changes their immutable placement/config snapshot.
+    config_epoch: AtomicU64,
+
+    /// Set when shutdown begins; prevents new admissions and migrations while
+    /// allowing already-running handlers to drain until the HTTP bound.
+    shutdown_requested: AtomicBool,
+
     /// Sequence number appended to instance IDs (`model@gpu#N`) so every
     /// instance gets a unique ID even when the base `model@gpus` collides
     /// (e.g. multiple CPU instances of one model).
@@ -311,8 +1060,23 @@ pub struct InstanceManager {
     /// See `docs/003-smart-handling.md`, decision 8.
     drain_idle_timeout_secs: RwLock<u64>,
 
+    /// Maximum scheduler queue wait in seconds; zero means no scheduler
+    /// deadline.  Backend timeouts begin only after assignment.
+    queue_wait_timeout_secs: RwLock<u64>,
+
+    /// Maximum migration transition duration; zero means no transition
+    /// deadline.  Queue wait deadlines remain separate.
+    migration_timeout_secs: RwLock<u64>,
+
     /// Per-model EMA metrics (load & request rate).
     model_metrics: RwLock<HashMap<String, ModelMetrics>>,
+
+    /// Bounded in-memory request lifecycle registry used by the authenticated
+    /// request-status endpoint.  Prompts and API keys are never stored.
+    request_statuses: std::sync::RwLock<HashMap<String, RequestStatusRecord>>,
+
+    /// Low-cardinality scheduler counters exposed through info/status.
+    scheduler_metrics: SchedulerCounters,
 
     /// Global semaphore to serialize the critical section of spawn
     /// attempts across models (process start + `SPAWN_SERIAL_WINDOW` of
@@ -348,6 +1112,11 @@ pub struct InstanceManager {
     /// client disconnect can never abort a spawn half-way and strand a
     /// `Loading` instance that nothing would reap.
     spawns_in_flight: std::sync::RwLock<HashMap<String, watch::Sender<()>>>,
+
+    /// Per-target in-flight migration tasks.  All callers for the same
+    /// logical target subscribe to one transition rather than planning
+    /// competing evictions.
+    migrations_in_flight: std::sync::RwLock<HashMap<String, watch::Sender<()>>>,
 }
 
 impl InstanceManager {
@@ -413,6 +1182,9 @@ impl InstanceManager {
             instances: RwLock::new(HashMap::new()),
             queues: RwLock::new(HashMap::new()),
             next_queue_id: AtomicU64::new(0),
+            coordinator: CoordinatorHandle::start(),
+            config_epoch: AtomicU64::new(0),
+            shutdown_requested: AtomicBool::new(false),
             instance_seq: AtomicU64::new(0),
             blocked: RwLock::new(HashMap::new()),
             gpu_snapshot,
@@ -425,7 +1197,11 @@ impl InstanceManager {
             crash_limit: 3,
             spawn_timeout: Duration::from_secs(120),
             drain_idle_timeout_secs: RwLock::new(config.server.drain_idle_timeout_secs),
+            queue_wait_timeout_secs: RwLock::new(config.server.queue_wait_timeout_secs),
+            migration_timeout_secs: RwLock::new(config.server.migration_timeout_secs),
             model_metrics: RwLock::new(HashMap::new()),
+            request_statuses: std::sync::RwLock::new(HashMap::new()),
+            scheduler_metrics: SchedulerCounters::default(),
             spawn_semaphore: Arc::new(Semaphore::new(1)),
             last_scale_action: RwLock::new(HashMap::new()),
             recent_completions: RwLock::new(HashMap::new()),
@@ -433,8 +1209,239 @@ impl InstanceManager {
             crash_tx,
             crash_counts: std::sync::Mutex::new(HashMap::new()),
             spawns_in_flight: std::sync::RwLock::new(HashMap::new()),
+            migrations_in_flight: std::sync::RwLock::new(HashMap::new()),
         };
         (mgr, release_rx, crash_rx)
+    }
+
+    // ── reservation bookkeeping ───────────────────────────────────────────
+
+    /// Allocate a unique ID for an admission or migration transition.
+    pub async fn allocate_transition_id(&self) -> Option<u64> {
+        self.coordinator.allocate_transition_id().await
+    }
+
+    /// Atomically reserve all PCI slots in one placement.
+    ///
+    /// Capacity and device-pool eligibility are checked by the coordinator;
+    /// this method only commits the reservation set in the coordinator task.
+    pub async fn reserve_placement(
+        &self,
+        request: ReservationRequest,
+    ) -> Result<(), ReservationError> {
+        self.coordinator.reserve_placement(request).await
+    }
+
+    /// Atomically reserve all placements belonging to one transition.
+    pub async fn reserve_placements(
+        &self,
+        requests: Vec<ReservationRequest>,
+    ) -> Result<(), ReservationError> {
+        self.coordinator.reserve_batch(requests).await
+    }
+
+    /// Update all reservation entries belonging to a transition.
+    pub async fn set_reservation_phase(&self, transition_id: u64, phase: ReservationPhase) -> bool {
+        self.coordinator.set_phase(transition_id, phase).await
+    }
+
+    /// Return projected reservation usage by PCI slot.
+    pub async fn reservation_usage(
+        &self,
+        excluding_transition: Option<u64>,
+    ) -> HashMap<String, u64> {
+        self.coordinator.usage(excluding_transition).await
+    }
+
+    /// Return a snapshot of all current reservation entries.
+    pub async fn reservation_snapshot(&self) -> Vec<GpuReservation> {
+        self.coordinator.snapshot().await
+    }
+
+    /// Release every reservation owned by a transition.  Safe to call from
+    /// multiple cleanup paths.
+    pub async fn release_reservations(&self, transition_id: u64) -> usize {
+        let released = self.coordinator.release_transition(transition_id).await;
+        if released > 0 {
+            self.scheduler_metrics
+                .reservation_cleanup_total
+                .fetch_add(released as u64, Ordering::Relaxed);
+        }
+        released
+    }
+
+    /// Release every reservation carrying a cleanup token.  Safe to call
+    /// repeatedly when a load-failure, timeout, or shutdown cleanup races.
+    pub async fn release_reservations_by_token(&self, token: u64) -> usize {
+        let released = self.coordinator.release_token(token).await;
+        if released > 0 {
+            self.scheduler_metrics
+                .reservation_cleanup_total
+                .fetch_add(released as u64, Ordering::Relaxed);
+        }
+        released
+    }
+
+    /// Release reservations associated with a model during removal or reload.
+    pub async fn release_model_reservations(&self, model: &str) -> usize {
+        let released = self.coordinator.release_model(model.to_owned()).await;
+        if released > 0 {
+            self.scheduler_metrics
+                .reservation_cleanup_total
+                .fetch_add(released as u64, Ordering::Relaxed);
+        }
+        released
+    }
+
+    /// Release all reservations during final shutdown cleanup.
+    pub async fn release_all_reservations(&self) -> usize {
+        let released = self.coordinator.release_all().await;
+        if released > 0 {
+            self.scheduler_metrics
+                .reservation_cleanup_total
+                .fetch_add(released as u64, Ordering::Relaxed);
+        }
+        released
+    }
+
+    // ── request status and queue metrics ─────────────────────────────────
+
+    /// Register an accepted request before scheduler admission begins.
+    /// Stop new request admission and infrastructure migrations.
+    pub fn begin_shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::Release);
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Acquire)
+    }
+
+    pub fn register_request(&self, request_id: &str, logical_model: &str) {
+        let mut statuses = self.request_statuses.write().unwrap();
+        statuses.insert(
+            request_id.to_owned(),
+            RequestStatusRecord {
+                status: RequestStatus {
+                    request_id: request_id.to_owned(),
+                    logical_model: logical_model.to_owned(),
+                    resolved_model: None,
+                    state: RequestState::Queued,
+                    queue: None,
+                    queue_position: None,
+                    enqueued_at: crate::debug_log::ts_now(),
+                    wait_duration_ms: 0,
+                    deadline: None,
+                    migration_id: None,
+                    migration_phase: None,
+                    victim_instance: None,
+                    victim_gpu: Vec::new(),
+                    destination_gpu: Vec::new(),
+                    target_gpu: Vec::new(),
+                    active_victim_slots: 0,
+                    reservation_peak_vram: HashMap::new(),
+                    reservation_final_vram: HashMap::new(),
+                    failure_reason: None,
+                },
+                created_at: Instant::now(),
+                terminal_at: None,
+            },
+        );
+        self.prune_request_statuses_locked(&mut statuses);
+    }
+
+    /// Update request lifecycle state without storing request contents.
+    pub fn update_request_state(
+        &self,
+        request_id: &str,
+        state: RequestState,
+        resolved_model: Option<&str>,
+        failure_reason: Option<&str>,
+    ) {
+        let mut statuses = self.request_statuses.write().unwrap();
+        let Some(record) = statuses.get_mut(request_id) else {
+            return;
+        };
+        record.status.state = state;
+        if let Some(model) = resolved_model {
+            record.status.resolved_model = Some(model.to_owned());
+        }
+        if let Some(reason) = failure_reason {
+            record.status.failure_reason = Some(reason.to_owned());
+        }
+        record.status.wait_duration_ms = record.created_at.elapsed().as_millis() as u64;
+        if request_state_is_terminal(state) {
+            record.terminal_at.get_or_insert_with(Instant::now);
+        }
+        self.prune_request_statuses_locked(&mut statuses);
+    }
+
+    /// Return one request status, pruning terminal entries past retention.
+    pub fn request_status(&self, request_id: &str) -> Option<RequestStatus> {
+        let mut statuses = self.request_statuses.write().unwrap();
+        self.prune_request_statuses_locked(&mut statuses);
+        statuses.get(request_id).map(|record| record.status.clone())
+    }
+
+    fn prune_request_statuses_locked(&self, statuses: &mut HashMap<String, RequestStatusRecord>) {
+        let now = Instant::now();
+        statuses.retain(|_, record| {
+            record
+                .terminal_at
+                .map(|terminal| now.duration_since(terminal) < REQUEST_STATUS_RETENTION)
+                .unwrap_or(true)
+        });
+        while statuses.len() > REQUEST_STATUS_MAX_ENTRIES {
+            let oldest = statuses
+                .iter()
+                .min_by_key(|(_, record)| record.terminal_at.unwrap_or(record.created_at))
+                .map(|(id, _)| id.clone());
+            let Some(id) = oldest else { break };
+            statuses.remove(&id);
+        }
+    }
+
+    /// Return aggregate scheduler counters.
+    pub fn scheduler_metrics_snapshot(&self) -> crate::types::SchedulerMetrics {
+        self.scheduler_metrics.snapshot()
+    }
+
+    /// Count queued entries by the reason currently blocking assignment.
+    pub fn queue_status(&self, model_name: &str) -> QueueStatus {
+        let loading = self
+            .instances
+            .read()
+            .unwrap()
+            .get(model_name)
+            .map(|instances| {
+                instances
+                    .iter()
+                    .any(|handle| handle.inner().lock().unwrap().state == InstanceState::Loading)
+            })
+            .unwrap_or(false);
+        let migration = self
+            .migrations_in_flight
+            .read()
+            .unwrap()
+            .contains_key(model_name);
+        let queues = self.queues.read().unwrap();
+        let mut result = QueueStatus::default();
+        for queue in queues.values() {
+            for entry in queue {
+                if entry.route.logical_model != model_name
+                    || entry.cancelled.load(Ordering::Acquire)
+                {
+                    continue;
+                }
+                if migration || entry.route.migration_id.is_some() {
+                    result.waiting_for_migration += 1;
+                } else if loading {
+                    result.waiting_for_spawn += 1;
+                } else {
+                    result.waiting_for_slot += 1;
+                }
+            }
+        }
+        result
     }
 
     // ── get-or-spawn ──────────────────────────────────────────────────────
@@ -466,27 +1473,20 @@ impl InstanceManager {
         .map(|(_, guard)| guard)
     }
 
-    /// Acquire an instance slot for one of `candidates` (in preference
-    /// order), returning the chosen model name alongside the slot guard.
-    /// Multi-model alias routing — see `docs/003-smart-handling.md`.
-    ///
-    /// Selection (`prefer_loaded`): any warm slot in order → first
-    /// candidate spawnable *without* eviction → first candidate spawnable
-    /// *with* make-room eviction → queue on the first loaded candidate.
-    /// `prefer_order` instead tries each candidate fully (warm slot →
-    /// spawn → make-room) before advancing to the next.
-    ///
-    /// Unknown and blocked candidates are skipped (traced); only when
-    /// *every* candidate is unusable does the call fail.
-    pub async fn acquire_for_candidates(
+    /// Register an admission and return either an immediate slot or a
+    /// queue-backed assignment future.  Slow spawn, legacy make-room, and
+    /// migration work is started only after the queue entry exists.
+    pub(crate) async fn admit(
         self: &Arc<Self>,
         candidates: &[String],
         policy: AliasPolicy,
         make_room: MakeRoomMode,
         drain_timeout: u64,
-    ) -> Result<(String, SlotGuard), AcquireError> {
-        // Resolve configs for all candidates; skip unknown/blocked ones.
-        // No awaits while the configs guard is held.
+        request_id: Option<&str>,
+    ) -> Result<Admission, AcquireError> {
+        if self.is_shutting_down() {
+            return Err(AcquireError::Unavailable);
+        }
         let mut resolved: Vec<(String, ModelConfig)> = Vec::new();
         let mut any_blocked = false;
         {
@@ -511,103 +1511,174 @@ impl InstanceManager {
             });
         }
 
+        let mut demand = None;
+        let mut queue_choice = None;
         match policy {
             AliasPolicy::PreferLoaded => {
-                // Pass A: first candidate with a warm slot.
                 for (name, cfg) in &resolved {
                     if let Some(guard) = self.acquire_ready_slot(name, cfg.max_concurrent) {
-                        return Ok((name.clone(), guard));
+                        return Ok(Admission::Assigned(name.clone(), guard));
                     }
                 }
-                // Pass B, round 1: first candidate spawnable *without*
-                // eviction — a spillover candidate that fits for free beats
-                // evicting for a more preferred one (decision 6).
                 for (name, cfg) in &resolved {
-                    if !self.should_spawn(name, cfg) {
-                        continue;
-                    }
-                    if !self.spawn_feasible(cfg, &HashSet::new()).await {
-                        debug!(model = %name, "candidate does not fit without eviction");
-                        continue;
-                    }
-                    if let Some(guard) = self.spawn_and_acquire(name, cfg).await {
-                        return Ok((name.clone(), guard));
+                    if self.should_spawn(name, cfg)
+                        && self.spawn_feasible(cfg, &HashSet::new()).await
+                    {
+                        demand = Some(AdmissionDemand::Spawn {
+                            model_name: name.clone(),
+                            cfg: cfg.clone(),
+                        });
+                        queue_choice = Some((name.clone(), cfg.clone()));
+                        break;
                     }
                 }
-                // Pass B, round 2: make-room eviction, in candidate order.
-                if make_room != MakeRoomMode::None {
+                if demand.is_none() {
                     for (name, cfg) in &resolved {
                         if !self.should_spawn(name, cfg) {
                             continue;
                         }
                         if self.spawn_feasible(cfg, &HashSet::new()).await {
-                            // Round 1 already tried (and failed) to spawn
-                            // this one — don't retry immediately.
                             continue;
                         }
-                        match self.plan_make_room(cfg, make_room).await {
-                            Some(plan) => {
-                                self.execute_make_room(&plan, drain_timeout).await;
-                                if let Some(guard) = self.spawn_and_acquire(name, cfg).await {
-                                    return Ok((name.clone(), guard));
-                                }
+                        demand = match make_room {
+                            mode if mode.is_migration() => Some(AdmissionDemand::Migration {
+                                model_name: name.clone(),
+                                cfg: cfg.clone(),
+                            }),
+                            mode if mode.is_legacy_eviction() => {
+                                Some(AdmissionDemand::LegacyMakeRoom {
+                                    model_name: name.clone(),
+                                    cfg: cfg.clone(),
+                                    candidates: candidates.to_vec(),
+                                    mode,
+                                    drain_timeout_secs: drain_timeout,
+                                })
                             }
-                            None => {
-                                debug!(model = %name, "no make-room plan frees enough VRAM")
-                            }
+                            _ => None,
+                        };
+                        if demand.is_some() {
+                            queue_choice = Some((name.clone(), cfg.clone()));
+                            break;
                         }
                     }
                 }
             }
             AliasPolicy::PreferOrder => {
-                // Per candidate, in order: warm slot → spawn → make-room.
-                // Only advance to the next candidate when all three fail.
                 for (name, cfg) in &resolved {
                     if let Some(guard) = self.acquire_ready_slot(name, cfg.max_concurrent) {
-                        return Ok((name.clone(), guard));
+                        return Ok(Admission::Assigned(name.clone(), guard));
                     }
                     if !self.should_spawn(name, cfg) {
                         continue;
                     }
-                    if self.spawn_feasible(cfg, &HashSet::new()).await {
-                        if let Some(guard) = self.spawn_and_acquire(name, cfg).await {
-                            return Ok((name.clone(), guard));
-                        }
-                    } else if make_room != MakeRoomMode::None {
-                        match self.plan_make_room(cfg, make_room).await {
-                            Some(plan) => {
-                                self.execute_make_room(&plan, drain_timeout).await;
-                                if let Some(guard) = self.spawn_and_acquire(name, cfg).await {
-                                    return Ok((name.clone(), guard));
-                                }
-                            }
-                            None => {
-                                debug!(model = %name, "no make-room plan frees enough VRAM")
-                            }
-                        }
+                    let feasible = self.spawn_feasible(cfg, &HashSet::new()).await;
+                    demand = if feasible {
+                        Some(AdmissionDemand::Spawn {
+                            model_name: name.clone(),
+                            cfg: cfg.clone(),
+                        })
+                    } else if make_room.is_migration() {
+                        Some(AdmissionDemand::Migration {
+                            model_name: name.clone(),
+                            cfg: cfg.clone(),
+                        })
+                    } else if make_room.is_legacy_eviction() {
+                        Some(AdmissionDemand::LegacyMakeRoom {
+                            model_name: name.clone(),
+                            cfg: cfg.clone(),
+                            candidates: candidates.to_vec(),
+                            mode: make_room,
+                            drain_timeout_secs: drain_timeout,
+                        })
+                    } else {
+                        None
+                    };
+                    if demand.is_some() {
+                        queue_choice = Some((name.clone(), cfg.clone()));
+                        break;
                     }
                 }
             }
         }
 
-        // Pass C: wait — queue on the first *loaded* candidate (a release
-        // or spawn event can wake a parked waiter); when nothing is loaded,
-        // on the first candidate, which fails fast if nothing can ever
-        // wake the queue (current single-model semantics).
-        let (queue_name, queue_cfg) = resolved
-            .iter()
-            .find(|(n, _)| self.has_routable_instance(n))
-            .unwrap_or(&resolved[0]);
-        debug!(
-            model = %queue_name,
-            "no candidate could serve or be loaded — queueing"
-        );
-        match self.enqueue(queue_name, queue_cfg.queue_depth).await {
-            Ok(guard) => Ok((queue_name.clone(), guard)),
-            // Nothing exists that could ever wake a waiter — the spawn
-            // failed (see logs) or everything left is retiring.
-            Err(EnqueueError::NoInstances) => Err(AcquireError::Unavailable),
-            Err(EnqueueError::QueueFull | EnqueueError::Timeout) => Err(AcquireError::NoCapacity),
+        let (queue_name, queue_cfg) = queue_choice.unwrap_or_else(|| {
+            resolved
+                .iter()
+                .find(|(name, _)| self.has_routable_instance(name))
+                .cloned()
+                .unwrap_or_else(|| resolved[0].clone())
+        });
+        // If no demand can be started and no routable instance exists, the
+        // request cannot ever be woken.  This preserves fail-fast behavior
+        // for direct requests whose model does not fit and has no migration
+        // policy, while spawnable cold starts still queue below.
+        if demand.is_none() && !self.has_routable_instance(&queue_name) {
+            return Err(AcquireError::Unavailable);
+        }
+
+        // A zero-depth queue rejects waiting immediately, but preserve the
+        // existing behavior of triggering a fitting normal spawn before the
+        // rejection is returned.  No request has been accepted in this
+        // branch, so it does not violate the pre-registration rule.
+        if queue_cfg.queue_depth == 0 {
+            if let Some(demand) = demand {
+                match demand {
+                    AdmissionDemand::Spawn { model_name, cfg } => {
+                        // Preserve the legacy zero-depth behavior: trigger
+                        // the fitting load and let it finish before reporting
+                        // that this request cannot wait in the queue.
+                        let mut rx = self.ensure_spawn(&model_name, &cfg);
+                        let budget =
+                            self.spawn_timeout + SPAWN_SERIAL_WINDOW + Duration::from_secs(30);
+                        let _ = tokio::time::timeout(budget, rx.changed()).await;
+                    }
+                    other => self.start_admission_demand(other),
+                }
+            }
+            return Err(AcquireError::NoCapacity);
+        }
+
+        let route = QueueRouteSnapshot {
+            logical_model: queue_name.clone(),
+            candidates: resolved.iter().map(|(name, _)| name.clone()).collect(),
+            policy,
+            make_room,
+            drain_timeout_secs: drain_timeout,
+            max_concurrent: queue_cfg.max_concurrent,
+            generation: self.model_generation(&queue_name),
+            migration_id: self.model_migration_id(&queue_name),
+            request_id: request_id.map(str::to_owned),
+        };
+        let pending = self
+            .register_pending(route, queue_cfg.queue_depth, true)
+            .map_err(|error| match error {
+                EnqueueError::QueueFull => AcquireError::NoCapacity,
+                #[cfg(test)]
+                EnqueueError::Timeout => AcquireError::QueueTimeout,
+                EnqueueError::NoInstances => AcquireError::Unavailable,
+            })?;
+
+        if let Some(demand) = demand {
+            self.start_admission_demand(demand);
+        }
+        Ok(Admission::Waiting(pending))
+    }
+
+    /// Acquire an instance slot for one of `candidates` (in preference
+    /// order), returning the chosen model name alongside the slot guard.
+    pub async fn acquire_for_candidates(
+        self: &Arc<Self>,
+        candidates: &[String],
+        policy: AliasPolicy,
+        make_room: MakeRoomMode,
+        drain_timeout: u64,
+    ) -> Result<(String, SlotGuard), AcquireError> {
+        match self
+            .admit(candidates, policy, make_room, drain_timeout, None)
+            .await?
+        {
+            Admission::Assigned(model_name, guard) => Ok((model_name, guard)),
+            Admission::Waiting(pending) => pending.wait().await,
         }
     }
 
@@ -631,9 +1702,7 @@ impl InstanceManager {
                         .get(model_name)
                         .map(|l| {
                             l.iter()
-                                .filter(|h| {
-                                    h.inner().lock().unwrap().state != InstanceState::Failed
-                                })
+                                .filter(|h| h.inner().lock().unwrap().counts_toward_instance_cap())
                                 .count()
                         })
                         .unwrap_or(0)
@@ -676,8 +1745,8 @@ impl InstanceManager {
     /// and the actual spawn; `try_spawn` re-checks under the spawn
     /// semaphore and simply fails then, which the caller handles.
     async fn spawn_feasible(&self, cfg: &ModelConfig, excluding: &HashSet<String>) -> bool {
-        // Instance cap (mirrors try_spawn): retiring (`Failed`) instances
-        // and planned make-room victims don't count.
+        // Instance cap (mirrors try_spawn): retiring (`Draining`/`Failed`)
+        // instances and planned make-room victims don't count.
         {
             let instances = self.instances.read().unwrap();
             if let Some(list) = instances.get(&cfg.name) {
@@ -685,7 +1754,7 @@ impl InstanceManager {
                     .iter()
                     .filter(|h| {
                         let inst = h.inner().lock().unwrap();
-                        inst.state != InstanceState::Failed && !excluding.contains(&inst.id)
+                        inst.counts_toward_instance_cap() && !excluding.contains(&inst.id)
                     })
                     .count();
                 if active >= cfg.max_instances {
@@ -701,29 +1770,12 @@ impl InstanceManager {
         if !has_device_pool {
             return true;
         }
-        self.select_gpus_inner(cfg, excluding).await.len() >= cfg.gpus
-    }
-
-    /// Ensure a spawn for `model_name` is running, await its completion
-    /// (bounded), then try the fast path once.  `None` on spawn failure or
-    /// when competing requests filled the fresh instance first — the
-    /// caller decides whether to try the next candidate or queue.
-    async fn spawn_and_acquire(
-        self: &Arc<Self>,
-        model_name: &str,
-        cfg: &ModelConfig,
-    ) -> Option<SlotGuard> {
-        let mut rx = self.ensure_spawn(model_name, cfg);
-        // Bound the wait: spawn timeout + serialized window + margin for
-        // semaphore queueing and process setup.
-        let budget = self.spawn_timeout + SPAWN_SERIAL_WINDOW + Duration::from_secs(30);
-        // The entry's sender is dropped when the spawn task finishes —
-        // success or failure — which resolves `changed()` with an error.
-        let _ = tokio::time::timeout(budget, rx.changed()).await;
-        // Retry the fast path once: after a successful spawn the fresh
-        // instance is Ready with spare capacity.  On failure (or if
-        // competing requests filled it first) the caller falls through.
-        self.acquire_ready_slot(model_name, cfg.max_concurrent)
+        let available = if excluding.is_empty() {
+            self.select_gpus_for_model(cfg).await.len()
+        } else {
+            self.select_gpus_inner(cfg, excluding).await.len()
+        };
+        available >= cfg.gpus
     }
 
     /// Whether the model has at least one routable (non-retiring)
@@ -735,12 +1787,460 @@ impl InstanceManager {
             .get(model_name)
             .map(|l| {
                 l.iter()
-                    .any(|h| h.inner().lock().unwrap().state != InstanceState::Failed)
+                    .any(|h| h.inner().lock().unwrap().can_wake_waiters())
             })
             .unwrap_or(false)
     }
 
+    /// Current logical generation for a model.  Queued requests store this
+    /// value as a diagnostic snapshot; physical routing is re-evaluated at
+    /// assignment time.
+    fn model_generation(&self, model_name: &str) -> u64 {
+        self.instances
+            .read()
+            .unwrap()
+            .get(model_name)
+            .map(|list| {
+                list.iter()
+                    .map(|handle| handle.inner().lock().unwrap().generation)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+    }
+
+    /// Return the migration barrier currently attached to a logical model.
+    fn model_migration_id(&self, model_name: &str) -> Option<u64> {
+        self.instances
+            .read()
+            .unwrap()
+            .get(model_name)
+            .and_then(|list| {
+                list.iter()
+                    .find_map(|handle| handle.inner().lock().unwrap().migration_id)
+            })
+    }
+
+    /// A queued route may be assigned only when no newer/different migration
+    /// barrier is active.  Generation changes alone are safe because the
+    /// queue is logical rather than instance-bound.
+    fn route_allows_assignment(&self, route: &QueueRouteSnapshot) -> bool {
+        match (
+            route.migration_id,
+            self.model_migration_id(&route.logical_model),
+        ) {
+            (None, Some(_)) | (Some(_), Some(_)) => false,
+            (_, None) => true,
+        }
+    }
+
     // ── make-room eviction (docs/003-smart-handling.md) ──────────────────
+
+    /// Enumerate migration candidates in deterministic LRU order.
+    ///
+    /// Unlike legacy make-room, migration may move a sole instance, but only
+    /// when a complete replacement placement can already be proven on a
+    /// different PCI-slot set.  This method is intentionally a snapshot:
+    /// callers must re-check the destination and reserve it before changing
+    /// routing.
+    async fn enumerate_migration_victims(
+        &self,
+        requesting_model: &str,
+    ) -> Vec<MigrationVictimCandidate> {
+        let configs = self.model_configs.read().unwrap().clone();
+        let mut candidates = Vec::new();
+        let instances: Vec<(String, InstanceHandle)> = {
+            let instances = self.instances.read().unwrap();
+            instances
+                .iter()
+                .flat_map(|(model_name, list)| {
+                    list.iter()
+                        .map(|handle| (model_name.clone(), handle.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+
+        for (model_name, handle) in instances {
+            if model_name == requesting_model {
+                continue;
+            }
+            let Some(cfg) = configs.get(&model_name) else {
+                continue;
+            };
+            let (
+                instance_id,
+                state,
+                in_flight,
+                last_completed,
+                gpu_indices,
+                migration_id,
+                generation,
+            ) = {
+                let inst = handle.inner().lock().unwrap();
+                (
+                    inst.id.clone(),
+                    inst.state,
+                    inst.in_flight,
+                    inst.last_completed,
+                    inst.gpu_indices.clone(),
+                    inst.migration_id,
+                    inst.generation,
+                )
+            };
+            if state != InstanceState::Ready || migration_id.is_some() || gpu_indices.is_empty() {
+                continue;
+            }
+            let Some(source_pci_slots) = self.pci_slots_for_instance(&model_name, &gpu_indices)
+            else {
+                continue;
+            };
+            let blocked_slots: HashSet<String> = source_pci_slots.iter().cloned().collect();
+            let mut excluding = HashSet::new();
+            excluding.insert(instance_id.clone());
+            let Some(destination) = self
+                .select_placement_snapshot_with_blocked(cfg, &excluding, &blocked_slots)
+                .await
+            else {
+                continue;
+            };
+            candidates.push(MigrationVictimCandidate {
+                model_name,
+                handle,
+                instance_id,
+                generation,
+                source_pci_slots,
+                destination,
+                last_completed,
+                in_flight,
+            });
+        }
+
+        candidates.sort_by(|a, b| {
+            let class = |in_flight: usize| usize::from(in_flight > 0);
+            class(a.in_flight)
+                .cmp(&class(b.in_flight))
+                .then(a.last_completed.cmp(&b.last_completed))
+                .then(a.in_flight.cmp(&b.in_flight))
+                .then(a.instance_id.cmp(&b.instance_id))
+        });
+        candidates
+    }
+
+    /// Dry-run a transactional migration for `target_cfg`.
+    ///
+    /// Each candidate already has a destination proven to fit on a different
+    /// PCI-slot set.  The target placement is then checked with the old
+    /// victim excluded and the replacement's VRAM added as virtual usage,
+    /// ensuring the temporary duplicate is charged before the source can be
+    /// considered free.
+    async fn plan_migration(&self, target_cfg: &ModelConfig) -> Option<MigrationPlan> {
+        let configs = self.model_configs.read().unwrap().clone();
+        for victim in self.enumerate_migration_victims(&target_cfg.name).await {
+            let Some(victim_cfg) = configs.get(&victim.model_name) else {
+                continue;
+            };
+            let replacement_vram = victim_cfg.vram * 1024 * 1024;
+            let extra_vram: HashMap<String, u64> = victim
+                .destination
+                .pci_slots
+                .iter()
+                .map(|slot| (slot.clone(), replacement_vram))
+                .collect();
+            let mut excluding = HashSet::new();
+            excluding.insert(victim.instance_id.clone());
+            let Some(target) = self
+                .select_placement_snapshot_with_blocked_and_extra(
+                    target_cfg,
+                    &excluding,
+                    &HashSet::new(),
+                    &extra_vram,
+                )
+                .await
+            else {
+                continue;
+            };
+            if !target
+                .pci_slots
+                .iter()
+                .any(|slot| victim.source_pci_slots.contains(slot))
+            {
+                continue;
+            }
+            return Some(MigrationPlan {
+                target_model: target_cfg.name.clone(),
+                target,
+                victim,
+            });
+        }
+        None
+    }
+
+    /// Execute one transactional victim migration followed by the target
+    /// load.  The old backend remains alive while the replacement loads and
+    /// while existing slot guards finish; only a zero-in-flight old backend
+    /// is removed.
+    pub(crate) async fn run_migration(
+        &self,
+        target_cfg: &ModelConfig,
+    ) -> Result<(), MigrationError> {
+        let transition_epoch = self.config_epoch.load(Ordering::Acquire);
+        let plan = self
+            .plan_migration(target_cfg)
+            .await
+            .ok_or(MigrationError::NoPlan)?;
+        debug_assert_eq!(plan.target_model, target_cfg.name);
+        if self.config_epoch.load(Ordering::Acquire) != transition_epoch {
+            return Err(MigrationError::ConfigChanged);
+        }
+        let migration_id = self
+            .allocate_transition_id()
+            .await
+            .ok_or(MigrationError::ReservationUnavailable)?;
+        info!(
+            migration_id,
+            target = %plan.target_model,
+            victim = %plan.victim.instance_id,
+            destination = ?plan.victim.destination.pci_slots,
+            target_gpu = ?plan.target.pci_slots,
+            "migration planned"
+        );
+        let migration_timeout_secs = *self.migration_timeout_secs.read().unwrap();
+        let expires_at = (migration_timeout_secs > 0)
+            .then(|| Instant::now() + Duration::from_secs(migration_timeout_secs));
+        let cleanup = ReservationCleanup {
+            token: migration_id,
+            expires_at,
+        };
+        let configs = self.model_configs.read().unwrap().clone();
+        let Some(victim_cfg) = configs.get(&plan.victim.model_name) else {
+            return Err(MigrationError::VictimChanged);
+        };
+        let reservation_requests = vec![
+            ReservationRequest {
+                transition_id: migration_id,
+                purpose: ReservationPurpose::MigrationReplacement,
+                model: plan.victim.model_name.clone(),
+                pci_slots: plan.victim.destination.pci_slots.clone(),
+                vram_per_slot: victim_cfg.vram * 1024 * 1024,
+                phase: ReservationPhase::Planned,
+                cleanup,
+            },
+            ReservationRequest {
+                transition_id: migration_id,
+                purpose: ReservationPurpose::LargeModelAdmission,
+                model: target_cfg.name.clone(),
+                pci_slots: plan.target.pci_slots.clone(),
+                vram_per_slot: target_cfg.vram * 1024 * 1024,
+                phase: ReservationPhase::Planned,
+                cleanup,
+            },
+        ];
+        if self.reserve_placements(reservation_requests).await.is_err() {
+            warn!(migration_id, "migration reservation rejected");
+            return Err(MigrationError::ReservationUnavailable);
+        }
+        info!(migration_id, "migration reservations acquired");
+        if self.config_epoch.load(Ordering::Acquire) != transition_epoch {
+            self.release_reservations(migration_id).await;
+            return Err(MigrationError::ConfigChanged);
+        }
+
+        let old_generation = plan.victim.generation;
+        let victim_marked = {
+            let mut victim = plan.victim.handle.inner().lock().unwrap();
+            if victim.state != InstanceState::Ready || victim.migration_id.is_some() {
+                false
+            } else {
+                victim.mark_draining(Some(migration_id));
+                true
+            }
+        };
+        if !victim_marked {
+            self.release_reservations(migration_id).await;
+            return Err(MigrationError::VictimChanged);
+        }
+        if self.config_epoch.load(Ordering::Acquire) != transition_epoch {
+            self.rollback_migration(&plan, migration_id, None).await;
+            return Err(MigrationError::ConfigChanged);
+        }
+        info!(migration_id, victim = %plan.victim.instance_id, "migration victim draining");
+        self.set_reservation_phase(migration_id, ReservationPhase::Loading)
+            .await;
+
+        let replacement = self
+            .try_spawn_with_options(
+                &plan.victim.model_name,
+                victim_cfg,
+                SpawnOptions {
+                    requested_gpu_indices: Some(plan.victim.destination.device_indices.clone()),
+                    load_purpose: InstanceLoadPurpose::MigrationReplacement,
+                    migration_id: Some(migration_id),
+                    reservation_id: Some(migration_id),
+                    enforce_instance_cap: false,
+                    retain_reservation: true,
+                },
+            )
+            .await;
+        let Some(replacement) = replacement else {
+            self.rollback_migration(&plan, migration_id, None).await;
+            return Err(MigrationError::ReplacementLoadFailed);
+        };
+        replacement.inner().lock().unwrap().generation = old_generation + 1;
+        info!(
+            migration_id,
+            replacement = %replacement.id(),
+            destination = ?plan.victim.destination.pci_slots,
+            "migration replacement ready"
+        );
+        if self.config_epoch.load(Ordering::Acquire) != transition_epoch {
+            self.rollback_migration(&plan, migration_id, Some(&replacement))
+                .await;
+            return Err(MigrationError::ConfigChanged);
+        }
+        self.set_reservation_phase(migration_id, ReservationPhase::WaitingForDrain)
+            .await;
+
+        let deadline = expires_at;
+        loop {
+            let (state, active, owner) = {
+                let victim = plan.victim.handle.inner().lock().unwrap();
+                (victim.state, victim.in_flight, victim.migration_id)
+            };
+            if state != InstanceState::Draining || owner != Some(migration_id) {
+                self.rollback_migration(&plan, migration_id, Some(&replacement))
+                    .await;
+                return Err(MigrationError::VictimChanged);
+            }
+            if active == 0 {
+                break;
+            }
+            if deadline.is_some_and(|limit| Instant::now() >= limit) {
+                self.rollback_migration(&plan, migration_id, Some(&replacement))
+                    .await;
+                return Err(MigrationError::ReplacementLoadFailed);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let replacement_ready = {
+            let replacement = replacement.inner().lock().unwrap();
+            replacement.state == InstanceState::Ready
+                && replacement.migration_id == Some(migration_id)
+        };
+        if !replacement_ready {
+            self.rollback_migration(&plan, migration_id, Some(&replacement))
+                .await;
+            return Err(MigrationError::ReplacementLoadFailed);
+        }
+        if self.config_epoch.load(Ordering::Acquire) != transition_epoch {
+            self.rollback_migration(&plan, migration_id, Some(&replacement))
+                .await;
+            return Err(MigrationError::ConfigChanged);
+        }
+
+        self.set_reservation_phase(migration_id, ReservationPhase::Committed)
+            .await;
+        {
+            let mut replacement_inst = replacement.inner().lock().unwrap();
+            replacement_inst.clear_migration();
+            replacement_inst.generation = old_generation + 1;
+        }
+        info!(migration_id, victim = %plan.victim.instance_id, "migration handoff committing");
+        self.force_remove_instance(&plan.victim.model_name, &plan.victim.handle)
+            .await;
+        self.set_reservation_phase(migration_id, ReservationPhase::Loading)
+            .await;
+
+        let config_changed = self.config_epoch.load(Ordering::Acquire) != transition_epoch;
+        let deadline_expired = deadline.is_some_and(|limit| Instant::now() >= limit);
+        if config_changed || deadline_expired {
+            self.retain_migrated_replacement_after_target_failure(
+                migration_id,
+                &plan.victim.model_name,
+                &replacement,
+            )
+            .await;
+            return Err(if config_changed {
+                MigrationError::ConfigChanged
+            } else {
+                MigrationError::TargetLoadFailed
+            });
+        }
+
+        info!(migration_id, target = %target_cfg.name, placement = ?plan.target.pci_slots, "migration target loading");
+        let target = self
+            .try_spawn_with_options(
+                &target_cfg.name,
+                target_cfg,
+                SpawnOptions {
+                    requested_gpu_indices: Some(plan.target.device_indices.clone()),
+                    load_purpose: InstanceLoadPurpose::LargeModelAdmission,
+                    migration_id: Some(migration_id),
+                    reservation_id: Some(migration_id),
+                    enforce_instance_cap: true,
+                    retain_reservation: true,
+                },
+            )
+            .await;
+        let Some(target) = target else {
+            self.retain_migrated_replacement_after_target_failure(
+                migration_id,
+                &plan.victim.model_name,
+                &replacement,
+            )
+            .await;
+            return Err(MigrationError::TargetLoadFailed);
+        };
+        target.inner().lock().unwrap().clear_migration();
+        self.set_reservation_phase(migration_id, ReservationPhase::Committed)
+            .await;
+        self.release_reservations(migration_id).await;
+        self.wake_one(&plan.victim.model_name);
+        self.wake_one(&target_cfg.name);
+        Ok(())
+    }
+
+    /// Roll back a pre-handoff migration: stop a ready replacement if one
+    /// exists, restore the old logical route, release all reservations, and
+    /// wake requests waiting on the victim model.
+    async fn rollback_migration(
+        &self,
+        plan: &MigrationPlan,
+        migration_id: u64,
+        replacement: Option<&InstanceHandle>,
+    ) {
+        info!(migration_id, victim = %plan.victim.instance_id, "migration rolling back");
+        if let Some(replacement) = replacement {
+            self.force_remove_instance(&plan.victim.model_name, replacement)
+                .await;
+        }
+        {
+            let mut victim = plan.victim.handle.inner().lock().unwrap();
+            if victim.state == InstanceState::Draining && victim.migration_id == Some(migration_id)
+            {
+                victim.mark_ready();
+                victim.clear_migration();
+            }
+        }
+        self.release_reservations(migration_id).await;
+        self.wake_one(&plan.victim.model_name);
+    }
+
+    /// Preserve a successful victim migration when the subsequent target
+    /// load fails.  The replacement becomes the normal logical route rather
+    /// than being migrated back, preventing failure-induced ping-pong.
+    async fn retain_migrated_replacement_after_target_failure(
+        &self,
+        migration_id: u64,
+        model_name: &str,
+        replacement: &InstanceHandle,
+    ) {
+        info!(migration_id, model = %model_name, "migration target load failed; retaining replacement");
+        replacement.inner().lock().unwrap().clear_migration();
+        self.release_reservations(migration_id).await;
+        self.wake_one(model_name);
+    }
 
     /// Plan the victim set that frees enough VRAM for `cfg` to spawn.
     /// Victims are accumulated in class order (idle surplus duplicates →
@@ -753,7 +2253,7 @@ impl InstanceManager {
         cfg: &ModelConfig,
         mode: MakeRoomMode,
     ) -> Option<Vec<MakeRoomVictim>> {
-        if mode == MakeRoomMode::None {
+        if !mode.is_legacy_eviction() {
             return None;
         }
         let mut excluding: HashSet<String> = HashSet::new();
@@ -804,7 +2304,12 @@ impl InstanceManager {
             for (model_name, list) in instances.iter() {
                 for h in list {
                     let inst = h.inner().lock().unwrap();
-                    if inst.state == InstanceState::Failed || excluding.contains(&inst.id) {
+                    if matches!(
+                        inst.state,
+                        InstanceState::Failed | InstanceState::Draining | InstanceState::Retired
+                    ) || inst.migration_id.is_some()
+                        || excluding.contains(&inst.id)
+                    {
                         continue;
                     }
                     snaps.push(Snap {
@@ -972,9 +2477,25 @@ impl InstanceManager {
         }
     }
 
+    /// Whether any queue contains a waiter logically routed to `model_name`.
+    /// Entries may remain under their original alias candidate key after a
+    /// fallback rebind, so checking only `queues[model_name]` is insufficient
+    /// for FIFO enforcement.
+    fn has_logical_waiters(&self, model_name: &str) -> bool {
+        self.queues.read().unwrap().values().any(|queue| {
+            queue
+                .iter()
+                .any(|entry| entry.route.logical_model == model_name)
+        })
+    }
+
     /// Fast path of `get_or_spawn`: acquire a slot on the least-loaded
-    /// ready instance with spare capacity.
+    /// ready instance with spare capacity, but never bypass an older logical
+    /// queue entry.
     fn acquire_ready_slot(&self, model_name: &str, max_concurrent: usize) -> Option<SlotGuard> {
+        if self.has_logical_waiters(model_name) {
+            return None;
+        }
         let handle = self.find_ready_instance(model_name, max_concurrent)?;
         let guard = handle.try_acquire(max_concurrent)?;
         self.record_metrics_event(model_name, 0);
@@ -1026,88 +2547,335 @@ impl InstanceManager {
         rx
     }
 
-    /// Enqueue the caller, waiting for an instance slot to free up.
-    /// Fails with `QueueFull` if the queue is at capacity (caller maps to
-    /// 429), with `NoInstances` if no routable instance exists (no release
-    /// or spawn event could ever wake the parked waiter — fail fast
-    /// instead of hanging forever), or with `Timeout` when the wait
-    /// exceeds the budget.  On success the received guard already owns the
-    /// slot (acquired by `wake_one`) — there is no acquire race on this
-    /// side.
-    async fn enqueue(&self, model_name: &str, max_depth: usize) -> Result<SlotGuard, EnqueueError> {
-        let (tx, rx) = oneshot::channel();
+    /// Subscribe to one in-flight migration for `model_name`, starting it
+    /// if necessary.  The detached task owns the transition so a caller
+    /// disconnecting while waiting cannot abort shared infrastructure work.
+    fn ensure_migration(
+        self: &Arc<Self>,
+        model_name: &str,
+        cfg: &ModelConfig,
+    ) -> watch::Receiver<()> {
+        if self.is_shutting_down() {
+            let (tx, rx) = watch::channel(());
+            drop(tx);
+            return rx;
+        }
+        {
+            let migrations = self.migrations_in_flight.read().unwrap();
+            if let Some(tx) = migrations.get(model_name) {
+                return tx.subscribe();
+            }
+        }
+        let (tx, rx) = watch::channel(());
+        {
+            let mut migrations = self.migrations_in_flight.write().unwrap();
+            if let Some(existing) = migrations.get(model_name) {
+                return existing.subscribe();
+            }
+            migrations.insert(model_name.to_owned(), tx);
+        }
+        self.scheduler_metrics
+            .migration_started_total
+            .fetch_add(1, Ordering::Relaxed);
+
+        let mgr = Arc::clone(self);
+        let target = model_name.to_owned();
+        let cfg = cfg.clone();
+        tokio::spawn(async move {
+            let _entry = MigrationEntryGuard {
+                mgr: Arc::clone(&mgr),
+                target_model: target.clone(),
+            };
+            match mgr.run_migration(&cfg).await {
+                Ok(()) => {
+                    mgr.scheduler_metrics
+                        .migration_completed_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(error) => {
+                    mgr.scheduler_metrics
+                        .migration_failed_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    debug!(model = %target, ?error, "migration transition finished without admission");
+                    if !mgr.has_routable_instance(&target) {
+                        mgr.fail_queue(&target, QueueTerminalError::MigrationFailed);
+                    }
+                }
+            }
+        });
+        rx
+    }
+
+    /// Start slow admission work after its logical queue is registered.
+    fn start_admission_demand(self: &Arc<Self>, demand: AdmissionDemand) {
+        match demand {
+            AdmissionDemand::Spawn { model_name, cfg } => {
+                self.start_spawn_demand(&model_name, &cfg, None);
+            }
+            AdmissionDemand::LegacyMakeRoom {
+                model_name,
+                cfg,
+                candidates,
+                mode,
+                drain_timeout_secs,
+            } => self.ensure_legacy_make_room(
+                &model_name,
+                &cfg,
+                &candidates,
+                mode,
+                drain_timeout_secs,
+            ),
+            AdmissionDemand::Migration { model_name, cfg } => {
+                let _rx = self.ensure_migration(&model_name, &cfg);
+            }
+        }
+    }
+
+    /// Start a normal spawn after its logical queue is registered.
+    fn start_spawn_demand(
+        self: &Arc<Self>,
+        model_name: &str,
+        cfg: &ModelConfig,
+        candidates: Option<Vec<String>>,
+    ) {
+        let mgr = Arc::clone(self);
+        let model = model_name.to_owned();
+        let cfg = cfg.clone();
+        tokio::spawn(async move {
+            let mut rx = mgr.ensure_spawn(&model, &cfg);
+            let _ = rx.changed().await;
+            if mgr.has_routable_instance(&model) {
+                mgr.wake_one(&model);
+            } else if let Some(candidates) = candidates
+                && mgr.rebind_queue_to_fallback(&model, &candidates)
+            {
+                // Fallback rebinding already woke the logical queue.
+            } else {
+                mgr.fail_queue(&model, QueueTerminalError::ModelRemoved);
+            }
+        });
+    }
+
+    /// Start the legacy destructive make-room path after its logical queue is
+    /// already registered.  Unlike migration, this path is intentionally
+    /// kept separate for backwards compatibility with old aliases.
+    fn ensure_legacy_make_room(
+        self: &Arc<Self>,
+        model_name: &str,
+        cfg: &ModelConfig,
+        candidates: &[String],
+        mode: MakeRoomMode,
+        drain_timeout_secs: u64,
+    ) {
+        let mgr = Arc::clone(self);
+        let model = model_name.to_owned();
+        let candidates = candidates.to_vec();
+        let cfg = cfg.clone();
+        tokio::spawn(async move {
+            match mgr.plan_make_room(&cfg, mode).await {
+                Some(plan) => mgr.execute_make_room(&plan, drain_timeout_secs).await,
+                None => {
+                    if !mgr.has_routable_instance(&model) {
+                        mgr.fail_queue(&model, QueueTerminalError::ModelRemoved);
+                    }
+                    return;
+                }
+            }
+            mgr.start_spawn_demand(&model, &cfg, Some(candidates));
+        });
+    }
+
+    /// Register a logical queue entry.  `allow_empty` is used by the new
+    /// admission path so a cold-start request can wait while its detached
+    /// spawn or migration demand is running; legacy callers retain the
+    /// fail-fast behavior when no instance exists.
+    fn register_pending(
+        self: &Arc<Self>,
+        route: QueueRouteSnapshot,
+        max_depth: usize,
+        allow_empty: bool,
+    ) -> Result<PendingAssignment, EnqueueError> {
+        let (assignment, receiver) = oneshot::channel();
         let id = self.next_queue_id.fetch_add(1, Ordering::Relaxed);
+        let model_name = route.logical_model.clone();
+        debug!(
+            model = %model_name,
+            candidates = ?route.candidates,
+            policy = ?route.policy,
+            make_room = ?route.make_room,
+            drain_timeout_secs = route.drain_timeout_secs,
+            generation = route.generation,
+            migration_id = ?route.migration_id,
+            "queue route snapshot created"
+        );
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let enqueued_at = Instant::now();
+        let queue_wait = *self.queue_wait_timeout_secs.read().unwrap();
+        let deadline = (queue_wait > 0).then(|| enqueued_at + Duration::from_secs(queue_wait));
+        let expired = Arc::new(AtomicBool::new(false));
+        let ticket = QueueTicket {
+            manager: Arc::clone(self),
+            model_name: model_name.clone(),
+            id,
+            cancelled: Arc::clone(&cancelled),
+            expired: Arc::clone(&expired),
+            request_id: route.request_id.clone(),
+        };
+        let entry = QueueEntry {
+            id,
+            route,
+            enqueued_at,
+            deadline,
+            assignment,
+            cancelled,
+        };
 
         {
             // Hold the instances read lock across the check *and* the queue
             // push.  remove_instance takes the instances write lock to remove
             // the last instance and only then drains the queue — so either
             // our push lands before the drain (and is cleared by it) or after
-            // the removal (and the check fails).  Without this, a removal
-            // could slip in between check and push and park us forever.
+            // the removal (and the check fails).
             let instances = self.instances.read().unwrap();
-            // Only routable instances count: when every remaining instance
-            // is retiring (`Failed` — draining or config-retired), no
-            // release event can ever serve a parked waiter (retiring
-            // instances accept no new slots), so fail fast instead of
-            // parking until the reap drains the queue.
             let has_instances = instances
-                .get(model_name)
-                .map(|l| {
-                    l.iter()
-                        .any(|h| h.inner().lock().unwrap().state != InstanceState::Failed)
+                .get(&model_name)
+                .map(|list| {
+                    list.iter()
+                        .any(|h| h.inner().lock().unwrap().can_wake_waiters())
                 })
                 .unwrap_or(false);
-            if !has_instances {
+            if !allow_empty && !has_instances {
                 return Err(EnqueueError::NoInstances);
             }
 
             let mut queues = self.queues.write().unwrap();
-            let queue = queues.entry(model_name.to_owned()).or_default();
+            let queue = queues.entry(model_name.clone()).or_default();
             if queue.len() >= max_depth {
                 return Err(EnqueueError::QueueFull);
             }
-            queue.push_back((id, tx));
+            queue.push_back(entry);
         }
+        self.scheduler_metrics
+            .queue_enqueued_total
+            .fetch_add(1, Ordering::Relaxed);
 
         // Close the lost-wakeup race: a slot may have been released between
-        // the capacity check in get_or_spawn and our queue push, with its
-        // wake_one finding an empty queue.  Re-signal now that we are
-        // parked — if capacity exists, the head waiter gets served.
-        self.wake_one(model_name);
+        // the capacity check and our queue push, with wake_one finding an
+        // empty queue.  Re-signal now that we are parked.
+        self.wake_one(&model_name);
 
-        // The wait budget must exceed the worst-case spawn (spawn timeout
-        // + serialized window + margin): a waiter parked behind a fresh
-        // spawn must not time out and 429 just as capacity appears.
-        let wait_budget = QUEUE_WAIT_TIMEOUT
-            .max(self.spawn_timeout + SPAWN_SERIAL_WINDOW + Duration::from_secs(60));
-        let guard = match tokio::time::timeout(wait_budget, rx).await {
-            Ok(Ok(guard)) => guard,
-            // Queue drained (last instance removed) — fail fast.
-            Ok(Err(_)) => return Err(EnqueueError::NoInstances),
-            Err(_) => {
-                // Timed out — remove our entry if it is still parked.
-                // (If wake_one already popped us, the guard it sent is
-                // dropped with the receiver, which releases the slot —
-                // accounting stays balanced.)
-                self.remove_queued(model_name, id);
-                return Err(EnqueueError::Timeout);
+        Ok(PendingAssignment {
+            receiver,
+            deadline,
+            _ticket: ticket,
+        })
+    }
+
+    /// Enqueue the caller through the logical queue and await assignment.
+    #[cfg(test)]
+    async fn enqueue(
+        self: &Arc<Self>,
+        route: QueueRouteSnapshot,
+        max_depth: usize,
+    ) -> Result<SlotGuard, EnqueueError> {
+        match self.register_pending(route, max_depth, false)?.wait().await {
+            Ok((_, guard)) => Ok(guard),
+            Err(AcquireError::NoCapacity) => Err(EnqueueError::QueueFull),
+            Err(AcquireError::QueueTimeout) => Err(EnqueueError::Timeout),
+            Err(AcquireError::Unavailable | AcquireError::Blocked) => {
+                Err(EnqueueError::NoInstances)
             }
-        };
-
-        // The guard already owns the slot (acquired by `wake_one`).
-        self.record_metrics_event(model_name, 0);
-        Ok(guard)
+        }
     }
 
     /// Remove a specific queued waiter (used after a queue-wait timeout).
-    fn remove_queued(&self, model_name: &str, id: u64) {
-        if let Some(q) = self.queues.write().unwrap().get_mut(model_name) {
-            q.retain(|(entry_id, _)| *entry_id != id);
+    fn remove_queued(&self, model_name: &str, id: u64) -> bool {
+        self.queues
+            .write()
+            .unwrap()
+            .get_mut(model_name)
+            .map(|queue| {
+                let before = queue.len();
+                queue.retain(|entry| entry.id != id);
+                queue.len() != before
+            })
+            .unwrap_or(false)
+    }
+
+    /// Complete all queued entries with a terminal scheduler error.
+    fn fail_queue(&self, model_name: &str, error: QueueTerminalError) {
+        let entries: Vec<QueueEntry> = self
+            .queues
+            .write()
+            .unwrap()
+            .get_mut(model_name)
+            .map(|queue| queue.drain(..).collect())
+            .unwrap_or_default();
+        for entry in entries {
+            let _ = entry.assignment.send(Err(error));
         }
     }
 
-    /// If no instances remain for `model_name`, drop all parked queue
+    /// Complete every queued request during final shutdown.
+    fn fail_all_queues(&self) {
+        let entries: Vec<QueueEntry> = self
+            .queues
+            .write()
+            .unwrap()
+            .values_mut()
+            .flat_map(|queue| queue.drain(..))
+            .collect();
+        for entry in entries {
+            let _ = entry.assignment.send(Err(QueueTerminalError::Shutdown));
+        }
+    }
+
+    /// Rebind queued entries to the first later alias candidate with a
+    /// routable instance.  The queue remains stored under its original key
+    /// so its cancellation ticket can still remove entries by ID; wake_one
+    /// follows each entry's logical route when assigning it.
+    fn rebind_queue_to_fallback(&self, source_model: &str, candidates: &[String]) -> bool {
+        let Some(source_index) = candidates.iter().position(|name| name == source_model) else {
+            return false;
+        };
+        let Some(target_model) = candidates
+            .iter()
+            .skip(source_index + 1)
+            .find(|name| self.has_routable_instance(name))
+            .cloned()
+        else {
+            return false;
+        };
+        let Some(target_cfg) = self
+            .model_configs
+            .read()
+            .unwrap()
+            .get(&target_model)
+            .cloned()
+        else {
+            return false;
+        };
+        let generation = self.model_generation(&target_model);
+        let migration_id = self.model_migration_id(&target_model);
+        let mut queues = self.queues.write().unwrap();
+        let Some(queue) = queues.get_mut(source_model) else {
+            return false;
+        };
+        if queue.is_empty() {
+            return false;
+        }
+        for entry in queue.iter_mut() {
+            entry.route.logical_model = target_model.clone();
+            entry.route.max_concurrent = target_cfg.max_concurrent;
+            entry.route.generation = generation;
+            entry.route.migration_id = migration_id;
+        }
+        drop(queues);
+        self.wake_one(source_model);
+        true
+    }
+
+    /// If no instances remain for `model_name`, complete all parked
     /// senders.  Each waiter's `rx.await` then resolves to `Err`, making the
     /// request fail fast instead of hanging forever — `wake_one` is only
     /// called on release events, which require a live instance.
@@ -1119,8 +2887,23 @@ impl InstanceManager {
             .get(model_name)
             .map(|l| l.is_empty())
             .unwrap_or(true);
-        if none_left && let Some(q) = self.queues.write().unwrap().get_mut(model_name) {
-            q.clear();
+        if none_left {
+            // An alias queue may still be serviceable through a later
+            // candidate.  Rebind before declaring the logical model removed;
+            // direct model queues have no fallback and are completed below.
+            let candidates = self
+                .queues
+                .read()
+                .unwrap()
+                .get(model_name)
+                .and_then(|queue| queue.front())
+                .map(|entry| entry.route.candidates.clone());
+            let fallback = candidates
+                .as_deref()
+                .is_some_and(|candidates| self.rebind_queue_to_fallback(model_name, candidates));
+            if !fallback {
+                self.fail_queue(model_name, QueueTerminalError::ModelRemoved);
+            }
         }
     }
 
@@ -1138,10 +2921,9 @@ impl InstanceManager {
     /// Public for the background release-processing task (see
     /// `InstanceManager::new`).
     pub fn wake_one(&self, model_name: &str) {
-        let cfg = match self.model_configs.read().unwrap().get(model_name).cloned() {
-            Some(c) => c,
-            None => return,
-        };
+        if !self.model_configs.read().unwrap().contains_key(model_name) {
+            return;
+        }
 
         loop {
             // Pop the head waiter, if any.  The queues lock is released
@@ -1150,20 +2932,55 @@ impl InstanceManager {
                 let mut queues = self.queues.write().unwrap();
                 queues.get_mut(model_name).and_then(|q| q.pop_front())
             };
-            let Some((id, tx)) = entry else {
+            let Some(entry) = entry else {
                 return;
             };
 
+            if entry.cancelled.load(Ordering::Acquire) {
+                continue;
+            }
+            if entry
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                self.scheduler_metrics
+                    .queue_expired_total
+                    .fetch_add(1, Ordering::Relaxed);
+                let _ = entry.assignment.send(Err(QueueTerminalError::Deadline));
+                continue;
+            }
+            if !self.route_allows_assignment(&entry.route) {
+                let mut queues = self.queues.write().unwrap();
+                queues
+                    .entry(model_name.to_owned())
+                    .or_default()
+                    .push_front(entry);
+                return;
+            }
+
+            let logical_model = entry.route.logical_model.clone();
+            let max_concurrent = entry.route.max_concurrent;
+            debug!(
+                model = %logical_model,
+                queue_id = entry.id,
+                generation = entry.route.generation,
+                queued_for_ms = entry.enqueued_at.elapsed().as_millis() as u64,
+                "considering queued assignment"
+            );
             let guard = self
-                .find_ready_instance(model_name, cfg.max_concurrent)
-                .and_then(|h| h.try_acquire(cfg.max_concurrent));
+                .find_ready_instance(&logical_model, max_concurrent)
+                .and_then(|h| h.try_acquire(max_concurrent));
             match guard {
-                Some(g) => match tx.send(g) {
-                    Ok(()) => return,
-                    // Waiter vanished (timeout racing the wake) — the
-                    // returned guard drops, releasing the slot; try the
-                    // next waiter.  (Costs a rare phantom release event in
-                    // the req-rate EMA — informational only.)
+                Some(g) => match entry.assignment.send(Ok((logical_model, g))) {
+                    Ok(()) => {
+                        self.scheduler_metrics
+                            .queue_assigned_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    // Waiter vanished (cancellation racing the wake) — the
+                    // returned guard drops, releasing the slot; try the next
+                    // waiter.
                     Err(_) => continue,
                 },
                 None => {
@@ -1173,7 +2990,7 @@ impl InstanceManager {
                     queues
                         .entry(model_name.to_owned())
                         .or_default()
-                        .push_front((id, tx));
+                        .push_front(entry);
                     return;
                 }
             }
@@ -1191,15 +3008,30 @@ impl InstanceManager {
         list.iter()
             .filter(|h| {
                 let inst = h.inner().lock().unwrap();
-                inst.state == InstanceState::Ready && inst.in_flight < max_concurrent
+                inst.state == InstanceState::Ready
+                    && inst.migration_id.is_none()
+                    && inst.in_flight < max_concurrent
             })
             .min_by_key(|h| h.inner().lock().unwrap().in_flight)
             .cloned()
     }
 
-    /// Attempt to spawn a new instance for `model`.  Returns `None` if the
+    /// Attempt to spawn a normal instance for `model`.  Returns `None` if the
     /// per-model instance cap has been reached.
     async fn try_spawn(&self, model_name: &str, cfg: &ModelConfig) -> Option<InstanceHandle> {
+        self.try_spawn_with_options(model_name, cfg, SpawnOptions::normal())
+            .await
+    }
+
+    /// Spawn an instance with coordinator-supplied placement and lifecycle
+    /// metadata.  Migration uses this path with a pre-reserved placement and
+    /// temporarily bypasses the ordinary logical instance cap.
+    async fn try_spawn_with_options(
+        &self,
+        model_name: &str,
+        cfg: &ModelConfig,
+        options: SpawnOptions,
+    ) -> Option<InstanceHandle> {
         // Serialize the critical section of spawn attempts globally —
         // prevents concurrent model loads from thrashing the SSD and
         // interleaving VRAM.  Released after SPAWN_SERIAL_WINDOW of
@@ -1207,18 +3039,18 @@ impl InstanceManager {
         let _permit = self.spawn_semaphore.clone().acquire_owned().await.ok()?;
 
         // Inside the semaphore: check instance cap.  Retiring instances
-        // (`Failed` — draining after admin unload, or retired by a config
-        // change) do not count: they are unroutable and reaped once idle,
-        // so counting them would wedge models with `max_instances = 1`
-        // behind a long-running request with no replacement.  Resource
-        // limits are still enforced by the VRAM accounting in
-        // `select_gpu_for_model`, which *does* include retiring instances.
-        {
+        // (`Draining`/`Failed` — after admin unload or config change) do not
+        // count: they are unroutable and reaped once idle, so counting them
+        // would wedge models with `max_instances = 1` behind a long-running
+        // request with no replacement.  Resource limits are still enforced
+        // by the VRAM accounting in `select_gpus_for_model`, which *does*
+        // include retiring instances.
+        if options.enforce_instance_cap {
             let instances = self.instances.read().unwrap();
             if let Some(list) = instances.get(model_name) {
                 let active = list
                     .iter()
-                    .filter(|h| h.inner().lock().unwrap().state != InstanceState::Failed)
+                    .filter(|h| h.inner().lock().unwrap().counts_toward_instance_cap())
                     .count();
                 if active >= cfg.max_instances {
                     return None;
@@ -1250,7 +3082,14 @@ impl InstanceManager {
         let parts = parts.unwrap();
         debug!(model = %model_name, parts = ?parts, "parsed command");
         let prog = &parts[0];
-        let gpu_indices: Vec<usize> = self.select_gpus_for_model(cfg).await;
+        let placement = match options.requested_gpu_indices.as_ref() {
+            Some(indices) => self.explicit_placement_snapshot(cfg, indices),
+            None => self.select_placement_snapshot(cfg, &HashSet::new()).await,
+        };
+        let gpu_indices: Vec<usize> = placement
+            .as_ref()
+            .map(|snapshot| snapshot.device_indices.clone())
+            .unwrap_or_default();
 
         // Safety: when a device pool is configured but the full device
         // set can't be satisfied, fail the spawn instead of launching
@@ -1260,7 +3099,7 @@ impl InstanceManager {
         let has_device_pool = !cfg.vulkan_devices.is_empty()
             || !cfg.cuda_devices.is_empty()
             || !cfg.rocm_devices.is_empty();
-        if has_device_pool && gpu_indices.len() < cfg.gpus {
+        if has_device_pool && placement.is_none() {
             warn!(
                 model = %model_name,
                 kind = ?cfg.device_kind(),
@@ -1271,6 +3110,60 @@ impl InstanceManager {
             self.ports.lock().await.free(port);
             return None;
         }
+
+        // Commit a short-lived reservation before process startup for a
+        // normal spawn.  A migration supplies an already-committed
+        // transaction reservation and retains it until the transition
+        // decides whether to roll back or commit.
+        let reservation_id = match (options.reservation_id, placement) {
+            (Some(transition_id), Some(_)) => Some(transition_id),
+            (Some(_), None) => {
+                warn!(model = %model_name, "migration placement is no longer valid");
+                self.ports.lock().await.free(port);
+                return None;
+            }
+            (None, Some(placement)) if !placement.device_indices.is_empty() => {
+                let Some(transition_id) = self.allocate_transition_id().await else {
+                    warn!(model = %model_name, "reservation coordinator unavailable");
+                    self.ports.lock().await.free(port);
+                    return None;
+                };
+                let cleanup = ReservationCleanup {
+                    token: transition_id,
+                    expires_at: Some(
+                        Instant::now()
+                            + self.spawn_timeout
+                            + SPAWN_SERIAL_WINDOW
+                            + Duration::from_secs(30),
+                    ),
+                };
+                match self
+                    .reserve_placement(ReservationRequest {
+                        transition_id,
+                        purpose: ReservationPurpose::NormalSpawn,
+                        model: model_name.to_owned(),
+                        pci_slots: placement.pci_slots,
+                        vram_per_slot: cfg.vram * 1024 * 1024,
+                        phase: ReservationPhase::Loading,
+                        cleanup,
+                    })
+                    .await
+                {
+                    Ok(()) => Some(transition_id),
+                    Err(error) => {
+                        debug!(
+                            model = %model_name,
+                            transition_id,
+                            ?error,
+                            "spawn placement reservation unavailable"
+                        );
+                        self.ports.lock().await.free(port);
+                        return None;
+                    }
+                }
+            }
+            _ => None,
+        };
 
         // Device pinning follows the model's namespace: Vulkan models via
         // GGML_VK_VISIBLE_DEVICES, CUDA models via CUDA_VISIBLE_DEVICES,
@@ -1293,17 +3186,24 @@ impl InstanceManager {
             Ok(pair) => pair,
             Err(e) => {
                 warn!(model = %model_name, error = %e, "spawn failed");
+                if !options.retain_reservation
+                    && let Some(transition_id) = reservation_id
+                {
+                    self.release_reservations(transition_id).await;
+                }
                 self.ports.lock().await.free(port);
                 return None;
             }
         };
 
-        let mut inst = Instance::new(
+        let mut inst = Instance::new_with_purpose(
             model_name,
             gpu_indices.clone(),
             port,
             Some(self.release_tx.clone()),
+            options.load_purpose,
         );
+        inst.migration_id = options.migration_id;
         inst.config_fingerprint = self.spawn_fingerprint(cfg);
         // Guarantee a unique ID even when the base `model@gpus` collides
         // (multiple CPU instances of the same model).
@@ -1323,6 +3223,11 @@ impl InstanceManager {
                 .entry(model_name.to_owned())
                 .or_default()
                 .push(handle.clone());
+        }
+        if !options.retain_reservation
+            && let Some(transition_id) = reservation_id
+        {
+            self.release_reservations(transition_id).await;
         }
 
         // Keep-alive: acquire one reference per occupied GPU.  Released
@@ -1390,7 +3295,7 @@ impl InstanceManager {
             self.dump_recent_output(&handle);
             let mut child_to_kill = {
                 let mut inst_lock = handle.inner().lock().unwrap();
-                inst_lock.state = InstanceState::Failed;
+                inst_lock.mark_failed();
                 inst_lock.child.take()
             };
             if let Some(ref mut child) = child_to_kill {
@@ -1425,7 +3330,7 @@ impl InstanceManager {
             );
             let mut child = {
                 let mut inst = handle.inner().lock().unwrap();
-                inst.state = InstanceState::Failed;
+                inst.mark_failed();
                 inst.child.take()
             };
             if let Some(ref mut c) = child {
@@ -1473,7 +3378,7 @@ impl InstanceManager {
     ///
     /// Per-GPU accounting is keyed by PCI slot so Vulkan, CUDA, and ROCm
     /// indices can never alias each other.
-    async fn select_gpus_for_model(&self, model_cfg: &ModelConfig) -> Vec<usize> {
+    pub(crate) async fn select_gpus_for_model(&self, model_cfg: &ModelConfig) -> Vec<usize> {
         self.select_gpus_inner(model_cfg, &HashSet::new()).await
     }
 
@@ -1485,6 +3390,122 @@ impl InstanceManager {
         model_cfg: &ModelConfig,
         excluding: &HashSet<String>,
     ) -> Vec<usize> {
+        self.select_placement_snapshot(model_cfg, excluding)
+            .await
+            .map(|snapshot| snapshot.device_indices)
+            .unwrap_or_default()
+    }
+
+    /// Translate an instance's backend indices through its model namespace.
+    /// Returning `None` for an incomplete mapping makes that instance
+    /// ineligible for non-interrupting migration rather than guessing at a
+    /// physical destination.
+    fn pci_slots_for_instance(&self, model_name: &str, indices: &[usize]) -> Option<Vec<String>> {
+        let kind = self
+            .model_configs
+            .read()
+            .unwrap()
+            .get(model_name)
+            .map(|cfg| cfg.device_kind())
+            .unwrap_or(DeviceKind::Vulkan);
+        let slots = match kind {
+            DeviceKind::Cuda => self.cuda_slots.read().unwrap().clone(),
+            DeviceKind::Rocm => self.rocm_slots.read().unwrap().clone(),
+            DeviceKind::Vulkan => self.vulkan_slots.read().unwrap().clone(),
+        };
+        indices
+            .iter()
+            .map(|index| slots.get(index).cloned())
+            .collect()
+    }
+
+    /// Build a placement snapshot for coordinator-supplied device indices.
+    /// The migration planner has already performed the VRAM proof; this
+    /// method validates that the indices still belong to the model's pool
+    /// and still have PCI mappings before startup begins.
+    fn explicit_placement_snapshot(
+        &self,
+        model_cfg: &ModelConfig,
+        indices: &[usize],
+    ) -> Option<PlacementSnapshot> {
+        let pool = match model_cfg.device_kind() {
+            DeviceKind::Cuda => &model_cfg.cuda_devices,
+            DeviceKind::Rocm => &model_cfg.rocm_devices,
+            DeviceKind::Vulkan => &model_cfg.vulkan_devices,
+        };
+        if indices.len() != model_cfg.gpus || indices.iter().any(|index| !pool.contains(index)) {
+            return None;
+        }
+        let pci_slots = self.pci_slots_for_config(model_cfg, indices)?;
+        Some(PlacementSnapshot {
+            device_indices: indices.to_vec(),
+            pci_slots,
+            projected_final_vram: HashMap::new(),
+            projected_peak_vram: HashMap::new(),
+        })
+    }
+
+    /// Translate backend indices through a model config's device namespace.
+    fn pci_slots_for_config(
+        &self,
+        model_cfg: &ModelConfig,
+        indices: &[usize],
+    ) -> Option<Vec<String>> {
+        let slots = match model_cfg.device_kind() {
+            DeviceKind::Cuda => self.cuda_slots.read().unwrap().clone(),
+            DeviceKind::Rocm => self.rocm_slots.read().unwrap().clone(),
+            DeviceKind::Vulkan => self.vulkan_slots.read().unwrap().clone(),
+        };
+        indices
+            .iter()
+            .map(|index| slots.get(index).cloned())
+            .collect()
+    }
+
+    /// Return a concrete deterministic placement plus projected final and
+    /// peak per-PCI-slot usage.
+    async fn select_placement_snapshot(
+        &self,
+        model_cfg: &ModelConfig,
+        excluding: &HashSet<String>,
+    ) -> Option<PlacementSnapshot> {
+        self.select_placement_snapshot_with_blocked_and_extra(
+            model_cfg,
+            excluding,
+            &HashSet::new(),
+            &HashMap::new(),
+        )
+        .await
+    }
+
+    /// Return a placement while treating `blocked_slots` as unavailable.
+    /// Migration uses this to prove that a victim replacement is on a
+    /// different physical GPU set from the old backend.
+    async fn select_placement_snapshot_with_blocked(
+        &self,
+        model_cfg: &ModelConfig,
+        excluding: &HashSet<String>,
+        blocked_slots: &HashSet<String>,
+    ) -> Option<PlacementSnapshot> {
+        self.select_placement_snapshot_with_blocked_and_extra(
+            model_cfg,
+            excluding,
+            blocked_slots,
+            &HashMap::new(),
+        )
+        .await
+    }
+
+    /// Return a placement with virtual per-slot VRAM added to the projected
+    /// current usage.  The migration dry-run uses this for a replacement
+    /// backend that has not been registered as an instance yet.
+    async fn select_placement_snapshot_with_blocked_and_extra(
+        &self,
+        model_cfg: &ModelConfig,
+        excluding: &HashSet<String>,
+        blocked_slots: &HashSet<String>,
+        extra_vram: &HashMap<String, u64>,
+    ) -> Option<PlacementSnapshot> {
         let kind = model_cfg.device_kind();
         let pool = match kind {
             DeviceKind::Cuda => &model_cfg.cuda_devices,
@@ -1513,7 +3534,7 @@ impl InstanceManager {
         };
         if pool.is_empty() || slots.is_empty() {
             debug!(model = %model_cfg.name, kind = ?kind, "no devices configured");
-            return Vec::new();
+            return None;
         }
 
         // Translate an instance's device index to a PCI slot using its
@@ -1531,7 +3552,8 @@ impl InstanceManager {
             }
         };
 
-        let gpus = self.gpu_snapshot.read().await;
+        let gpus = self.gpu_snapshot.read().await.clone();
+        let reservation_used = self.reservation_usage(None).await;
         debug!(
             model = %model_cfg.name,
             vram_mb = model_cfg.vram,
@@ -1560,7 +3582,14 @@ impl InstanceManager {
         let vram_used: HashMap<String, u64> = {
             let instances = self.instances.read().unwrap();
             let model_configs = self.model_configs.read().unwrap();
-            let mut used = HashMap::new();
+            let mut used = reservation_used;
+            for (pci_slot, vram) in extra_vram {
+                *used.entry(pci_slot.clone()).or_default() += *vram;
+            }
+            // Reservations cover in-flight loads that have not yet become
+            // registered instances.  Registered Loading/Ready/Draining
+            // instances are added below using the normal physical-accounting
+            // path.
             for (model_name, list) in instances.iter() {
                 let model_vram = model_configs
                     .get(model_name)
@@ -1596,6 +3625,10 @@ impl InstanceManager {
             };
             if occupied.contains(pci_slot) {
                 debug!(model = %model_cfg.name, device = idx, "skipping — already has instance");
+                continue;
+            }
+            if blocked_slots.contains(pci_slot) {
+                debug!(model = %model_cfg.name, device = idx, "skipping — blocked by migration source");
                 continue;
             }
 
@@ -1640,7 +3673,7 @@ impl InstanceManager {
                 available = candidates.len(),
                 "not enough GPU candidates"
             );
-            return Vec::new();
+            return None;
         }
 
         let instance_counts: HashMap<String, usize> = {
@@ -1685,8 +3718,26 @@ impl InstanceManager {
             .take(needed)
             .map(|(idx, _)| *idx)
             .collect();
+        let pci_slots: Vec<String> = chosen
+            .iter()
+            .filter_map(|idx| slots.get(idx).cloned())
+            .collect();
+        if pci_slots.len() != chosen.len() {
+            return None;
+        }
+
+        let mut projected_final_vram = vram_used;
+        for pci_slot in &pci_slots {
+            *projected_final_vram.entry(pci_slot.clone()).or_default() += model_vram_bytes;
+        }
+        let projected_peak_vram = projected_final_vram.clone();
         debug!(model = %model_cfg.name, kind = ?kind, devices = ?chosen, "selected GPUs");
-        chosen
+        Some(PlacementSnapshot {
+            device_indices: chosen,
+            pci_slots,
+            projected_final_vram,
+            projected_peak_vram,
+        })
     }
 
     // ── blocked flag ─────────────────────────────────────────────────────
@@ -1727,7 +3778,7 @@ impl InstanceManager {
     /// Remove an instance, **draining** it when busy (admin unload, config
     /// removal).
     ///
-    /// A busy instance is marked `Failed` so no new requests are routed to
+    /// A busy instance is marked `Draining` so no new requests are routed to
     /// it, but its child keeps running until the in-flight requests finish;
     /// `reap_drained` then completes the removal.  Returns `true` when the
     /// instance was removed immediately.
@@ -1765,20 +3816,20 @@ impl InstanceManager {
                     // Mark unroutable but keep the child serving the
                     // in-flight requests; reap_drained finishes the job.
                     RemovalMode::Drain => {
-                        if inst.state != InstanceState::Failed {
+                        if !inst.is_draining() {
                             debug!(
                                 inst = %inst.id,
                                 in_flight = inst.in_flight,
                                 "instance busy — marked draining"
                             );
-                            inst.state = InstanceState::Failed;
+                            inst.mark_draining(None);
                         }
                         return false;
                     }
                     RemovalMode::Force => {}
                 }
             }
-            inst.state = InstanceState::Failed;
+            inst.mark_failed();
             inst.child.take()
         };
         if let Some(ref mut c) = child {
@@ -1787,14 +3838,15 @@ impl InstanceManager {
 
         self.unregister_instance(model_name, handle, &gpu_indices)
             .await;
+        self.drain_queue_if_no_instances(model_name);
         true
     }
 
     /// Finish removing draining instances whose requests have completed.
     ///
-    /// Draining instances are marked `Failed` but keep their child alive
-    /// until their in-flight count reaches zero.  Called on every slot
-    /// release (and periodically from the autoscaler) for `model_name`.
+    /// Draining instances keep their child alive until their in-flight count
+    /// reaches zero.  Called on every slot release (and periodically from the
+    /// autoscaler) for `model_name`.
     pub async fn reap_drained(&self, model_name: &str) {
         let drained: Vec<InstanceHandle> = {
             let instances = self.instances.read().unwrap();
@@ -1804,7 +3856,9 @@ impl InstanceManager {
                     list.iter()
                         .filter(|h| {
                             let inst = h.inner().lock().unwrap();
-                            inst.state == InstanceState::Failed && inst.in_flight == 0
+                            inst.state == InstanceState::Draining
+                                && inst.migration_id.is_none()
+                                && inst.in_flight == 0
                         })
                         .cloned()
                         .collect()
@@ -1822,7 +3876,7 @@ impl InstanceManager {
     /// that are no longer in use.
     ///
     /// The caller must already have terminated (or reaped) the child
-    /// process and marked the instance `Failed`.
+    /// process and marked the instance non-routable.
     ///
     /// Idempotent: if the handle is no longer registered, nothing happens.
     /// Port frees and keep-alive releases must happen exactly once per
@@ -1859,8 +3913,6 @@ impl InstanceManager {
 
         let port = handle.inner().lock().unwrap().port;
         self.ports.lock().await.free(port);
-
-        self.drain_queue_if_no_instances(model_name);
 
         // Keep-alive: release this instance's per-GPU reference (acquired
         // at spawn registration).  The task stops when the last instance
@@ -1912,18 +3964,24 @@ impl InstanceManager {
     /// not count — the model has proven functional and is respawned on
     /// demand (plan §Backends).
     pub async fn handle_crash(&self, handle: InstanceHandle) {
-        let (model_name, was_ready, gpu_indices) = {
+        let (model_name, was_ready, gpu_indices, migration_id) = {
             let mut inst = handle.inner().lock().unwrap();
-            if inst.state == InstanceState::Failed {
+            if matches!(inst.state, InstanceState::Failed | InstanceState::Retired) {
                 // Already handled by a managed removal path (admin unload,
                 // TTL eviction, health-timeout cleanup, shutdown).
                 return;
             }
-            let was_ready = inst.state == InstanceState::Ready;
-            inst.state = InstanceState::Failed;
+            let was_ready = matches!(inst.state, InstanceState::Ready | InstanceState::Draining);
+            let migration_id = inst.migration_id;
+            inst.mark_failed();
             // The monitor already reaped the process via try_wait.
             let _ = inst.child.take();
-            (inst.model_name.clone(), was_ready, inst.gpu_indices.clone())
+            (
+                inst.model_name.clone(),
+                was_ready,
+                inst.gpu_indices.clone(),
+                migration_id,
+            )
         };
         let (id, port) = {
             let inst = handle.inner().lock().unwrap();
@@ -1940,6 +3998,15 @@ impl InstanceManager {
 
         self.unregister_instance(&model_name, &handle, &gpu_indices)
             .await;
+        self.drain_queue_if_no_instances(&model_name);
+
+        if let Some(migration_id) = migration_id {
+            // A replacement crash cannot leave its transition reservation
+            // occupying the destination forever.  The migration coordinator
+            // will observe the failed instance and decide whether to roll
+            // back the logical route.
+            self.release_reservations(migration_id).await;
+        }
 
         if !was_ready {
             self.note_pre_output_crash(&model_name);
@@ -2015,7 +4082,7 @@ impl InstanceManager {
             let instances = self.instances.read().unwrap();
             instances
                 .get(model_name)
-                .map(|list| list.iter().cloned().collect())
+                .map(|list| list.to_vec())
                 .unwrap_or_default()
         };
 
@@ -2037,6 +4104,8 @@ impl InstanceManager {
     // ── shutdown ─────────────────────────────────────────────────────────
 
     pub async fn shutdown_all(&self) {
+        self.begin_shutdown();
+        self.fail_all_queues();
         let all: Vec<(String, InstanceHandle)> = {
             let instances = self.instances.read().unwrap();
             instances
@@ -2061,6 +4130,7 @@ impl InstanceManager {
         if let Some(ref ka) = keepalive {
             ka.stop_all();
         }
+        self.release_all_reservations().await;
     }
 
     // ── config hot-reload ────────────────────────────────────────────────
@@ -2101,6 +4171,7 @@ impl InstanceManager {
         };
         for model in &removed {
             info!(model = %model, "model removed from config — unloading instances");
+            self.release_model_reservations(model).await;
             self.unload_model(model).await;
         }
 
@@ -2120,7 +4191,11 @@ impl InstanceManager {
                         list.iter()
                             .filter(|h| {
                                 let inst = h.inner().lock().unwrap();
-                                inst.state != InstanceState::Failed && inst.config_fingerprint != fp
+                                !matches!(
+                                    inst.state,
+                                    InstanceState::Failed | InstanceState::Retired
+                                ) && inst.migration_id.is_none()
+                                    && inst.config_fingerprint != fp
                             })
                             .cloned()
                             .collect()
@@ -2130,7 +4205,7 @@ impl InstanceManager {
             for handle in stale {
                 let (id, in_flight) = {
                     let mut inst = handle.inner().lock().unwrap();
-                    inst.state = InstanceState::Failed;
+                    inst.mark_draining(None);
                     (inst.id.clone(), inst.in_flight)
                 };
                 info!(
@@ -2143,6 +4218,7 @@ impl InstanceManager {
         }
 
         // ── Swap config-derived fields ───────────────────────────────
+        self.config_epoch.fetch_add(1, Ordering::AcqRel);
         *self.model_configs.write().unwrap() = new_model_configs;
         *self.cmd_aliases.write().unwrap() = config.cmd_aliases.clone();
         *self.vulkan_slots.write().unwrap() = config
@@ -2169,6 +4245,8 @@ impl InstanceManager {
             .map(|d| d.rocm.clone())
             .unwrap_or_default();
         *self.drain_idle_timeout_secs.write().unwrap() = config.server.drain_idle_timeout_secs;
+        *self.queue_wait_timeout_secs.write().unwrap() = config.server.queue_wait_timeout_secs;
+        *self.migration_timeout_secs.write().unwrap() = config.server.migration_timeout_secs;
         self.ports
             .lock()
             .await
@@ -2227,6 +4305,13 @@ impl InstanceManager {
                 }
             }
             info!("keep-alive manager rebuilt after config reload");
+        }
+
+        // A valid reload may make a previously queued logical route
+        // assignable (for example by changing max_concurrent or restoring a
+        // model).  Re-check each surviving queue after the atomic swap.
+        for model in &config.models {
+            self.wake_one(&model.name);
         }
 
         // ── Clear crash blocks (§5) ──────────────────────────────────
@@ -2373,6 +4458,19 @@ impl InstanceManager {
         let now = Instant::now();
         let metrics = self.model_metrics_snapshot();
         let drain_idle_timeout = *self.drain_idle_timeout_secs.read().unwrap();
+        let reserved_models: HashSet<String> = self
+            .reservation_snapshot()
+            .await
+            .into_iter()
+            .map(|reservation| reservation.model)
+            .collect();
+        let active_migrations: HashSet<String> = self
+            .migrations_in_flight
+            .read()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
 
         // Snapshot configs for the iteration (cheap clone, small structs).
         let configs: Vec<(String, ModelConfig)> = self
@@ -2384,6 +4482,25 @@ impl InstanceManager {
             .collect();
 
         for (model_name, cfg) in &configs {
+            let instance_in_migration = self
+                .instances
+                .read()
+                .unwrap()
+                .get(model_name)
+                .map(|instances| {
+                    instances
+                        .iter()
+                        .any(|handle| handle.inner().lock().unwrap().migration_id.is_some())
+                })
+                .unwrap_or(false);
+            if reserved_models.contains(model_name)
+                || active_migrations.contains(model_name)
+                || instance_in_migration
+            {
+                debug!(model = %model_name, "autoscale: skipping migration participant or reserved model");
+                continue;
+            }
+
             // Safety net: finish removals of draining instances whose
             // in-flight requests have completed.
             self.reap_drained(model_name).await;
@@ -2402,6 +4519,7 @@ impl InstanceManager {
                             .filter(|h| {
                                 let inst = h.inner().lock().unwrap();
                                 inst.state == InstanceState::Loading
+                                    && inst.migration_id.is_none()
                                     && inst.last_active.elapsed() > self.spawn_timeout * 2
                             })
                             .cloned()
@@ -2448,19 +4566,18 @@ impl InstanceManager {
             // despawn is a no-op.
             if num_instances == 1 {
                 let mut despawned = false;
-                if let Some(h) = self.pick_least_loaded(model_name) {
-                    if h.inner()
+                if let Some(h) = self.pick_least_loaded(model_name)
+                    && h.inner()
                         .lock()
                         .unwrap()
                         .is_idle_expired(drain_idle_timeout)
-                    {
-                        info!(
-                            model = %model_name,
-                            drain_idle_timeout,
-                            "drain idle timeout expired, despawning last instance"
-                        );
-                        despawned = self.remove_instance(model_name, &h).await;
-                    }
+                {
+                    info!(
+                        model = %model_name,
+                        drain_idle_timeout,
+                        "drain idle timeout expired, despawning last instance"
+                    );
+                    despawned = self.remove_instance(model_name, &h).await;
                 }
                 if despawned {
                     continue;
@@ -2504,10 +4621,10 @@ impl InstanceManager {
             // ── Cooldown ──────────────────────────────────────────
             {
                 let last = self.last_scale_action.read().unwrap();
-                if let Some(t) = last.get(model_name) {
-                    if now.duration_since(*t).as_secs() < a.cooldown_secs {
-                        continue;
-                    }
+                if let Some(t) = last.get(model_name)
+                    && now.duration_since(*t).as_secs() < a.cooldown_secs
+                {
+                    continue;
                 }
             }
 
@@ -2594,10 +4711,70 @@ impl InstanceManager {
         let instances = self.instances.read().unwrap();
         let mut list: Vec<InstanceHandle> = instances
             .get(model_name)
-            .map(|l| l.iter().cloned().collect())
+            .map(|l| l.to_vec())
             .unwrap_or_default();
         list.sort_by_key(|h| h.inner().lock().unwrap().in_flight);
         list
+    }
+}
+
+/// One migration victim candidate with a currently proven destination.
+///
+/// The destination is still advisory until the coordinator reserves it; the
+/// candidate is intentionally cheap to discard and recompute if placement
+/// changes before the migration transaction starts.
+struct MigrationVictimCandidate {
+    model_name: String,
+    handle: InstanceHandle,
+    instance_id: String,
+    generation: u64,
+    source_pci_slots: Vec<String>,
+    destination: PlacementSnapshot,
+    last_completed: Instant,
+    in_flight: usize,
+}
+
+/// A complete dry-run migration plan.  Reservations are acquired only by
+/// the next execution phase after the plan has been selected.
+struct MigrationPlan {
+    target_model: String,
+    target: PlacementSnapshot,
+    victim: MigrationVictimCandidate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MigrationError {
+    NoPlan,
+    ReservationUnavailable,
+    VictimChanged,
+    ConfigChanged,
+    ReplacementLoadFailed,
+    TargetLoadFailed,
+}
+
+/// Parameters for one backend spawn attempt.
+struct SpawnOptions {
+    /// Explicit placement for migration replacement; normal spawns select it.
+    requested_gpu_indices: Option<Vec<usize>>,
+    load_purpose: InstanceLoadPurpose,
+    migration_id: Option<u64>,
+    /// Existing coordinator reservation, if this load is part of a larger
+    /// transaction.  Normal spawns create a short-lived reservation below.
+    reservation_id: Option<u64>,
+    enforce_instance_cap: bool,
+    retain_reservation: bool,
+}
+
+impl SpawnOptions {
+    fn normal() -> Self {
+        Self {
+            requested_gpu_indices: None,
+            load_purpose: InstanceLoadPurpose::Normal,
+            migration_id: None,
+            reservation_id: None,
+            enforce_instance_cap: true,
+            retain_reservation: false,
+        }
     }
 }
 
@@ -2630,6 +4807,22 @@ impl Drop for SpawnEntryGuard {
     }
 }
 
+/// RAII cleanup for a detached migration task.
+struct MigrationEntryGuard {
+    mgr: Arc<InstanceManager>,
+    target_model: String,
+}
+
+impl Drop for MigrationEntryGuard {
+    fn drop(&mut self) {
+        self.mgr
+            .migrations_in_flight
+            .write()
+            .unwrap()
+            .remove(&self.target_model);
+    }
+}
+
 // ── Crash monitoring ─────────────────────────────────────────────────────────
 
 /// Poll interval for the per-instance child-exit monitor.
@@ -2641,7 +4834,7 @@ const CRASH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Exits quietly when the instance is going through a managed removal (state
 /// set to `Failed` / child taken by `remove_instance` or shutdown), so only
 /// *unexpected* exits are reported.  Managed removal races the report: the
-/// crash handler re-checks the state and ignores already-`Failed` instances.
+/// crash handler re-checks the state and ignores already-terminal instances.
 async fn monitor_instance_exit(
     handle: InstanceHandle,
     crash_tx: mpsc::UnboundedSender<InstanceHandle>,
@@ -2650,7 +4843,7 @@ async fn monitor_instance_exit(
         tokio::time::sleep(CRASH_POLL_INTERVAL).await;
         let exited = {
             let mut inst = handle.inner().lock().unwrap();
-            if inst.state == InstanceState::Failed {
+            if matches!(inst.state, InstanceState::Failed | InstanceState::Retired) {
                 return;
             }
             match inst.child.as_mut() {
@@ -2695,6 +4888,285 @@ models:
         mgr
     }
 
+    type TestQueueReceiver = oneshot::Receiver<Result<(String, SlotGuard), QueueTerminalError>>;
+
+    fn test_queue_route(mgr: &InstanceManager) -> QueueRouteSnapshot {
+        QueueRouteSnapshot {
+            logical_model: "m".to_owned(),
+            candidates: vec!["m".to_owned()],
+            policy: AliasPolicy::PreferLoaded,
+            make_room: MakeRoomMode::None,
+            drain_timeout_secs: 0,
+            max_concurrent: 4,
+            generation: mgr.model_generation("m"),
+            migration_id: mgr.model_migration_id("m"),
+            request_id: None,
+        }
+    }
+
+    fn test_queue_entry(mgr: &InstanceManager, id: u64) -> (QueueEntry, TestQueueReceiver) {
+        let (assignment, receiver) = oneshot::channel();
+        (
+            QueueEntry {
+                id,
+                route: test_queue_route(mgr),
+                enqueued_at: Instant::now(),
+                deadline: None,
+                assignment,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
+            receiver,
+        )
+    }
+
+    #[test]
+    fn request_status_registry_tracks_and_returns_bounded_records() {
+        let mgr = test_manager();
+        mgr.register_request("req-1", "alias");
+        mgr.update_request_state("req-1", RequestState::Assigned, Some("m"), None);
+        let status = mgr.request_status("req-1").unwrap();
+        assert_eq!(status.request_id, "req-1");
+        assert_eq!(status.resolved_model.as_deref(), Some("m"));
+        assert_eq!(status.state, RequestState::Assigned);
+
+        mgr.update_request_state("req-1", RequestState::Completed, Some("m"), None);
+        assert_eq!(
+            mgr.request_status("req-1").unwrap().state,
+            RequestState::Completed
+        );
+        assert!(mgr.request_status("missing").is_none());
+    }
+
+    #[test]
+    fn reservation_table_is_atomic_and_accounts_each_slot() {
+        let mut table = ReservationTable::default();
+        let slots = vec!["0000:01:00.0".to_owned(), "0000:02:00.0".to_owned()];
+        let cleanup = ReservationCleanup {
+            token: 11,
+            expires_at: None,
+        };
+
+        table
+            .reserve_placement(ReservationRequest {
+                transition_id: 1,
+                purpose: ReservationPurpose::MigrationReplacement,
+                model: "victim".to_owned(),
+                pci_slots: slots.clone(),
+                vram_per_slot: 30,
+                phase: ReservationPhase::Planned,
+                cleanup,
+            })
+            .unwrap();
+
+        let usage = table.usage_by_slot(None);
+        assert_eq!(usage.get(&slots[0]), Some(&30));
+        assert_eq!(usage.get(&slots[1]), Some(&30));
+        assert_eq!(table.snapshot().len(), 2);
+
+        table.set_phase(1, ReservationPhase::Loading);
+        assert!(
+            table
+                .snapshot()
+                .iter()
+                .all(|reservation| reservation.phase == ReservationPhase::Loading)
+        );
+
+        let conflicting = vec![slots[1].clone(), "0000:03:00.0".to_owned()];
+        assert!(matches!(
+            table.reserve_placement(ReservationRequest {
+                transition_id: 2,
+                purpose: ReservationPurpose::LargeModelAdmission,
+                model: "target".to_owned(),
+                pci_slots: conflicting.clone(),
+                vram_per_slot: 90,
+                phase: ReservationPhase::Planned,
+                cleanup: ReservationCleanup {
+                    token: 22,
+                    expires_at: None,
+                },
+            }),
+            Err(ReservationError::AlreadyReserved { .. })
+        ));
+        assert!(!table.usage_by_slot(None).contains_key(&conflicting[1]));
+        assert_eq!(
+            table.snapshot().len(),
+            2,
+            "conflicts must not partially reserve"
+        );
+
+        assert_eq!(table.release_cleanup_token(11), 2);
+        assert_eq!(table.release_cleanup_token(11), 0);
+        assert!(table.snapshot().is_empty());
+    }
+
+    #[test]
+    fn reservation_table_reserves_batch_atomically() {
+        let mut table = ReservationTable::default();
+        table
+            .reserve_batch(vec![
+                ReservationRequest {
+                    transition_id: 3,
+                    purpose: ReservationPurpose::MigrationReplacement,
+                    model: "victim".to_owned(),
+                    pci_slots: vec!["0000:01:00.0".to_owned()],
+                    vram_per_slot: 30,
+                    phase: ReservationPhase::Loading,
+                    cleanup: ReservationCleanup {
+                        token: 3,
+                        expires_at: None,
+                    },
+                },
+                ReservationRequest {
+                    transition_id: 3,
+                    purpose: ReservationPurpose::LargeModelAdmission,
+                    model: "target".to_owned(),
+                    pci_slots: vec!["0000:02:00.0".to_owned()],
+                    vram_per_slot: 90,
+                    phase: ReservationPhase::Planned,
+                    cleanup: ReservationCleanup {
+                        token: 3,
+                        expires_at: None,
+                    },
+                },
+            ])
+            .unwrap();
+        assert_eq!(table.snapshot().len(), 2);
+        assert_eq!(table.usage_by_slot(None)["0000:01:00.0"], 30);
+        assert_eq!(table.usage_by_slot(None)["0000:02:00.0"], 90);
+
+        assert!(
+            table
+                .reserve_batch(vec![
+                    ReservationRequest {
+                        transition_id: 4,
+                        purpose: ReservationPurpose::MigrationReplacement,
+                        model: "other".to_owned(),
+                        pci_slots: vec!["0000:02:00.0".to_owned()],
+                        vram_per_slot: 1,
+                        phase: ReservationPhase::Planned,
+                        cleanup: ReservationCleanup {
+                            token: 4,
+                            expires_at: None,
+                        },
+                    },
+                    ReservationRequest {
+                        transition_id: 4,
+                        purpose: ReservationPurpose::LargeModelAdmission,
+                        model: "other-target".to_owned(),
+                        pci_slots: vec!["0000:03:00.0".to_owned()],
+                        vram_per_slot: 1,
+                        phase: ReservationPhase::Planned,
+                        cleanup: ReservationCleanup {
+                            token: 4,
+                            expires_at: None,
+                        },
+                    },
+                ])
+                .is_err()
+        );
+        assert_eq!(
+            table.snapshot().len(),
+            2,
+            "batch conflicts must not partially apply"
+        );
+    }
+
+    #[test]
+    fn reservation_table_reaps_expired_entries() {
+        let mut table = ReservationTable::default();
+        let now = Instant::now();
+        table
+            .reserve_placement(ReservationRequest {
+                transition_id: 1,
+                purpose: ReservationPurpose::NormalSpawn,
+                model: "model".to_owned(),
+                pci_slots: vec!["0000:01:00.0".to_owned()],
+                vram_per_slot: 10,
+                phase: ReservationPhase::Loading,
+                cleanup: ReservationCleanup {
+                    token: 1,
+                    expires_at: Some(now - Duration::from_secs(1)),
+                },
+            })
+            .unwrap();
+        assert_eq!(table.release_expired(now), 1);
+        assert!(table.snapshot().is_empty());
+    }
+
+    #[test]
+    fn reservation_table_rejects_duplicate_slots_without_mutation() {
+        let mut table = ReservationTable::default();
+        let slots = vec!["0000:01:00.0".to_owned(), "0000:01:00.0".to_owned()];
+        assert_eq!(
+            table.reserve_placement(ReservationRequest {
+                transition_id: 1,
+                purpose: ReservationPurpose::NormalSpawn,
+                model: "model".to_owned(),
+                pci_slots: slots.clone(),
+                vram_per_slot: 10,
+                phase: ReservationPhase::Planned,
+                cleanup: ReservationCleanup {
+                    token: 1,
+                    expires_at: None,
+                },
+            }),
+            Err(ReservationError::DuplicateSlot(slots[0].clone()))
+        );
+        assert!(table.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn coordinator_serializes_reservation_commands() {
+        let mgr = test_manager();
+        let transition_id = mgr.allocate_transition_id().await.unwrap();
+        let slots = vec!["0000:01:00.0".to_owned()];
+        mgr.reserve_placement(ReservationRequest {
+            transition_id,
+            purpose: ReservationPurpose::NormalSpawn,
+            model: "model".to_owned(),
+            pci_slots: slots.clone(),
+            vram_per_slot: 25,
+            phase: ReservationPhase::Loading,
+            cleanup: ReservationCleanup {
+                token: transition_id,
+                expires_at: None,
+            },
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(mgr.reservation_usage(None).await.get(&slots[0]), Some(&25));
+        assert!(
+            mgr.set_reservation_phase(transition_id, ReservationPhase::Committed)
+                .await
+        );
+        assert_eq!(
+            mgr.reservation_snapshot().await[0].phase,
+            ReservationPhase::Committed
+        );
+        assert_eq!(mgr.release_reservations(transition_id).await, 1);
+        assert!(mgr.reservation_snapshot().await.is_empty());
+
+        let expiring_id = mgr.allocate_transition_id().await.unwrap();
+        mgr.reserve_placement(ReservationRequest {
+            transition_id: expiring_id,
+            purpose: ReservationPurpose::NormalSpawn,
+            model: "model".to_owned(),
+            pci_slots: vec!["0000:02:00.0".to_owned()],
+            vram_per_slot: 10,
+            phase: ReservationPhase::Loading,
+            cleanup: ReservationCleanup {
+                token: expiring_id,
+                expires_at: Some(Instant::now() + Duration::from_millis(25)),
+            },
+        })
+        .await
+        .unwrap();
+        assert_eq!(mgr.reservation_snapshot().await.len(), 1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(mgr.reservation_snapshot().await.is_empty());
+    }
+
     fn make_handle(state: InstanceState, in_flight: usize, idle_for: Duration) -> InstanceHandle {
         make_handle_on_gpus(vec![0], state, in_flight, idle_for)
     }
@@ -2708,7 +5180,9 @@ models:
         let mut inst = Instance::new("m", gpus, 54321, None);
         inst.state = state;
         inst.in_flight = in_flight;
-        inst.last_active = Instant::now() - idle_for;
+        let last = Instant::now() - idle_for;
+        inst.last_active = last;
+        inst.last_completed = last;
         InstanceHandle::new(inst)
     }
 
@@ -2817,8 +5291,8 @@ models:
     async fn enqueue_refused_when_no_instances_exist() {
         // Spawn failure with zero instances registered must not park the
         // request forever: nothing would ever wake the waiter.
-        let mgr = test_manager();
-        let result = mgr.enqueue("m", 8).await;
+        let mgr = Arc::new(test_manager());
+        let result = mgr.enqueue(test_queue_route(&mgr), 8).await;
         assert!(
             matches!(result, Err(EnqueueError::NoInstances)),
             "enqueue with no instances must fail fast"
@@ -2838,19 +5312,19 @@ models:
             .or_default()
             .push(handle.clone());
 
-        let (tx, rx) = oneshot::channel();
+        let (entry, rx) = test_queue_entry(&mgr, 0);
         mgr.queues
             .write()
             .unwrap()
             .entry("m".to_owned())
             .or_default()
-            .push_back((0, tx));
+            .push_back(entry);
 
         mgr.remove_instance("m", &handle).await;
 
         assert!(
-            rx.await.is_err(),
-            "waiter must be released when the last instance is removed"
+            matches!(rx.await, Ok(Err(QueueTerminalError::ModelRemoved))),
+            "waiter must be completed when the last instance is removed"
         );
     }
 
@@ -2867,13 +5341,13 @@ models:
             list.push(h2);
         }
 
-        let (tx, rx) = oneshot::channel::<SlotGuard>();
+        let (entry, rx) = test_queue_entry(&mgr, 0);
         mgr.queues
             .write()
             .unwrap()
             .entry("m".to_owned())
             .or_default()
-            .push_back((0, tx));
+            .push_back(entry);
 
         mgr.remove_instance("m", &h1).await;
 
@@ -2885,11 +5359,227 @@ models:
     }
 
     #[tokio::test]
+    async fn shutdown_completes_queued_assignments_and_releases_state() {
+        let mgr = Arc::new(test_manager());
+        let handle = make_handle(InstanceState::Ready, 4, Duration::ZERO);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle);
+        let admission = mgr
+            .admit(
+                &cands(&["m"]),
+                AliasPolicy::PreferLoaded,
+                MakeRoomMode::None,
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+        let pending = match admission {
+            Admission::Waiting(pending) => pending,
+            Admission::Assigned(_, _) => panic!("full instance must queue"),
+        };
+        assert_eq!(mgr.queue_depth("m"), 1);
+
+        mgr.shutdown_all().await;
+
+        assert!(matches!(
+            pending.wait().await,
+            Err(AcquireError::Unavailable)
+        ));
+        assert_eq!(mgr.queue_depth("m"), 0);
+        assert!(mgr.reservation_snapshot().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queue_depth_and_blocking_state_counts_are_distinct() {
+        let mgr = Arc::new(test_manager());
+        let full = make_handle(InstanceState::Ready, 4, Duration::ZERO);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(full);
+
+        let first = mgr
+            .register_pending(test_queue_route(&mgr), 1, true)
+            .unwrap();
+        assert_eq!(mgr.queue_status("m").waiting_for_slot, 1);
+        assert_eq!(mgr.queue_status("m").waiting_for_spawn, 0);
+        assert_eq!(mgr.queue_status("m").waiting_for_migration, 0);
+        assert!(matches!(
+            mgr.register_pending(test_queue_route(&mgr), 1, true),
+            Err(EnqueueError::QueueFull)
+        ));
+        drop(first);
+
+        let spawn_mgr = Arc::new(test_manager());
+        let loading = make_handle(InstanceState::Loading, 0, Duration::ZERO);
+        spawn_mgr
+            .instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(loading);
+        let spawn_pending = spawn_mgr
+            .register_pending(test_queue_route(&spawn_mgr), 2, true)
+            .unwrap();
+        assert_eq!(spawn_mgr.queue_status("m").waiting_for_spawn, 1);
+        drop(spawn_pending);
+
+        let migration_mgr = Arc::new(test_manager());
+        let (migration_tx, _migration_rx) = watch::channel(());
+        migration_mgr
+            .migrations_in_flight
+            .write()
+            .unwrap()
+            .insert("m".to_owned(), migration_tx);
+        let migration_pending = migration_mgr
+            .register_pending(test_queue_route(&migration_mgr), 2, true)
+            .unwrap();
+        assert_eq!(migration_mgr.queue_status("m").waiting_for_migration, 1);
+        drop(migration_pending);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_deadline_expires_without_touching_active_slots() {
+        let mgr = Arc::new(test_manager());
+        mgr.register_request("req-expired", "m");
+        *mgr.queue_wait_timeout_secs.write().unwrap() = 1;
+        let handle = make_handle(InstanceState::Ready, 0, Duration::ZERO);
+        let mut active_guards = Vec::new();
+        for _ in 0..4 {
+            active_guards.push(handle.try_acquire(4).expect("active slot available"));
+        }
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle.clone());
+
+        let admission = mgr
+            .admit(
+                &cands(&["m"]),
+                AliasPolicy::PreferLoaded,
+                MakeRoomMode::None,
+                0,
+                Some("req-expired"),
+            )
+            .await
+            .unwrap();
+        let pending = match admission {
+            Admission::Waiting(pending) => pending,
+            Admission::Assigned(_, _) => panic!("full instance must queue"),
+        };
+        assert_eq!(mgr.queue_depth("m"), 1);
+        assert!(matches!(
+            pending.wait().await,
+            Err(AcquireError::QueueTimeout)
+        ));
+        assert_eq!(
+            mgr.request_status("req-expired").unwrap().state,
+            RequestState::Expired
+        );
+        assert_eq!(mgr.queue_depth("m"), 0);
+        assert_eq!(handle.inner().lock().unwrap().in_flight, 4);
+        drop(active_guards);
+    }
+
+    #[tokio::test]
+    async fn autoscale_skips_migration_participants() {
+        let mgr = Arc::new(test_manager());
+        let handle = make_handle(InstanceState::Ready, 0, Duration::from_secs(3600));
+        handle.inner().lock().unwrap().migration_id = Some(42);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle.clone());
+
+        mgr.evaluate_autoscale().await;
+        assert_eq!(instance_count(&mgr), 1);
+        assert_eq!(handle.inner().lock().unwrap().state, InstanceState::Ready);
+    }
+
+    #[tokio::test]
+    async fn dropped_pending_assignment_removes_queue_entry_promptly() {
+        let mgr = Arc::new(test_manager());
+        mgr.register_request("req-cancel", "m");
+        let handle = make_handle(InstanceState::Ready, 4, Duration::ZERO);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle);
+
+        let admission = mgr
+            .admit(
+                &cands(&["m"]),
+                AliasPolicy::PreferLoaded,
+                MakeRoomMode::None,
+                0,
+                Some("req-cancel"),
+            )
+            .await
+            .unwrap();
+        let pending = match admission {
+            Admission::Waiting(pending) => pending,
+            Admission::Assigned(_, _) => panic!("full instance must queue"),
+        };
+        assert_eq!(mgr.queue_depth("m"), 1);
+        drop(pending);
+        assert_eq!(mgr.queue_depth("m"), 0);
+        assert_eq!(
+            mgr.request_status("req-cancel").unwrap().state,
+            RequestState::Cancelled
+        );
+        let metrics = mgr.scheduler_metrics_snapshot();
+        assert_eq!(metrics.queue_enqueued_total, 1);
+        assert_eq!(metrics.queue_cancelled_total, 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_receiver_releases_raced_assignment_slot() {
+        let mgr = test_manager();
+        let handle = make_handle(InstanceState::Ready, 3, Duration::ZERO);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle.clone());
+        let (entry, receiver) = test_queue_entry(&mgr, 19);
+        mgr.queues
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push_back(entry);
+        drop(receiver);
+
+        mgr.wake_one("m");
+        assert_eq!(
+            handle.inner().lock().unwrap().in_flight,
+            3,
+            "a guard sent to a cancelled receiver must be dropped"
+        );
+        assert_eq!(mgr.queue_depth("m"), 0);
+    }
+
+    #[tokio::test]
     async fn enqueue_self_wakes_when_capacity_already_free() {
         // Lost-wakeup regression: capacity freed *before* the waiter parks
         // must still serve it — the post-push wake_one re-signals instead
         // of leaving the waiter parked on a free slot.
-        let mgr = test_manager();
+        let mgr = Arc::new(test_manager());
         let handle = make_handle(InstanceState::Ready, 0, Duration::ZERO);
         mgr.instances
             .write()
@@ -2898,7 +5588,7 @@ models:
             .or_default()
             .push(handle.clone());
 
-        let guard = mgr.enqueue("m", 8).await;
+        let guard = mgr.enqueue(test_queue_route(&mgr), 8).await;
         assert!(guard.is_ok(), "waiter must be served by the post-push wake");
         assert_eq!(handle.inner().lock().unwrap().in_flight, 1);
     }
@@ -2916,17 +5606,20 @@ models:
             .entry("m".to_owned())
             .or_default()
             .push(handle.clone());
-        let (tx, rx) = oneshot::channel::<SlotGuard>();
+        let (entry, rx) = test_queue_entry(&mgr, 0);
         mgr.queues
             .write()
             .unwrap()
             .entry("m".to_owned())
             .or_default()
-            .push_back((0, tx));
+            .push_back(entry);
 
         mgr.wake_one("m");
 
-        let guard = rx.await.expect("waiter must receive a slot");
+        let guard = rx
+            .await
+            .expect("waiter must receive an assignment")
+            .expect("assignment must succeed");
         assert_eq!(
             handle.inner().lock().unwrap().in_flight,
             2,
@@ -2949,11 +5642,11 @@ models:
             .entry("m".to_owned())
             .or_default()
             .push(handle);
-        let (tx, rx) = oneshot::channel::<SlotGuard>();
+        let (entry, rx) = test_queue_entry(&mgr, 7);
         {
             let mut queues = mgr.queues.write().unwrap();
             let q = queues.entry("m".to_owned()).or_default();
-            q.push_back((7, tx));
+            q.push_back(entry);
         }
 
         mgr.wake_one("m");
@@ -2962,7 +5655,7 @@ models:
         assert!(!rx.is_terminated(), "waiter must stay parked");
         let queues = mgr.queues.read().unwrap();
         assert_eq!(
-            queues["m"][0].0, 7,
+            queues["m"][0].id, 7,
             "re-parked waiter must be back at the head"
         );
     }
@@ -2972,13 +5665,13 @@ models:
         // Timeout path: a timed-out waiter removes its own entry by id;
         // other parked waiters must stay in place.
         let mgr = test_manager();
-        let (tx1, rx1) = oneshot::channel::<SlotGuard>();
-        let (tx2, rx2) = oneshot::channel::<SlotGuard>();
+        let (entry1, rx1) = test_queue_entry(&mgr, 1);
+        let (entry2, rx2) = test_queue_entry(&mgr, 2);
         {
             let mut queues = mgr.queues.write().unwrap();
             let q = queues.entry("m".to_owned()).or_default();
-            q.push_back((1, tx1));
-            q.push_back((2, tx2));
+            q.push_back(entry1);
+            q.push_back(entry2);
         }
 
         mgr.remove_queued("m", 1);
@@ -3119,6 +5812,20 @@ models:
             .or_default()
             .push(handle);
         mgr.block_model("m");
+        mgr.reserve_placement(ReservationRequest {
+            transition_id: 91,
+            purpose: ReservationPurpose::LargeModelAdmission,
+            model: "m".to_owned(),
+            pci_slots: vec!["0000:01:00.0".to_owned()],
+            vram_per_slot: 1,
+            phase: ReservationPhase::Planned,
+            cleanup: ReservationCleanup {
+                token: 91,
+                expires_at: None,
+            },
+        })
+        .await
+        .unwrap();
 
         let cfg_b: crate::config::Config = serde_yaml_ng::from_str(TEST_CONFIG_YAML_B).unwrap();
         mgr.reconcile_config(&cfg_b).await;
@@ -3131,6 +5838,7 @@ models:
         assert!(!mgr.model_configs.read().unwrap().contains_key("m"));
         assert!(mgr.model_configs.read().unwrap().contains_key("n"));
         assert!(!mgr.is_blocked("m"), "reload must clear blocked flags");
+        assert!(mgr.reservation_snapshot().await.is_empty());
     }
 
     #[tokio::test]
@@ -3163,6 +5871,36 @@ models:
     }
 
     #[tokio::test]
+    async fn reload_preserves_accepted_queue_route_snapshot() {
+        let mgr = Arc::new(test_manager());
+        let handle = make_handle(InstanceState::Ready, 4, Duration::ZERO);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle);
+        let mut route = test_queue_route(&mgr);
+        route.policy = AliasPolicy::PreferOrder;
+        route.make_room = MakeRoomMode::Migrate;
+        route.generation = 17;
+        let pending = mgr.register_pending(route, 8, true).unwrap();
+
+        let yaml = TEST_CONFIG_YAML.replace("idle_ttl: 60", "idle_ttl: 60\n    max_concurrent: 8");
+        let cfg: crate::config::Config = serde_yaml_ng::from_str(&yaml).unwrap();
+        mgr.reconcile_config(&cfg).await;
+
+        let queued = mgr.queues.read().unwrap();
+        let route = &queued["m"][0].route;
+        assert_eq!(route.policy, AliasPolicy::PreferOrder);
+        assert_eq!(route.make_room, MakeRoomMode::Migrate);
+        assert_eq!(route.generation, 17);
+        assert_eq!(route.max_concurrent, 4);
+        drop(queued);
+        drop(pending);
+    }
+
+    #[tokio::test]
     async fn reconcile_retires_stale_instances_and_reaps_after_drain() {
         // A change to a spawn-relevant field (cmd) retires the running
         // instance: marked unroutable immediately, but the in-flight
@@ -3183,7 +5921,7 @@ models:
 
         assert_eq!(
             handle.inner().lock().unwrap().state,
-            InstanceState::Failed,
+            InstanceState::Draining,
             "stale instance must be marked unroutable"
         );
         assert_eq!(
@@ -3280,7 +6018,7 @@ models:
     async fn enqueue_refused_when_only_draining_instances_exist() {
         // All remaining instances retiring (Failed): no release event can
         // ever serve a parked waiter, so enqueue must fail fast.
-        let mgr = test_manager();
+        let mgr = Arc::new(test_manager());
         let handle = make_handle(InstanceState::Failed, 0, Duration::ZERO);
         mgr.instances
             .write()
@@ -3289,7 +6027,7 @@ models:
             .or_default()
             .push(handle);
 
-        let result = mgr.enqueue("m", 8).await;
+        let result = mgr.enqueue(test_queue_route(&mgr), 8).await;
         assert!(
             matches!(result, Err(EnqueueError::NoInstances)),
             "enqueue with only retiring instances must fail fast"
@@ -3301,7 +6039,7 @@ models:
         // All instances busy (in_flight = max_concurrent = 4, the config
         // default), nothing ever releases: the waiter must eventually
         // fail with Timeout (paused time auto-advances).
-        let mgr = test_manager();
+        let mgr = Arc::new(test_manager());
         let handle = make_handle(InstanceState::Ready, 4, Duration::ZERO);
         mgr.instances
             .write()
@@ -3310,7 +6048,7 @@ models:
             .or_default()
             .push(handle);
 
-        let result = mgr.enqueue("m", 8).await;
+        let result = mgr.enqueue(test_queue_route(&mgr), 8).await;
         assert!(
             matches!(result, Err(EnqueueError::Timeout)),
             "got: {:?}",
@@ -3560,7 +6298,7 @@ models:
         assert_eq!(instance_count(&mgr), 1, "busy instance must survive");
         assert_eq!(
             handle.inner().lock().unwrap().state,
-            InstanceState::Failed,
+            InstanceState::Draining,
             "busy instance must be marked unroutable"
         );
         // No new slots may be acquired on a draining instance.
@@ -3626,6 +6364,73 @@ models:
     vulkan_devices: [0, 1, 2, 3]
 "#;
 
+    const MIGRATION_VICTIM_YAML: &str = r#"
+server: {}
+apikeys_file: apikeys.txt
+devices:
+  vulkan:
+    0: "0000:01:00.0"
+    1: "0000:02:00.0"
+    2: "0000:03:00.0"
+    3: "0000:04:00.0"
+models:
+  - name: large
+    context_length: 4096
+    cmd: "sleep 3600"
+    vram: 40000
+    vulkan_devices: [0, 1, 2, 3]
+  - name: idle-old
+    context_length: 4096
+    cmd: "sleep 3600"
+    vram: 20000
+    vulkan_devices: [0, 1, 2, 3]
+  - name: idle-new
+    context_length: 4096
+    cmd: "sleep 3600"
+    vram: 20000
+    vulkan_devices: [0, 1, 2, 3]
+  - name: busy
+    context_length: 4096
+    cmd: "sleep 3600"
+    vram: 20000
+    vulkan_devices: [0, 1, 2, 3]
+  - name: transitioning
+    context_length: 4096
+    cmd: "sleep 3600"
+    vram: 20000
+    vulkan_devices: [0, 1, 2, 3]
+  - name: stuck
+    context_length: 4096
+    cmd: "sleep 3600"
+    vram: 20000
+    vulkan_devices: [0]
+"#;
+
+    const MIGRATION_PLAN_YAML: &str = r#"
+server: {}
+apikeys_file: apikeys.txt
+devices:
+  vulkan:
+    0: "0000:01:00.0"
+    1: "0000:02:00.0"
+models:
+  - name: large
+    context_length: 4096
+    cmd: "sleep 3600"
+    vram: 90000
+    vulkan_devices: [0, 1]
+  - name: resident
+    context_length: 4096
+    cmd: "sleep 3600"
+    vram: 30000
+    vulkan_devices: [0, 1]
+  - name: victim
+    context_length: 4096
+    cmd: "sleep 3600"
+    vram: 30000
+    vulkan_devices: [0, 1]
+"#;
+
     fn multi_gpu_manager() -> InstanceManager {
         let config: crate::config::Config = serde_yaml_ng::from_str(MULTI_GPU_YAML).unwrap();
         let snapshot = Arc::new(tokio::sync::RwLock::new(vec![
@@ -3647,6 +6452,379 @@ models:
             .entry(model.to_owned())
             .or_default()
             .push(InstanceHandle::new(inst));
+    }
+
+    fn register_aged_ready(
+        mgr: &InstanceManager,
+        model: &str,
+        gpus: Vec<usize>,
+        port: u16,
+        in_flight: usize,
+        completed_ago: Duration,
+    ) -> InstanceHandle {
+        let mut inst = Instance::new(model, gpus, port, None);
+        inst.state = InstanceState::Ready;
+        inst.in_flight = in_flight;
+        let completed = Instant::now() - completed_ago;
+        inst.last_completed = completed;
+        inst.last_active = completed;
+        let handle = InstanceHandle::new(inst);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry(model.to_owned())
+            .or_default()
+            .push(handle.clone());
+        handle
+    }
+
+    #[tokio::test]
+    async fn migration_demands_for_one_target_are_coalesced() {
+        let mgr = Arc::new(test_manager());
+        let cfg = mgr.model_configs.read().unwrap().get("m").cloned().unwrap();
+        let mut first = mgr.ensure_migration("m", &cfg);
+        let mut second = mgr.ensure_migration("m", &cfg);
+        assert_eq!(mgr.migrations_in_flight.read().unwrap().len(), 1);
+        assert!(first.changed().await.is_err());
+        assert!(second.changed().await.is_err());
+        assert!(mgr.migrations_in_flight.read().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn migration_rollback_restores_old_route_and_releases_reservations() {
+        let mgr = test_manager();
+        let old = make_handle(InstanceState::Draining, 1, Duration::ZERO);
+        old.inner().lock().unwrap().migration_id = Some(9);
+        let replacement = make_handle(InstanceState::Ready, 0, Duration::ZERO);
+        {
+            let mut instance = replacement.inner().lock().unwrap();
+            instance.load_purpose = InstanceLoadPurpose::MigrationReplacement;
+            instance.migration_id = Some(9);
+        }
+        {
+            let mut instances = mgr.instances.write().unwrap();
+            let list = instances.entry("m".to_owned()).or_default();
+            list.push(old.clone());
+            list.push(replacement.clone());
+        }
+        mgr.reserve_placement(ReservationRequest {
+            transition_id: 9,
+            purpose: ReservationPurpose::MigrationReplacement,
+            model: "m".to_owned(),
+            pci_slots: vec!["0000:01:00.0".to_owned()],
+            vram_per_slot: 1,
+            phase: ReservationPhase::WaitingForDrain,
+            cleanup: ReservationCleanup {
+                token: 9,
+                expires_at: None,
+            },
+        })
+        .await
+        .unwrap();
+
+        let plan = MigrationPlan {
+            target_model: "target".to_owned(),
+            target: PlacementSnapshot {
+                device_indices: vec![],
+                pci_slots: vec![],
+                projected_final_vram: HashMap::new(),
+                projected_peak_vram: HashMap::new(),
+            },
+            victim: MigrationVictimCandidate {
+                model_name: "m".to_owned(),
+                handle: old.clone(),
+                instance_id: old.id(),
+                generation: 0,
+                source_pci_slots: vec!["0000:02:00.0".to_owned()],
+                destination: PlacementSnapshot {
+                    device_indices: vec![],
+                    pci_slots: vec![],
+                    projected_final_vram: HashMap::new(),
+                    projected_peak_vram: HashMap::new(),
+                },
+                last_completed: Instant::now(),
+                in_flight: 1,
+            },
+        };
+
+        mgr.rollback_migration(&plan, 9, Some(&replacement)).await;
+
+        let (old_state, old_migration, old_in_flight) = {
+            let old_state = old.inner().lock().unwrap();
+            (old_state.state, old_state.migration_id, old_state.in_flight)
+        };
+        assert_eq!(old_state, InstanceState::Ready);
+        assert_eq!(old_migration, None);
+        assert_eq!(old_in_flight, 1, "active request must remain intact");
+        assert_eq!(instance_count(&mgr), 1);
+        assert!(mgr.reservation_snapshot().await.is_empty());
+        assert_eq!(
+            replacement.inner().lock().unwrap().state,
+            InstanceState::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_participant_crash_releases_transition_and_unblocks_state() {
+        let mgr = Arc::new(test_manager());
+        let replacement = make_handle(InstanceState::Ready, 0, Duration::ZERO);
+        {
+            let mut instance = replacement.inner().lock().unwrap();
+            instance.load_purpose = InstanceLoadPurpose::MigrationReplacement;
+            instance.migration_id = Some(27);
+        }
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(replacement.clone());
+        mgr.reserve_placement(ReservationRequest {
+            transition_id: 27,
+            purpose: ReservationPurpose::MigrationReplacement,
+            model: "m".to_owned(),
+            pci_slots: vec!["0000:01:00.0".to_owned()],
+            vram_per_slot: 1,
+            phase: ReservationPhase::Loading,
+            cleanup: ReservationCleanup {
+                token: 27,
+                expires_at: None,
+            },
+        })
+        .await
+        .unwrap();
+
+        mgr.handle_crash(replacement).await;
+
+        assert_eq!(registered_count(&mgr, "m"), 0);
+        assert!(mgr.reservation_snapshot().await.is_empty());
+        assert!(
+            !mgr.is_blocked("m"),
+            "a ready migration crash is post-output"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_handoff_target_failure_keeps_replacement_routable() {
+        let mgr = test_manager();
+        let replacement = make_handle(InstanceState::Ready, 0, Duration::ZERO);
+        {
+            let mut instance = replacement.inner().lock().unwrap();
+            instance.load_purpose = InstanceLoadPurpose::MigrationReplacement;
+            instance.migration_id = Some(12);
+        }
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(replacement.clone());
+        mgr.reserve_placement(ReservationRequest {
+            transition_id: 12,
+            purpose: ReservationPurpose::LargeModelAdmission,
+            model: "target".to_owned(),
+            pci_slots: vec!["0000:01:00.0".to_owned()],
+            vram_per_slot: 1,
+            phase: ReservationPhase::Loading,
+            cleanup: ReservationCleanup {
+                token: 12,
+                expires_at: None,
+            },
+        })
+        .await
+        .unwrap();
+
+        mgr.retain_migrated_replacement_after_target_failure(12, "m", &replacement)
+            .await;
+
+        let (state, migration_id) = {
+            let instance = replacement.inner().lock().unwrap();
+            (instance.state, instance.migration_id)
+        };
+        assert_eq!(state, InstanceState::Ready);
+        assert_eq!(migration_id, None);
+        assert_eq!(instance_count(&mgr), 1);
+        assert!(mgr.reservation_snapshot().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn migration_dry_run_charges_replacement_before_target() {
+        let config: crate::config::Config = serde_yaml_ng::from_str(MIGRATION_PLAN_YAML).unwrap();
+        let snapshot = Arc::new(tokio::sync::RwLock::new(vec![
+            gpu_metrics(0, "0000:01:00.0", 100_000),
+            gpu_metrics(1, "0000:02:00.0", 100_000),
+        ]));
+        let mgr = {
+            let (mgr, _release_rx, _crash_rx) = InstanceManager::new(&config, snapshot, None);
+            mgr
+        };
+        register_aged_ready(
+            &mgr,
+            "resident",
+            vec![0],
+            54321,
+            0,
+            Duration::from_secs(100),
+        );
+        let victim =
+            register_aged_ready(&mgr, "victim", vec![1], 54322, 0, Duration::from_secs(300));
+        let target_cfg = mgr
+            .model_configs
+            .read()
+            .unwrap()
+            .get("large")
+            .cloned()
+            .unwrap();
+
+        let plan = mgr.plan_migration(&target_cfg).await.unwrap();
+        assert_eq!(plan.victim.handle.id(), victim.id());
+        assert_eq!(plan.victim.source_pci_slots, vec!["0000:02:00.0"]);
+        assert_eq!(plan.victim.destination.pci_slots, vec!["0000:01:00.0"]);
+        assert_eq!(
+            plan.victim.destination.projected_peak_vram,
+            plan.victim.destination.projected_final_vram
+        );
+        assert_eq!(
+            plan.victim.destination.projected_peak_vram["0000:01:00.0"],
+            60_000 * 1024 * 1024,
+            "replacement must fit alongside the resident model"
+        );
+        assert_eq!(plan.target.pci_slots, vec!["0000:02:00.0"]);
+        assert_eq!(plan.target_model, "large");
+        assert_eq!(
+            plan.target.projected_final_vram["0000:01:00.0"],
+            60_000 * 1024 * 1024
+        );
+        assert_eq!(
+            plan.target.projected_final_vram["0000:02:00.0"],
+            90_000 * 1024 * 1024
+        );
+
+        let mut too_large = target_cfg;
+        too_large.vram = 100_001;
+        assert!(mgr.plan_migration(&too_large).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn migration_victims_are_lru_ordered_and_destination_safe() {
+        let config: crate::config::Config = serde_yaml_ng::from_str(MIGRATION_VICTIM_YAML).unwrap();
+        let snapshot = Arc::new(tokio::sync::RwLock::new(vec![
+            gpu_metrics(0, "0000:01:00.0", 48_000),
+            gpu_metrics(1, "0000:02:00.0", 48_000),
+            gpu_metrics(2, "0000:03:00.0", 48_000),
+            gpu_metrics(3, "0000:04:00.0", 48_000),
+        ]));
+        let (mgr, _release_rx, _crash_rx) = InstanceManager::new(&config, snapshot, None);
+
+        let idle_old = register_aged_ready(
+            &mgr,
+            "idle-old",
+            vec![0],
+            54321,
+            0,
+            Duration::from_secs(300),
+        );
+        let idle_new = register_aged_ready(
+            &mgr,
+            "idle-new",
+            vec![1],
+            54322,
+            0,
+            Duration::from_secs(100),
+        );
+        let busy = register_aged_ready(&mgr, "busy", vec![2], 54323, 1, Duration::from_secs(1000));
+        let transitioning = register_aged_ready(
+            &mgr,
+            "transitioning",
+            vec![3],
+            54324,
+            0,
+            Duration::from_secs(400),
+        );
+        transitioning.inner().lock().unwrap().migration_id = Some(9);
+        register_aged_ready(&mgr, "stuck", vec![0], 54325, 0, Duration::from_secs(500));
+
+        let candidates = mgr.enumerate_migration_victims("large").await;
+        let names: Vec<&str> = candidates
+            .iter()
+            .map(|candidate| candidate.model_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["idle-old", "idle-new", "busy"]);
+        assert_eq!(candidates[0].handle.id(), idle_old.id());
+        assert_eq!(candidates[1].handle.id(), idle_new.id());
+        assert_eq!(candidates[2].handle.id(), busy.id());
+        for candidate in &candidates {
+            assert!(
+                candidate
+                    .source_pci_slots
+                    .iter()
+                    .all(|slot| !candidate.destination.pci_slots.contains(slot)),
+                "destination must not reuse source slots"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn selection_observes_coordinator_reservations() {
+        let mgr = multi_gpu_manager();
+        let transition_id = mgr.allocate_transition_id().await.unwrap();
+        let reserved_slot = "0000:01:00.0".to_owned();
+        mgr.reserve_placement(ReservationRequest {
+            transition_id,
+            purpose: ReservationPurpose::LargeModelAdmission,
+            model: "target".to_owned(),
+            pci_slots: vec![reserved_slot.clone()],
+            vram_per_slot: 48_000 * 1024 * 1024,
+            phase: ReservationPhase::Loading,
+            cleanup: ReservationCleanup {
+                token: transition_id,
+                expires_at: None,
+            },
+        })
+        .await
+        .unwrap();
+
+        let cfg = mgr
+            .model_configs
+            .read()
+            .unwrap()
+            .get("big")
+            .cloned()
+            .unwrap();
+        let placement = mgr.select_gpus_for_model(&cfg).await;
+        assert_eq!(placement.len(), 2);
+        assert!(
+            !placement.contains(&0),
+            "reserved PCI slot must not be selected"
+        );
+
+        assert_eq!(mgr.release_reservations(transition_id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn placement_snapshot_reports_concrete_devices_and_projected_usage() {
+        let mgr = multi_gpu_manager();
+        let cfg = mgr
+            .model_configs
+            .read()
+            .unwrap()
+            .get("big")
+            .cloned()
+            .unwrap();
+
+        let snapshot = mgr
+            .select_placement_snapshot(&cfg, &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(snapshot.device_indices.len(), 2);
+        assert_eq!(snapshot.pci_slots.len(), 2);
+        assert_eq!(snapshot.projected_peak_vram, snapshot.projected_final_vram);
+        for pci_slot in &snapshot.pci_slots {
+            assert_eq!(
+                snapshot.projected_final_vram.get(pci_slot),
+                Some(&(20_000 * 1024 * 1024))
+            );
+        }
     }
 
     #[tokio::test]
@@ -4452,7 +7630,7 @@ models:
             )
             .await;
         assert!(
-            matches!(res, Err(AcquireError::NoCapacity)),
+            matches!(res, Err(AcquireError::QueueTimeout)),
             "queued on the loaded candidate → timeout, got: {:?}",
             res.map(|_| "guard")
         );
@@ -4779,7 +7957,7 @@ models:
             .expect("a stuck drain must be abandoned after drain_timeout");
         assert_eq!(
             victim.inner().lock().unwrap().state,
-            InstanceState::Failed,
+            InstanceState::Draining,
             "timed-out drain leaves the instance draining (reaped once idle)"
         );
         assert_eq!(registered_count(&mgr, "dense"), 2, "nothing reaped yet");

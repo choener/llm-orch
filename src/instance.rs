@@ -12,8 +12,31 @@ pub enum InstanceState {
     Loading,
     /// Health check passed, accepting requests.
     Ready,
-    /// Health check or spawn failed, or crashed without producing output.
+    /// No new requests are accepted, but existing slot guards may continue
+    /// using the backend until it becomes idle.
+    Draining,
+    /// The backend is no longer serving requests and is awaiting registry
+    /// removal.  This is a short-lived internal state.
+    Retired,
+    /// Health check or spawn failed, or the backend crashed and is no longer
+    /// usable.
     Failed,
+}
+
+/// Why a backend instance is being loaded.
+///
+/// Keeping the purpose on the instance lets the scheduler distinguish an
+/// ordinary on-demand spawn from the temporary duplicate used by a future
+/// migration transaction, without making the process routable before it is
+/// ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstanceLoadPurpose {
+    /// Normal request-driven or autoscaling spawn.
+    Normal,
+    /// Temporary replacement for an existing instance during migration.
+    MigrationReplacement,
+    /// Target model load performed as part of a make-room transaction.
+    LargeModelAdmission,
 }
 
 // ── Instance ─────────────────────────────────────────────────────────────────
@@ -42,6 +65,19 @@ pub struct Instance {
     /// Current lifecycle state.
     pub state: InstanceState,
 
+    /// Purpose of the load that created this instance.
+    pub load_purpose: InstanceLoadPurpose,
+
+    /// Logical routing generation served by this physical instance.
+    ///
+    /// Generation `0` is the initial/default generation.  Migration and
+    /// reload coordination may assign later generations before an instance
+    /// becomes the active logical route.
+    pub generation: u64,
+
+    /// Transition that owns this instance, if it participates in one.
+    pub migration_id: Option<u64>,
+
     /// Subprocess handle (`None` before spawn, or after the process exits).
     pub child: Option<Child>,
 
@@ -53,8 +89,14 @@ pub struct Instance {
     /// Number of in-flight requests currently being processed.
     pub in_flight: usize,
 
-    /// Timestamp of the last request completion (for TTL tracking).
+    /// Timestamp of the last request activity (acquire or release, for TTL
+    /// tracking).
     pub last_active: Instant,
+
+    /// Timestamp of the last slot release.  Kept separate from
+    /// `last_active` so migration victim ordering can use completion history
+    /// rather than the most recent request start.
+    pub last_completed: Instant,
 
     /// Channel sender for notifying the manager on slot release.
     /// `None` in tests or after shutdown.
@@ -64,7 +106,7 @@ pub struct Instance {
     /// device pool, `vram`, `context_length`) this instance was launched
     /// with.  Set by the manager at spawn time; `0` means "unset" (tests).
     /// On config reload, instances whose fingerprint no longer matches are
-    /// retired (marked `Failed`/draining) and replaced on demand.
+    /// retired (marked `Draining`) and replaced on demand.
     pub config_fingerprint: u64,
 }
 
@@ -76,17 +118,39 @@ impl Instance {
         port: u16,
         release_tx: Option<mpsc::UnboundedSender<String>>,
     ) -> Self {
+        Self::new_with_purpose(
+            model_name,
+            gpu_indices,
+            port,
+            release_tx,
+            InstanceLoadPurpose::Normal,
+        )
+    }
+
+    /// Create an instance descriptor with an explicit load purpose.
+    pub fn new_with_purpose(
+        model_name: &str,
+        gpu_indices: Vec<usize>,
+        port: u16,
+        release_tx: Option<mpsc::UnboundedSender<String>>,
+        load_purpose: InstanceLoadPurpose,
+    ) -> Self {
         let id = format!("{}@{}", model_name, display_gpus(&gpu_indices));
+        let now = Instant::now();
         Self {
             id,
             model_name: model_name.to_owned(),
             port,
             gpu_indices,
             state: InstanceState::Loading,
+            load_purpose,
+            generation: 0,
+            migration_id: None,
             child: None,
             output: None,
             in_flight: 0,
-            last_active: Instant::now(),
+            last_active: now,
+            last_completed: now,
             release_tx,
             config_fingerprint: 0,
         }
@@ -95,6 +159,58 @@ impl Instance {
     /// Mark this instance as ready (health check passed).
     pub fn mark_ready(&mut self) {
         self.state = InstanceState::Ready;
+    }
+
+    /// Mark this instance as draining.  Existing slot guards remain valid,
+    /// but future acquisitions reject the instance atomically.
+    pub fn mark_draining(&mut self, migration_id: Option<u64>) {
+        self.state = InstanceState::Draining;
+        self.migration_id = migration_id;
+    }
+
+    /// Mark this instance as retired and ready for registry removal.
+    pub fn mark_retired(&mut self) {
+        self.state = InstanceState::Retired;
+    }
+
+    /// Whether this instance is already draining.
+    pub fn is_draining(&self) -> bool {
+        self.state == InstanceState::Draining
+    }
+
+    /// Clear migration ownership once the instance becomes the active logical
+    /// route or a pre-handoff rollback restores the old route.
+    pub fn clear_migration(&mut self) {
+        self.migration_id = None;
+    }
+
+    /// Mark this instance as failed and remove any transition association.
+    pub fn mark_failed(&mut self) {
+        self.state = InstanceState::Failed;
+        self.migration_id = None;
+    }
+
+    /// Whether the instance can receive a new request slot.  A ready
+    /// migration replacement remains behind its barrier until handoff clears
+    /// `migration_id`.
+    pub fn is_routable(&self) -> bool {
+        self.state == InstanceState::Ready && self.migration_id.is_none()
+    }
+
+    /// Whether a load or ready instance counts against the ordinary logical
+    /// instance cap.  A migration replacement is a temporary duplicate and
+    /// is counted through its coordinator reservation instead.
+    pub fn counts_toward_instance_cap(&self) -> bool {
+        matches!(self.state, InstanceState::Loading | InstanceState::Ready)
+            && !(self.migration_id.is_some()
+                && self.load_purpose == InstanceLoadPurpose::MigrationReplacement)
+    }
+
+    /// Whether a release or readiness event can eventually wake a queued
+    /// request.  Loading is included because its spawn completion may make a
+    /// slot available; draining and terminal states cannot accept work.
+    pub fn can_wake_waiters(&self) -> bool {
+        matches!(self.state, InstanceState::Loading | InstanceState::Ready)
     }
 
     /// Increment the in-flight counter and bump the activity timestamp.
@@ -113,8 +229,10 @@ impl Instance {
     pub fn release_slot(&mut self) {
         let was_active = self.in_flight > 0;
         self.in_flight = self.in_flight.saturating_sub(1);
-        self.last_active = Instant::now();
+        let now = Instant::now();
+        self.last_active = now;
         if was_active {
+            self.last_completed = now;
             if let Some(ref tx) = self.release_tx {
                 let _ = tx.send(self.model_name.clone());
             }
@@ -123,7 +241,7 @@ impl Instance {
 
     /// Whether this instance has spare capacity for another request.
     pub fn has_capacity(&self, max_concurrent: usize) -> bool {
-        self.state == InstanceState::Ready && self.in_flight < max_concurrent
+        self.is_routable() && self.in_flight < max_concurrent
     }
 
     /// Whether the instance has been idle longer than `ttl_seconds`.
@@ -242,6 +360,56 @@ mod tests {
     }
 
     #[test]
+    fn migration_metadata_and_draining_state() {
+        let mut inst = Instance::new_with_purpose(
+            "test",
+            vec![1],
+            9003,
+            None,
+            InstanceLoadPurpose::MigrationReplacement,
+        );
+        assert_eq!(inst.state, InstanceState::Loading);
+        assert_eq!(inst.load_purpose, InstanceLoadPurpose::MigrationReplacement);
+        assert_eq!(inst.generation, 0);
+        assert_eq!(inst.migration_id, None);
+
+        inst.mark_draining(Some(7));
+        assert!(inst.is_draining());
+        assert_eq!(inst.migration_id, Some(7));
+        assert!(!inst.is_routable());
+        assert!(!inst.counts_toward_instance_cap());
+        assert!(!inst.can_wake_waiters());
+
+        inst.mark_ready();
+        assert!(!inst.is_routable());
+        assert!(!inst.has_capacity(4));
+        assert_eq!(inst.migration_id, Some(7));
+        inst.clear_migration();
+        assert!(inst.is_routable());
+        assert!(inst.has_capacity(4));
+    }
+
+    #[test]
+    fn migration_replacement_is_barriered_until_handoff() {
+        let mut inst = Instance::new_with_purpose(
+            "test",
+            vec![0],
+            9003,
+            None,
+            InstanceLoadPurpose::MigrationReplacement,
+        );
+        inst.mark_ready();
+        inst.migration_id = Some(1);
+        let handle = InstanceHandle::new(inst);
+
+        assert!(!handle.inner.lock().unwrap().counts_toward_instance_cap());
+        assert!(handle.try_acquire(4).is_none());
+
+        handle.inner.lock().unwrap().clear_migration();
+        assert!(handle.try_acquire(4).is_some());
+    }
+
+    #[test]
     fn handle_acquire_release() {
         let mut inst = Instance::new("test", vec![0], 9003, None);
         inst.mark_ready();
@@ -255,6 +423,7 @@ mod tests {
         {
             let inst = handle.inner.lock().unwrap();
             assert_eq!(inst.in_flight, 0);
+            assert!(inst.last_completed >= inst.last_active);
         }
     }
 

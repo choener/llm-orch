@@ -88,31 +88,19 @@ pub async fn watch_paths(
     // Debounce task
     let debounce_task = tokio::spawn(async move {
         let mut pending: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-        loop {
-            match event_rx.recv().await {
-                Some(path) => {
-                    debug!("debounce: received {}", path.display());
-                    pending.insert(path);
-                    loop {
-                        match tokio::time::timeout(debounce, event_rx.recv()).await {
-                            Ok(Some(p)) => {
-                                debug!("debounce: burst {}", p.display());
-                                pending.insert(p);
-                            }
-                            _ => break,
-                        }
-                    }
-                    for p in pending.drain() {
-                        debug!("debounce: broadcasting {}", p.display());
-                        let _ = tx.send(FileChange { path: p });
-                    }
-                }
-                None => {
-                    debug!("debounce: channel closed");
-                    break;
-                }
+        while let Some(path) = event_rx.recv().await {
+            debug!("debounce: received {}", path.display());
+            pending.insert(path);
+            while let Ok(Some(p)) = tokio::time::timeout(debounce, event_rx.recv()).await {
+                debug!("debounce: burst {}", p.display());
+                pending.insert(p);
+            }
+            for p in pending.drain() {
+                debug!("debounce: broadcasting {}", p.display());
+                let _ = tx.send(FileChange { path: p });
             }
         }
+        debug!("debounce: channel closed");
     });
 
     Ok(WatchHandle {

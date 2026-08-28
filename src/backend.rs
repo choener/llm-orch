@@ -312,10 +312,10 @@ pub async fn poll_readiness(
         // Early exit: is the process already dead?
         {
             let mut inst = handle.inner().lock().unwrap();
-            if let Some(child) = inst.child.as_mut() {
-                if !matches!(child.try_wait(), Ok(None)) {
-                    return ReadyOutcome::ChildExited;
-                }
+            if let Some(child) = inst.child.as_mut()
+                && !matches!(child.try_wait(), Ok(None))
+            {
+                return ReadyOutcome::ChildExited;
             }
         }
         match client.get(&url).send().await {

@@ -36,6 +36,21 @@ server:
   # `idle_ttl` is only a protection window against make-room eviction
   # (an instance younger than that is never evicted to make room); this
   # global timeout is what actually unloads idle models.
+  # Maximum accepted scheduler wait (seconds).  0 means no scheduler
+  # deadline; clients/proxies can still disconnect their request.
+  # queue_wait_timeout_secs: 3600     # default
+
+  # SSE comment heartbeat cadence while a request waits for a slot, spawn,
+  # or migration.  Must be greater than zero.
+  # queue_heartbeat_secs: 10          # default
+
+  # Maximum migration transition duration. 0 allows active victim requests
+  # to finish without a migration deadline; it never kills active requests.
+  # migration_timeout_secs: 0         # default
+
+  # Victim ordering policy. Only lru is currently implemented.
+  # eviction_policy: lru              # default
+
   # drain_idle_timeout_secs: 3600     # default
 
 # ---------------------------------------------------------------------------
@@ -319,12 +334,14 @@ models:
 #   policy:      prefer_loaded (default) — serve from any already-loaded
 #                candidate before spawning; prefer_order — try candidates
 #                strictly in order (warm slot → spawn → make-room).
-#   make_room:   none | evict_idle (default) | drain_surplus — what may be
-#                evicted when the preferred candidate does not fit:
+#   make_room:   none | evict_idle (default) | drain_surplus | migrate — what
+#                may happen when the preferred candidate does not fit:
 #                evict_idle removes idle instances past their model's
 #                idle_ttl protection; drain_surplus additionally drains
 #                busy *duplicate* instances (never the last one serving a
-#                model).
+#                model); migrate re-uploads an eligible victim on another
+#                GPU before loading the preferred model and never interrupts
+#                active requests.  Migration is alias-only and opt-in.
 #   drain_timeout: bound (seconds, default 300) on waiting for a busy
 #                duplicate to drain when make_room: drain_surplus.
 aliases:
@@ -341,3 +358,10 @@ aliases:
 
   - name: "coder"
     target: "deepseek-coder-7b"
+
+  # Transactional migration is explicit and only applies to aliases.  The
+  # target model is queued while an eligible victim is re-uploaded elsewhere.
+  # - name: "preferred-large"
+  #   targets: ["qwen3-32b"]
+  #   policy: prefer_order
+  #   make_room: migrate

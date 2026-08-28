@@ -216,10 +216,10 @@ fn read_u64(device: &Path, name: &str) -> Option<u64> {
 fn find_hwmon_numeric(device: &Path, name: &str) -> Option<u64> {
     for n in 0..8 {
         let path = device.join(format!("hwmon/hwmon{}", n)).join(name);
-        if let Ok(contents) = fs::read_to_string(&path) {
-            if let Ok(val) = contents.trim().parse::<u64>() {
-                return Some(val);
-            }
+        if let Ok(contents) = fs::read_to_string(&path)
+            && let Ok(val) = contents.trim().parse::<u64>()
+        {
+            return Some(val);
         }
     }
     None
@@ -274,14 +274,13 @@ mod tests {
         let result: Option<u64> = {
             let mut val = None;
             for line in sample.lines() {
-                if line.contains('*') {
-                    if let Some(colon) = line.find(':') {
-                        let after = &line[colon + 1..].trim();
-                        let num: String =
-                            after.chars().take_while(|c| c.is_ascii_digit()).collect();
-                        val = Some(num.parse().unwrap());
-                        break;
-                    }
+                if line.contains('*')
+                    && let Some(colon) = line.find(':')
+                {
+                    let after = &line[colon + 1..].trim();
+                    let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    val = Some(num.parse().unwrap());
+                    break;
                 }
             }
             val

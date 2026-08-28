@@ -3,6 +3,7 @@
 // Boots a real orchestrator (config, auth, scheduler, HTTP server) against
 // the stub llama.cpp backend binary — no GPU or model required.
 
+use futures_util::StreamExt;
 use llm_orch::{apikeys, config, debug_log, gpu, reload, scheduler, server};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -60,9 +61,19 @@ struct TestServer {
 async fn boot(dir: &Path, apikeys_contents: &str, models_yaml: &str) -> TestServer {
     let listen_port = free_port();
     let config_path = write_config(dir, listen_port, models_yaml);
-    std::fs::write(dir.join("apikeys.txt"), apikeys_contents).unwrap();
+    boot_from_config_path(dir, &config_path, apikeys_contents).await
+}
 
-    let cfg = config::Config::load(&config_path).unwrap();
+/// Boot from a complete config file, allowing integration tests to provide
+/// device maps and static capacities that are independent of host GPU
+/// metrics.
+async fn boot_from_config_path(
+    dir: &Path,
+    config_path: &Path,
+    apikeys_contents: &str,
+) -> TestServer {
+    std::fs::write(dir.join("apikeys.txt"), apikeys_contents).unwrap();
+    let cfg = config::Config::load(config_path).unwrap();
     let keys = apikeys::ApikeysStore::load(&cfg.apikeys_file)
         .unwrap_or_else(|_| apikeys::ApikeysStore::empty());
 
@@ -112,8 +123,9 @@ async fn boot(dir: &Path, apikeys_contents: &str, models_yaml: &str) -> TestServ
         panic!("server task exited at startup: {:?}", server_task.await);
     }
 
+    let listen = shared_cfg.read().await.server.listen.clone();
     TestServer {
-        url: format!("http://127.0.0.1:{listen_port}"),
+        url: format!("http://{listen}"),
         manager,
         config: shared_cfg,
         apikeys: shared_keys,
@@ -169,6 +181,306 @@ async fn happy_path_stream_release_and_ttl_unload() {
         Some(0),
         "idle instance must be despawned after drain_idle_timeout"
     );
+}
+
+#[tokio::test]
+async fn queued_stream_emits_sse_comment_before_assignment() {
+    let dir = temp_dir("queued-heartbeat");
+    let models = models_yaml(" --chunks 20 --chunk-delay-ms 100", 60).replace(
+        "max_instances: 1",
+        "max_instances: 1\n    max_concurrent: 1",
+    );
+    let listen_port = free_port();
+    let config_path = write_config(&dir, listen_port, &models);
+    let config = std::fs::read_to_string(&config_path).unwrap().replace(
+        "drain_idle_timeout_secs: 1",
+        "drain_idle_timeout_secs: 1\n  queue_heartbeat_secs: 1",
+    );
+    std::fs::write(&config_path, config).unwrap();
+    std::fs::write(dir.join("apikeys.txt"), "tester: secret-key\n").unwrap();
+
+    let cfg = config::Config::load(&config_path).unwrap();
+    let keys = apikeys::ApikeysStore::load(&cfg.apikeys_file).unwrap();
+    let (gpu_reader, _gpu_task) = gpu::GpuReader::start(Duration::from_secs(5));
+    let gpu_snapshot = gpu_reader.snapshot_arc();
+    let (manager, release_rx, crash_rx) =
+        scheduler::InstanceManager::new(&cfg, Arc::clone(&gpu_snapshot), None);
+    let manager = Arc::new(manager);
+    let config_state = Arc::new(RwLock::new(cfg));
+    let apikeys_state = Arc::new(RwLock::new(keys));
+    let state = server::AppState {
+        config: Arc::clone(&config_state),
+        apikeys: Arc::clone(&apikeys_state),
+        manager: Arc::clone(&manager),
+        client: manager.client().clone(),
+        gpu: gpu_snapshot,
+        debug_loggers: Arc::new(debug_log::DebugLoggers::new()),
+    };
+    tokio::spawn({
+        let manager = Arc::clone(&manager);
+        async move {
+            let mut rx = release_rx;
+            while let Some(model) = rx.recv().await {
+                manager.record_metrics_event(&model, 1);
+                manager.wake_one(&model);
+                manager.reap_drained(&model).await;
+            }
+        }
+    });
+    tokio::spawn({
+        let manager = Arc::clone(&manager);
+        async move {
+            let mut rx = crash_rx;
+            while let Some(handle) = rx.recv().await {
+                manager.handle_crash(handle).await;
+            }
+        }
+    });
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server_task = tokio::spawn(server::serve(state, shutdown_rx));
+    let url = format!("http://127.0.0.1:{listen_port}");
+    let client = reqwest::Client::new();
+    for _ in 0..50 {
+        if client.get(format!("{url}/health")).send().await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let first = authed(&client, &format!("{url}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "first"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+
+    let second = authed(&client, &format!("{url}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "second"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 200);
+    assert_eq!(
+        second
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream"),
+    );
+    assert_eq!(
+        second
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-cache"),
+    );
+    assert_eq!(
+        second
+            .headers()
+            .get("x-accel-buffering")
+            .and_then(|value| value.to_str().ok()),
+        Some("no"),
+    );
+    assert!(second.headers().get("x-llm-orch-request-id").is_some());
+    let mut body = second.bytes_stream();
+    let chunk = tokio::time::timeout(Duration::from_secs(3), body.next())
+        .await
+        .expect("queued SSE must emit a heartbeat")
+        .expect("heartbeat stream must remain open")
+        .unwrap();
+    let text = String::from_utf8_lossy(&chunk);
+    assert!(
+        text.starts_with(": llm-orch waiting;"),
+        "unexpected heartbeat: {text}"
+    );
+    assert!(
+        !text.contains("data:"),
+        "heartbeat must not be an OpenAI data event"
+    );
+
+    // Releasing the first stream assigns the queued request.  The response
+    // body must then contain the backend's normal chunks and terminator,
+    // not a synthetic completion.
+    drop(first);
+    let mut forwarded = String::new();
+    for _ in 0..100 {
+        let Some(chunk) = tokio::time::timeout(Duration::from_secs(3), body.next())
+            .await
+            .expect("assigned backend stream must continue")
+            .expect("assigned stream must not end before [DONE]")
+            .ok()
+        else {
+            break;
+        };
+        forwarded.push_str(&String::from_utf8_lossy(&chunk));
+        if forwarded.contains("[DONE]") {
+            break;
+        }
+    }
+    assert!(
+        forwarded.contains("tok-0"),
+        "backend data was not spliced: {forwarded}"
+    );
+    assert!(
+        forwarded.contains("[DONE]"),
+        "backend terminator was not preserved: {forwarded}"
+    );
+
+    drop(body);
+
+    // An explicitly opted-in client receives a versioned status event while
+    // waiting, whereas the default stream above remained comment-only.
+    let holder = authed(&client, &format!("{url}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "holder"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status_response = authed(&client, &format!("{url}/v1/chat/completions"))
+        .header("X-LLM-Orch-Wait-Events", "1")
+        .json(&serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "status"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status_response.status(), 200);
+    let mut status_body = status_response.bytes_stream();
+    let status_chunk = tokio::time::timeout(Duration::from_secs(3), status_body.next())
+        .await
+        .expect("opt-in status stream must emit an event")
+        .expect("opt-in status stream must remain open")
+        .unwrap();
+    let status_text = String::from_utf8_lossy(&status_chunk);
+    assert!(status_text.contains("event: llm-orch.status"));
+    assert!(status_text.contains("\"version\":1"));
+    assert!(status_text.contains("\"state\":\"queued\""));
+    drop(status_body);
+    drop(holder);
+
+    drop(shutdown_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(3), server_task).await;
+}
+
+#[tokio::test]
+async fn migration_preserves_busy_victim_and_loads_target_after_handoff() {
+    let Some(slots) = real_pci_slots(2) else {
+        return;
+    };
+    let dir = temp_dir("migration");
+    let listen_port = free_port();
+    let config_path = dir.join("config.yaml");
+    std::fs::write(&config_path, migration_cuda_yaml(listen_port, &slots)).unwrap();
+    let srv = boot_from_config_path(&dir, &config_path, "tester: secret-key\n").await;
+    let client = reqwest::Client::new();
+
+    // Keep both resident models active while the target migration starts.
+    let first = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "messages": [{"role": "user", "content": "m1"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    let first_task = tokio::spawn(async move { first.text().await.unwrap() });
+
+    let second = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&serde_json::json!({
+            "model": "m2",
+            "messages": [{"role": "user", "content": "m2"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 200);
+    let second_task = tokio::spawn(async move { second.text().await.unwrap() });
+    for _ in 0..100 {
+        if srv.manager.instance_counts().get("m1").copied() == Some(1)
+            && srv.manager.instance_counts().get("m2").copied() == Some(1)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let target = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&serde_json::json!({
+            "model": "preferred",
+            "messages": [{"role": "user", "content": "large"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(target.status(), 200);
+    let mut target_body = target.bytes_stream();
+    let heartbeat = tokio::time::timeout(Duration::from_secs(3), target_body.next())
+        .await
+        .expect("migration wait must emit a heartbeat")
+        .expect("migration stream must remain open")
+        .unwrap();
+    let heartbeat_text = String::from_utf8_lossy(&heartbeat);
+    assert!(
+        heartbeat_text.contains("llm-orch waiting"),
+        "expected migration heartbeat, got: {heartbeat_text}"
+    );
+
+    let (first_body, second_body) = tokio::time::timeout(
+        Duration::from_secs(10),
+        futures_util::future::join(first_task, second_task),
+    )
+    .await
+    .expect("busy resident requests must finish without migration interruption");
+    assert!(first_body.unwrap().contains("[DONE]"));
+    assert!(second_body.unwrap().contains("[DONE]"));
+
+    let mut target_text = String::new();
+    for _ in 0..20 {
+        let Some(chunk) = tokio::time::timeout(Duration::from_secs(3), target_body.next())
+            .await
+            .expect("target stream must continue after handoff")
+            .expect("target stream must reach its terminator")
+            .ok()
+        else {
+            break;
+        };
+        target_text.push_str(&String::from_utf8_lossy(&chunk));
+        if target_text.contains("[DONE]") {
+            break;
+        }
+    }
+    assert!(
+        target_text.contains("tok-0"),
+        "target was not loaded: {target_text}"
+    );
+    assert!(
+        target_text.contains("[DONE]"),
+        "target terminator missing: {target_text}"
+    );
+    assert_eq!(srv.manager.instance_counts().get("large").copied(), Some(1));
+    assert_eq!(srv.manager.instance_counts().get("m1").copied(), Some(1));
+    assert_eq!(srv.manager.instance_counts().get("m2").copied(), Some(1));
+    let metrics = srv.manager.scheduler_metrics_snapshot();
+    assert!(metrics.migration_started_total >= 1);
+    assert!(metrics.migration_completed_total >= 1);
+    assert!(metrics.queue_enqueued_total >= 1);
 }
 
 #[tokio::test]
@@ -328,6 +640,27 @@ async fn reload_rejects_bad_config_and_keeps_serving_old() {
     .await;
     let cfg = srv.config.read().await;
     assert_eq!(cfg.models[0].max_concurrent, 8, "valid reload must apply");
+    assert_eq!(cfg.server.queue_heartbeat_secs, 10);
+    drop(cfg);
+
+    // A semantically invalid new scheduler setting is rejected atomically;
+    // the last valid configuration remains active.
+    let bad_heartbeat = std::fs::read_to_string(&config_path).unwrap().replace(
+        "drain_idle_timeout_secs: 1",
+        "drain_idle_timeout_secs: 1\n  queue_heartbeat_secs: 0",
+    );
+    std::fs::write(&config_path, bad_heartbeat).unwrap();
+    reload::handle_config_reload(
+        &config_path,
+        &srv.config,
+        &srv.apikeys,
+        &srv.manager,
+        &last_mtime,
+    )
+    .await;
+    let cfg = srv.config.read().await;
+    assert_eq!(cfg.server.queue_heartbeat_secs, 10);
+    assert_eq!(cfg.models[0].max_concurrent, 8);
 }
 
 // ── --check-config ───────────────────────────────────────────────────────────
@@ -352,6 +685,38 @@ fn check_config_exits_zero_on_valid_nonzero_on_invalid() {
         .unwrap();
     assert!(!bad.status.success(), "invalid config must exit non-zero");
     assert!(!bad.stderr.is_empty(), "invalid config must print an error");
+
+    // The scheduler-specific validation must also be enforced by
+    // --check-config.
+    let scheduler_config = write_config(&dir, free_port(), &models_yaml("", 60));
+    let heartbeat_bad = std::fs::read_to_string(&scheduler_config).unwrap().replace(
+        "drain_idle_timeout_secs: 1",
+        "drain_idle_timeout_secs: 1\n  queue_heartbeat_secs: 0",
+    );
+    std::fs::write(&scheduler_config, heartbeat_bad).unwrap();
+    let bad_heartbeat = std::process::Command::new(ORCH_BIN)
+        .arg("--check-config")
+        .arg(&scheduler_config)
+        .output()
+        .unwrap();
+    assert!(
+        !bad_heartbeat.status.success(),
+        "zero queue heartbeat must be rejected"
+    );
+
+    let policy_bad = std::fs::read_to_string(&scheduler_config)
+        .unwrap()
+        .replace("queue_heartbeat_secs: 0", "eviction_policy: priority_lru");
+    std::fs::write(&scheduler_config, policy_bad).unwrap();
+    let bad_policy = std::process::Command::new(ORCH_BIN)
+        .arg("--check-config")
+        .arg(&scheduler_config)
+        .output()
+        .unwrap();
+    assert!(
+        !bad_policy.status.success(),
+        "unknown eviction policy must be rejected"
+    );
 }
 
 // ── Graceful shutdown ────────────────────────────────────────────────────────
@@ -448,6 +813,49 @@ fn audio_models_yaml(idle_ttl: u64) -> String {
     format!(
         "models:\n  - name: audio-m\n    cmd: \"{STUB_BIN} --port {{port}} --config /etc/llm-orch/audio/{{name}}.json --host 127.0.0.1 --backend vulkan\"\n    idle_ttl: {idle_ttl}\n    max_instances: 1\n"
     )
+}
+
+#[tokio::test]
+async fn request_status_endpoint_reports_completed_request() {
+    let dir = temp_dir("request-status");
+    let srv = boot(&dir, "tester: secret-key\n", &models_yaml("", 60)).await;
+    let client = reqwest::Client::new();
+
+    let response = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "status"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let request_id = response
+        .headers()
+        .get("x-llm-orch-request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("completed response must expose request ID")
+        .to_owned();
+
+    let status_response = client
+        .get(format!("{}/v1/requests/{request_id}", srv.url))
+        .bearer_auth("secret-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status_response.status(), 200);
+    let status: serde_json::Value = status_response.json().await.unwrap();
+    assert_eq!(status["request_id"], request_id);
+    assert_eq!(status["state"], "completed");
+    assert_eq!(status["resolved_model"], "m");
+
+    let missing = client
+        .get(format!("{}/v1/requests/missing", srv.url))
+        .bearer_auth("secret-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
 }
 
 #[tokio::test]
@@ -678,6 +1086,25 @@ fn real_pci_slot() -> Option<String> {
         .collect();
     slots.sort();
     slots.into_iter().next()
+}
+
+fn real_pci_slots(count: usize) -> Option<Vec<String>> {
+    let mut slots: Vec<String> = std::fs::read_dir("/sys/bus/pci/devices")
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    slots.sort();
+    (slots.len() >= count).then(|| slots.into_iter().take(count).collect())
+}
+
+/// Two resident 30 GB CUDA models share two synthetic 100 GB capacities;
+/// the 90 GB target fits only after one resident model is migrated.
+fn migration_cuda_yaml(listen_port: u16, slots: &[String]) -> String {
+    format!(
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  queue_wait_timeout_secs: 20\n  queue_heartbeat_secs: 1\n  migration_timeout_secs: 15\napikeys_file: \"apikeys.txt\"\ndevices:\n  cuda:\n    0:\n      pci: \"{}\"\n      vram_mb: 100000\n    1:\n      pci: \"{}\"\n      vram_mb: 100000\nmodels:\n  - name: m1\n    context_length: 4096\n    cmd: \"{STUB_BIN} --port {{port}} --chunks 60 --chunk-delay-ms 50\"\n    max_instances: 1\n    max_concurrent: 1\n    vram: 30000\n    cuda_devices: [0, 1]\n  - name: m2\n    context_length: 4096\n    cmd: \"{STUB_BIN} --port {{port}} --chunks 60 --chunk-delay-ms 50\"\n    max_instances: 1\n    max_concurrent: 1\n    vram: 30000\n    cuda_devices: [0, 1]\n  - name: large\n    context_length: 4096\n    cmd: \"{STUB_BIN} --port {{port}}\"\n    max_instances: 1\n    max_concurrent: 1\n    vram: 90000\n    cuda_devices: [0, 1]\naliases:\n  - name: preferred\n    targets: [large]\n    policy: prefer_order\n    make_room: migrate\n",
+        slots[0], slots[1]
+    )
 }
 
 /// Two CUDA models on one 48 GB GPU: m1 takes 20 GB, m2 takes 40 GB — they

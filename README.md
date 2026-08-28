@@ -126,6 +126,10 @@ bursts.
 | `max_instances` | `1` | Hard cap on scale-up (VRAM permitting). |
 | `max_concurrent` | `4` | Slots per instance - **the denominator of every threshold**. |
 | `queue_depth` | `10` | Where excess requests go while the gate refuses to spawn; 429 when full. |
+| `server.queue_wait_timeout_secs` | `3600` | Maximum accepted scheduler wait in seconds; `0` means no scheduler deadline. |
+| `server.queue_heartbeat_secs` | `10` | Pre-assignment SSE comment cadence; must be greater than zero. |
+| `server.migration_timeout_secs` | `0` | Migration transition deadline; `0` means no transition deadline. |
+| `server.eviction_policy` | `lru` | Victim ordering policy; only `lru` is currently implemented. |
 | `server.drain_idle_timeout_secs` | `3600` | The only n -> 0 mechanism. |
 | `vram` * `gpus` | - | Per-instance VRAM reservation; scale-up is also bounded by free VRAM in the device pool. |
 
@@ -166,6 +170,33 @@ also get the decision log lines: `autoscale: scaling up (load_m5=..., threshold=
 `autoscale: scaled down (load_m15=..., threshold=...)`, and `drain idle timeout
 expired, ...` for the n -> 0 unload. Actions are sparse by design: evaluated
 every 30 s and at most one per `cooldown_secs`.
+
+### Long queue waits and streaming heartbeats
+
+Accepted requests may wait for a slot, model load, or GPU migration for up to
+`server.queue_wait_timeout_secs` (3600 seconds by default). Set it to `0` to
+remove llm-orch's scheduler deadline; a reverse proxy or client can still
+impose its own total or idle timeout. `queue_depth` remains the per-model cap
+for new waiters, and a full queue returns `429` with `Retry-After`.
+
+For `stream: true`, llm-orch returns the SSE response before assignment and
+sends standards-compliant SSE comment heartbeats every
+`server.queue_heartbeat_secs` seconds. Comments do not become assistant text
+and are ignored by ordinary OpenAI-compatible parsers. After assignment, the
+normal backend SSE events and terminal marker are forwarded unchanged. Clients
+that opt into `X-LLM-Orch-Wait-Events: 1` may also receive versioned
+`llm-orch.status` events while waiting.
+
+A non-streaming JSON response cannot carry interim heartbeat bytes while
+remaining valid JSON. Such requests stay open and return one JSON response
+when assigned, or a gateway timeout when their scheduler deadline expires.
+Use streaming mode or poll the authenticated `GET /v1/requests/{request_id}`
+endpoint when a client or proxy needs visible progress during a long wait.
+Request statuses are kept in a bounded in-memory registry (up to 4096 entries;
+terminal records are retained for 15 minutes) and contain lifecycle metadata
+only—never prompts or API keys. Valid config reloads preserve accepted queue
+route snapshots; a migration rolls back before handoff if its placement becomes
+stale, while a completed victim handoff is not undone.
 
 ### ROCm (AMD) devices
 ROCm models use a separate llama.cpp backend namespace from Vulkan. This is

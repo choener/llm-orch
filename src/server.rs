@@ -54,6 +54,7 @@ pub fn build_router(state: AppState) -> Router {
         // OpenAI-compatible endpoints.
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/info", get(handlers::info_endpoint))
+        .route("/v1/requests/{request_id}", get(handlers::request_status))
         .route("/v1/chat/completions", post(handlers::chat_completions))
         .route("/v1/responses", post(handlers::responses))
         .route(
@@ -146,8 +147,14 @@ pub enum ApiError {
     #[error("no capacity: {0}")]
     NoCapacity(String),
 
+    #[error("queue wait timeout: {0}")]
+    QueueTimeout(String),
+
     #[error("model unavailable: {0}")]
     ModelUnavailable(String),
+
+    #[error("request not found: {0}")]
+    RequestNotFound(String),
 
     #[error("backend timeout: {0}")]
     BackendTimeout(String),
@@ -164,7 +171,9 @@ impl IntoResponse for ApiError {
             ApiError::ModelNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             ApiError::ModelBlocked(_) => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             ApiError::ModelUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
+            ApiError::RequestNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             ApiError::NoCapacity(_) => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
+            ApiError::QueueTimeout(_) => (StatusCode::GATEWAY_TIMEOUT, self.to_string()),
             ApiError::BackendTimeout(_) => (StatusCode::GATEWAY_TIMEOUT, self.to_string()),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
         };

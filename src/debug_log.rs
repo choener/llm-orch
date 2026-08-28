@@ -102,6 +102,12 @@ impl DebugLoggers {
     }
 }
 
+impl Default for DebugLoggers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Log entry ────────────────────────────────────────────────────────────────
 
 /// One line in a per-model debug log (JSONL).

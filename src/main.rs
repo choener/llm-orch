@@ -345,6 +345,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // configured drain timeout so one hung streaming request can't block
     // shutdown forever (plan §11).
     info!("stopping http server...");
+    // Stop new scheduler admissions before beginning axum's bounded drain;
+    // existing queued/running handlers may still finish or be cancelled by
+    // their clients during the configured shutdown window.
+    manager.begin_shutdown();
     drop(shutdown_tx);
     let drain_timeout =
         Duration::from_secs(shared_cfg.read().await.server.shutdown_drain_timeout_secs);

@@ -51,10 +51,10 @@ impl Config {
         let contents = std::fs::read_to_string(path)?;
         let mut config: Self = serde_yaml_ng::from_str(&contents)?;
         // Resolve relative apikeys_file against the config file's directory.
-        if config.apikeys_file.is_relative() {
-            if let Some(parent) = path.parent() {
-                config.apikeys_file = parent.join(&config.apikeys_file);
-            }
+        if config.apikeys_file.is_relative()
+            && let Some(parent) = path.parent()
+        {
+            config.apikeys_file = parent.join(&config.apikeys_file);
         }
         config.validate()?;
         Ok(config)
@@ -217,6 +217,17 @@ impl Config {
             }
         }
 
+        // --- queue and migration settings ---
+        if self.server.queue_heartbeat_secs == 0 {
+            return Err(ConfigError::Validation(
+                "server.queue_heartbeat_secs must be > 0".into(),
+            ));
+        }
+
+        // `0` is the documented unlimited value for both queue waiting and
+        // migration transitions; unsigned deserialization rejects negative
+        // values before semantic validation reaches this point.
+
         // --- port range ---
         match &self.server.port_range {
             PortRange::Range { start, end } => {
@@ -240,18 +251,18 @@ impl Config {
         }
 
         // --- keep-alive ---
-        if let Some(ref ka) = self.keep_alive {
-            if let Some(ref amd) = ka.amd {
-                if amd.sleep == 0 {
-                    return Err(ConfigError::Validation(
-                        "keep_alive.amd.sleep must be > 0 (0 would busy-loop the command)".into(),
-                    ));
-                }
-                if amd.cmd.trim().is_empty() {
-                    return Err(ConfigError::Validation(
-                        "keep_alive.amd.cmd must not be empty".into(),
-                    ));
-                }
+        if let Some(ref ka) = self.keep_alive
+            && let Some(ref amd) = ka.amd
+        {
+            if amd.sleep == 0 {
+                return Err(ConfigError::Validation(
+                    "keep_alive.amd.sleep must be > 0 (0 would busy-loop the command)".into(),
+                ));
+            }
+            if amd.cmd.trim().is_empty() {
+                return Err(ConfigError::Validation(
+                    "keep_alive.amd.cmd must not be empty".into(),
+                ));
             }
         }
 
@@ -388,6 +399,16 @@ impl Config {
 // Server settings
 // ---------------------------------------------------------------------------
 
+/// Policy used to order candidates when a make-room transition needs a
+/// victim.  LRU is the only implemented policy for now; the enum leaves an
+/// explicit validation point for future priority-aware policies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvictionPolicy {
+    #[default]
+    Lru,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     /// Address and port the HTTP server listens on, e.g. `"127.0.0.1:8080"`.
@@ -424,6 +445,27 @@ pub struct ServerConfig {
     /// See `docs/003-smart-handling.md`, decision 8.
     #[serde(default = "default_drain_idle_timeout")]
     pub drain_idle_timeout_secs: u64,
+
+    /// Maximum time an accepted request may wait for a scheduler assignment.
+    /// `0` disables the scheduler deadline; external clients/proxies may
+    /// still impose their own timeout.
+    #[serde(default = "default_queue_wait_timeout")]
+    pub queue_wait_timeout_secs: u64,
+
+    /// Interval for pre-assignment SSE comment heartbeats.
+    /// Must be greater than zero so queued streaming clients do not receive
+    /// an accidentally idle connection.
+    #[serde(default = "default_queue_heartbeat")]
+    pub queue_heartbeat_secs: u64,
+
+    /// Maximum duration of a migration transition.  `0` means no transition
+    /// deadline; active requests are never terminated by this setting.
+    #[serde(default)]
+    pub migration_timeout_secs: u64,
+
+    /// Victim ordering policy for make-room migrations.
+    #[serde(default)]
+    pub eviction_policy: EvictionPolicy,
 }
 
 fn default_listen() -> String {
@@ -440,6 +482,12 @@ fn default_shutdown_drain_timeout() -> u64 {
 }
 fn default_drain_idle_timeout() -> u64 {
     3600
+}
+fn default_queue_wait_timeout() -> u64 {
+    3600
+}
+fn default_queue_heartbeat() -> u64 {
+    10
 }
 
 /// Port allocation strategy for backend instances.
@@ -831,6 +879,23 @@ pub enum MakeRoomMode {
     /// Additionally drain busy *surplus duplicate* instances (never the last
     /// serving instance of a model), bounded by the alias's `drain_timeout`.
     DrainSurplus,
+    /// Migrate an eligible victim to another GPU before loading the requested
+    /// model.  This is an explicit opt-in and is handled by the migration
+    /// coordinator rather than the legacy eviction path.
+    Migrate,
+}
+
+impl MakeRoomMode {
+    /// Whether this mode uses the existing destructive/legacy make-room
+    /// implementation.  Migration must never silently fall through to it.
+    pub fn is_legacy_eviction(self) -> bool {
+        matches!(self, Self::EvictIdle | Self::DrainSurplus)
+    }
+
+    /// Whether this mode requests the transactional migration path.
+    pub fn is_migration(self) -> bool {
+        self == Self::Migrate
+    }
 }
 
 /// Deserialize a field that accepts either a single string or a sequence of
@@ -1349,6 +1414,18 @@ models:
     }
 
     #[test]
+    fn accepts_migration_make_room_mode() {
+        let yaml = BASE.replace(
+            "apikeys_file: apikeys.txt",
+            "apikeys_file: apikeys.txt\naliases:\n  - name: a\n    targets: [m]\n    make_room: migrate",
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.aliases[0].make_room, MakeRoomMode::Migrate);
+        assert!(cfg.aliases[0].make_room.is_migration());
+        assert!(!cfg.aliases[0].make_room.is_legacy_eviction());
+    }
+
+    #[test]
     fn accepts_targets_list_with_explicit_settings() {
         let yaml = BASE.replace(
             "cmd: \"sleep 3600\"",
@@ -1411,6 +1488,38 @@ models:
             "apikeys_file: apikeys.txt\naliases:\n  - name: a\n    target: m\n    system_prompt: hi\n    prompt_template: \"{prompt}\"",
         );
         parse(&yaml).unwrap();
+    }
+
+    #[test]
+    fn queue_and_migration_defaults_are_backward_compatible() {
+        let cfg = parse(BASE).unwrap();
+        assert_eq!(cfg.server.queue_wait_timeout_secs, 3600);
+        assert_eq!(cfg.server.queue_heartbeat_secs, 10);
+        assert_eq!(cfg.server.migration_timeout_secs, 0);
+        assert_eq!(cfg.server.eviction_policy, EvictionPolicy::Lru);
+    }
+
+    #[test]
+    fn accepts_unlimited_queue_and_migration_timeouts() {
+        let yaml = BASE.replace(
+            "server: {}",
+            "server:\n  queue_wait_timeout_secs: 0\n  migration_timeout_secs: 0",
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.server.queue_wait_timeout_secs, 0);
+        assert_eq!(cfg.server.migration_timeout_secs, 0);
+    }
+
+    #[test]
+    fn rejects_zero_queue_heartbeat() {
+        let yaml = BASE.replace("server: {}", "server:\n  queue_heartbeat_secs: 0");
+        expect_validation_error(&yaml, "queue_heartbeat_secs must be > 0");
+    }
+
+    #[test]
+    fn rejects_unknown_eviction_policy() {
+        let yaml = BASE.replace("server: {}", "server:\n  eviction_policy: priority_lru");
+        assert!(serde_yaml_ng::from_str::<Config>(&yaml).is_err());
     }
 
     #[test]

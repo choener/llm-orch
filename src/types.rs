@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
+use std::collections::HashMap;
 
 // ── Chat completions request ─────────────────────────────────────────────────
 
@@ -196,6 +197,7 @@ pub struct InfoResponse {
     pub aliases: Vec<AliasInfo>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub gpus: Vec<GpuStatus>,
+    pub metrics: SchedulerMetrics,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -206,6 +208,7 @@ pub struct ModelInfo {
     pub max_instances: usize,
     pub queue_depth_used: usize,
     pub queue_depth_max: usize,
+    pub queue: QueueStatus,
     pub blocked: bool,
     /// 1 / 5 / 15-minute EMA of concurrent in-flight requests.
     pub load_m1: f64,
@@ -227,6 +230,130 @@ pub struct ModelInfo {
 pub struct AliasInfo {
     pub name: String,
     pub targets: Vec<String>,
+}
+
+/// Aggregate scheduler counters for diagnosing queue starvation and VRAM
+/// migration churn.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SchedulerMetrics {
+    pub queue_enqueued_total: u64,
+    pub queue_assigned_total: u64,
+    pub queue_cancelled_total: u64,
+    pub queue_expired_total: u64,
+    pub migration_started_total: u64,
+    pub migration_completed_total: u64,
+    pub migration_failed_total: u64,
+    pub reservation_cleanup_total: u64,
+}
+
+// ── Queue/migration/request status ──────────────────────────────────────────
+
+/// State exposed for an accepted request's scheduler lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestState {
+    Queued,
+    WaitingForSlot,
+    WaitingForMigration,
+    WaitingForSpawn,
+    LoadingReplacement,
+    WaitingForDrain,
+    LoadingTarget,
+    Assigned,
+    Running,
+    Completed,
+    Expired,
+    Cancelled,
+    Shutdown,
+    Failed,
+}
+
+/// Phase exposed for a shared make-room migration transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationPhase {
+    Planning,
+    Reserving,
+    LoadingReplacement,
+    WaitingForDrain,
+    Handoff,
+    LoadingTarget,
+    Completed,
+    RolledBack,
+    Cancelled,
+    Failed,
+}
+
+/// Aggregate queue counts used by model and admin status responses.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QueueStatus {
+    pub waiting_for_slot: usize,
+    pub waiting_for_migration: usize,
+    pub waiting_for_spawn: usize,
+}
+
+/// Status for a shared migration operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationStatus {
+    pub migration_id: u64,
+    pub logical_model: String,
+    pub phase: MigrationPhase,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub victim_instance: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub victim_gpu: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub destination_gpu: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_gpu: Vec<String>,
+    pub active_victim_slots: usize,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub reservation_peak_vram: HashMap<String, u64>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub reservation_final_vram: HashMap<String, u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+}
+
+/// Request status returned by the authenticated request-status endpoint.
+///
+/// Timestamps use the same string representation as `CompletionRecord`; the
+/// scheduler owns formatting wall-clock values while duration remains a
+/// numeric millisecond value for clients and metrics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestStatus {
+    pub request_id: String,
+    pub logical_model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_model: Option<String>,
+    pub state: RequestState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue: Option<QueueStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_position: Option<usize>,
+    pub enqueued_at: String,
+    pub wait_duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub migration_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub migration_phase: Option<MigrationPhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub victim_instance: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub victim_gpu: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub destination_gpu: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_gpu: Vec<String>,
+    pub active_victim_slots: usize,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub reservation_peak_vram: HashMap<String, u64>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub reservation_final_vram: HashMap<String, u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
 }
 
 // ── GPU status (for /admin/status) ───────────────────────────────────────────
@@ -376,6 +503,53 @@ fn bool_is_false(b: &bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduler_status_enums_use_stable_snake_case_wire_names() {
+        assert_eq!(
+            serde_json::to_string(&RequestState::WaitingForMigration).unwrap(),
+            "\"waiting_for_migration\""
+        );
+        assert_eq!(
+            serde_json::from_str::<MigrationPhase>("\"loading_target\"").unwrap(),
+            MigrationPhase::LoadingTarget
+        );
+    }
+
+    #[test]
+    fn request_status_round_trips_without_optional_payload_fields() {
+        let status = RequestStatus {
+            request_id: "req-1".into(),
+            logical_model: "large".into(),
+            resolved_model: Some("large-v1".into()),
+            state: RequestState::WaitingForDrain,
+            queue: Some(QueueStatus {
+                waiting_for_slot: 1,
+                waiting_for_migration: 2,
+                waiting_for_spawn: 0,
+            }),
+            queue_position: Some(2),
+            enqueued_at: "2025-01-01T00:00:00.000Z".into(),
+            wait_duration_ms: 1200,
+            deadline: None,
+            migration_id: Some(7),
+            migration_phase: Some(MigrationPhase::WaitingForDrain),
+            victim_instance: Some("small@1#0".into()),
+            victim_gpu: vec!["0000:01:00.0".into()],
+            destination_gpu: vec!["0000:02:00.0".into()],
+            target_gpu: vec!["0000:01:00.0".into()],
+            active_victim_slots: 1,
+            reservation_peak_vram: HashMap::from([("0000:02:00.0".into(), 30)]),
+            reservation_final_vram: HashMap::from([("0000:01:00.0".into(), 90)]),
+            failure_reason: None,
+        };
+        let encoded = serde_json::to_value(&status).unwrap();
+        assert!(encoded.get("failure_reason").is_none());
+        assert!(encoded.get("deadline").is_none());
+        let decoded: RequestStatus = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.request_id, "req-1");
+        assert_eq!(decoded.state, RequestState::WaitingForDrain);
+    }
 
     #[test]
     fn chat_request_round_trip_omits_stream_when_false() {

@@ -30,15 +30,16 @@
 use axum::{
     Json,
     body::Bytes,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, header},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
 };
-use futures_util::stream::Stream;
+use futures_util::stream::{self, Stream, StreamExt};
 use std::convert::Infallible;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -47,7 +48,7 @@ use tracing::{debug, info, warn};
 use crate::config::{AliasConfig, AliasPolicy, MakeRoomMode};
 use crate::debug_log::{DebugLogEntry, DebugStreamContext, ts_now};
 use crate::instance::SlotGuard;
-use crate::scheduler::{AcquireError, InstanceManager};
+use crate::scheduler::{AcquireError, Admission, InstanceManager, PendingAssignment};
 use crate::server::{ApiError, ApiKey, AppState};
 use crate::types::*;
 use tracing::Instrument;
@@ -136,10 +137,7 @@ pub async fn info_endpoint(
         }; // cfg read guard dropped
 
         // ── 2. Read instance state, clone what we need, drop the guard. ─────
-        let instance_counts = {
-            let instances = state.manager.instance_counts();
-            instances
-        }; // instances read guard dropped
+        let instance_counts = state.manager.instance_counts();
 
         // ── 3. Read GPU snapshot. ────────────────────────────────────────────
         let gpu_metrics = {
@@ -168,6 +166,7 @@ pub async fn info_endpoint(
                     max_instances: m.max_instances,
                     queue_depth_used: state.manager.queue_depth(&m.name),
                     queue_depth_max: m.queue_depth,
+                    queue: state.manager.queue_status(&m.name),
                     blocked: state.manager.is_blocked(&m.name),
                     load_m1: mets.map(|x| x.load_m1).unwrap_or(0.0),
                     load_m5: mets.map(|x| x.load_m5).unwrap_or(0.0),
@@ -220,10 +219,24 @@ pub async fn info_endpoint(
             models: model_infos,
             aliases: alias_infos,
             gpus: gpu_statuses,
+            metrics: state.manager.scheduler_metrics_snapshot(),
         }))
     }
     .instrument(span)
     .await
+}
+
+/// `GET /v1/requests/{request_id}` — authenticated request lifecycle status.
+pub async fn request_status(
+    State(state): State<AppState>,
+    _key: ApiKey,
+    Path(request_id): Path<String>,
+) -> Result<Json<RequestStatus>, ApiError> {
+    state
+        .manager
+        .request_status(&request_id)
+        .map(Json)
+        .ok_or(ApiError::RequestNotFound(request_id))
 }
 
 // ── /v1/chat/completions ─────────────────────────────────────────────────────
@@ -252,6 +265,7 @@ pub async fn info_endpoint(
 pub async fn chat_completions(
     State(state): State<AppState>,
     key: ApiKey,
+    headers: HeaderMap,
     Json(mut request): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -260,11 +274,20 @@ pub async fn chat_completions(
         id = %request_id,
         model = %request.model,
     );
+    let wait_events = wait_events_requested(&headers);
     async {
         // ── 1. Resolve alias → candidate models; extract the backend
         //    timeouts.  Read config, extract what we need, drop the guard.
         let request_model = request.model.clone();
-        let (candidates, policy, make_room, drain_timeout, idle_timeout, total_timeout) = {
+        let (
+            candidates,
+            policy,
+            make_room,
+            drain_timeout,
+            idle_timeout,
+            total_timeout,
+            heartbeat_secs,
+        ) = {
             let cfg = state.config.read().await;
             let (c, p, mr, dt) = resolve_alias(&cfg.aliases, &request.model);
             if !c.iter().any(|n| cfg.models.iter().any(|m| &m.name == n)) {
@@ -277,8 +300,10 @@ pub async fn chat_completions(
                 dt,
                 std::time::Duration::from_secs(cfg.server.backend_idle_timeout_secs),
                 std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs),
+                cfg.server.queue_heartbeat_secs,
             )
         }; // cfg read guard dropped — future is `Send`
+        state.manager.register_request(&request_id, &request_model);
 
         debug!(
             request_model = %request_model,
@@ -288,12 +313,67 @@ pub async fn chat_completions(
             "resolved candidates"
         );
 
-        // ── 2. Acquire an instance slot on one of the candidates (or queue).
-        let (model_name, guard) = state
+        // ── 2. Register admission before any slow spawn or migration.
+        let admission = state
             .manager
-            .acquire_for_candidates(&candidates, policy, make_room, drain_timeout)
+            .admit(
+                &candidates,
+                policy,
+                make_room,
+                drain_timeout,
+                Some(&request_id),
+            )
             .await
-            .map_err(|e| acquire_error(&request_model, e))?;
+            .map_err(|e| {
+                acquire_error_for_request(&state.manager, &request_id, &request_model, e)
+            })?;
+        let (model_name, guard) = match admission {
+            Admission::Assigned(model_name, guard) => {
+                state.manager.update_request_state(
+                    &request_id,
+                    RequestState::Assigned,
+                    Some(&model_name),
+                    None,
+                );
+                (model_name, guard)
+            }
+            Admission::Waiting(pending) if request.stream => {
+                state.manager.update_request_state(
+                    &request_id,
+                    RequestState::WaitingForSlot,
+                    None,
+                    None,
+                );
+                let context = WaitingSseContext {
+                    state: state.clone(),
+                    request_body: serde_json::to_value(&request).unwrap_or_default(),
+                    requested_model: request_model.clone(),
+                    backend_path: "/v1/chat/completions".into(),
+                    idle_timeout,
+                    heartbeat_secs,
+                    api_user: key.label.clone(),
+                    request_id: request_id.clone(),
+                    alias: Some(request_model.clone()),
+                    record_debug: true,
+                    status_events: wait_events,
+                };
+                let stream = waiting_sse_stream(pending, context);
+                return Ok(sse_response(stream, &request_id));
+            }
+            Admission::Waiting(pending) => {
+                let assigned = pending
+                    .wait()
+                    .await
+                    .map_err(|e| acquire_error(&request_model, e))?;
+                state.manager.update_request_state(
+                    &request_id,
+                    RequestState::Assigned,
+                    Some(&assigned.0),
+                    None,
+                );
+                assigned
+            }
+        };
 
         // ── 3. Per-model debug log for the *chosen* model. ──────────────────
         let debug_log_path: Option<std::path::PathBuf> = {
@@ -373,9 +453,7 @@ pub async fn chat_completions(
             .await
             .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
 
-            Ok(Sse::new(stream)
-                .keep_alive(KeepAlive::default())
-                .into_response())
+            Ok(sse_response(stream, &request_id))
         } else {
             // Non-streaming mode: aggregate the backend response.
             let t0 = std::time::Instant::now();
@@ -439,8 +517,17 @@ pub async fn chat_completions(
                     },
                 );
             }
+            state.manager.update_request_state(
+                &request_id,
+                RequestState::Completed,
+                Some(&model_name),
+                None,
+            );
 
-            Ok(Json(response_body).into_response())
+            Ok(response_with_request_id(
+                Json(response_body).into_response(),
+                &request_id,
+            ))
         }
     }
     .instrument(span)
@@ -468,6 +555,7 @@ pub async fn chat_completions(
 pub async fn responses(
     State(state): State<AppState>,
     key: ApiKey,
+    headers: HeaderMap,
     Json(mut request): Json<serde_json::Value>,
 ) -> Result<Response, ApiError> {
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -486,10 +574,19 @@ pub async fn responses(
         id = %request_id,
         model = %requested_model,
     );
+    let wait_events = wait_events_requested(&headers);
     async {
         // ── 1. Resolve alias → candidate models; extract the backend
         //    timeouts. ───────────────────────────────────────────────────────
-        let (candidates, policy, make_room, drain_timeout, idle_timeout, total_timeout) = {
+        let (
+            candidates,
+            policy,
+            make_room,
+            drain_timeout,
+            idle_timeout,
+            total_timeout,
+            heartbeat_secs,
+        ) = {
             let cfg = state.config.read().await;
             let (c, p, mr, dt) = resolve_alias(&cfg.aliases, &requested_model);
             if !c.iter().any(|n| cfg.models.iter().any(|m| &m.name == n)) {
@@ -502,8 +599,12 @@ pub async fn responses(
                 dt,
                 std::time::Duration::from_secs(cfg.server.backend_idle_timeout_secs),
                 std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs),
+                cfg.server.queue_heartbeat_secs,
             )
         }; // cfg read guard dropped — future is `Send`
+        state
+            .manager
+            .register_request(&request_id, &requested_model);
 
         debug!(
             request_model = %requested_model,
@@ -513,12 +614,67 @@ pub async fn responses(
             "resolved candidates"
         );
 
-        // ── 2. Acquire an instance slot on one of the candidates (or queue).
-        let (model_name, guard) = state
+        // ── 2. Register admission before any slow spawn or migration.
+        let admission = state
             .manager
-            .acquire_for_candidates(&candidates, policy, make_room, drain_timeout)
+            .admit(
+                &candidates,
+                policy,
+                make_room,
+                drain_timeout,
+                Some(&request_id),
+            )
             .await
-            .map_err(|e| acquire_error(&requested_model, e))?;
+            .map_err(|e| {
+                acquire_error_for_request(&state.manager, &request_id, &requested_model, e)
+            })?;
+        let (model_name, guard) = match admission {
+            Admission::Assigned(model_name, guard) => {
+                state.manager.update_request_state(
+                    &request_id,
+                    RequestState::Assigned,
+                    Some(&model_name),
+                    None,
+                );
+                (model_name, guard)
+            }
+            Admission::Waiting(pending) if stream_requested => {
+                state.manager.update_request_state(
+                    &request_id,
+                    RequestState::WaitingForSlot,
+                    None,
+                    None,
+                );
+                let context = WaitingSseContext {
+                    state: state.clone(),
+                    request_body: request.clone(),
+                    requested_model: requested_model.clone(),
+                    backend_path: "/v1/responses".into(),
+                    idle_timeout,
+                    heartbeat_secs,
+                    api_user: key.label.clone(),
+                    request_id: request_id.clone(),
+                    alias: Some(requested_model.clone()),
+                    record_debug: true,
+                    status_events: wait_events,
+                };
+                let stream = waiting_sse_stream(pending, context);
+                return Ok(sse_response(stream, &request_id));
+            }
+            Admission::Waiting(pending) => {
+                let assigned = pending
+                    .wait()
+                    .await
+                    .map_err(|e| acquire_error(&requested_model, e))?;
+                state.manager.update_request_state(
+                    &request_id,
+                    RequestState::Assigned,
+                    Some(&assigned.0),
+                    None,
+                );
+                assigned
+            }
+        };
 
         // ── 3. Per-model debug log for the *chosen* model. ──────────────────
         let debug_log_path: Option<std::path::PathBuf> = {
@@ -596,9 +752,7 @@ pub async fn responses(
             .await
             .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
 
-            Ok(Sse::new(stream)
-                .keep_alive(KeepAlive::default())
-                .into_response())
+            Ok(sse_response(stream, &request_id))
         } else {
             // Non-streaming mode: aggregate the backend response.
             let t0 = std::time::Instant::now();
@@ -669,8 +823,17 @@ pub async fn responses(
                     duration_ms: elapsed.as_millis() as u64,
                 },
             );
+            state.manager.update_request_state(
+                &request_id,
+                RequestState::Completed,
+                Some(&model_name),
+                None,
+            );
 
-            Ok(Json(response_body).into_response())
+            Ok(response_with_request_id(
+                Json(response_body).into_response(),
+                &request_id,
+            ))
         }
     }
     .instrument(span)
@@ -843,6 +1006,7 @@ pub async fn responses_input_tokens(
 pub async fn completions(
     State(state): State<AppState>,
     key: ApiKey,
+    headers: HeaderMap,
     Json(mut request): Json<CompletionRequest>,
 ) -> Result<Response, ApiError> {
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -851,9 +1015,18 @@ pub async fn completions(
         id = %request_id,
         model = %request.model,
     );
+    let wait_events = wait_events_requested(&headers);
     async {
         // ── 1. Resolve alias → candidates; read the backend timeouts. ──────
-        let (candidates, policy, make_room, drain_timeout, idle_timeout, total_timeout) = {
+        let (
+            candidates,
+            policy,
+            make_room,
+            drain_timeout,
+            idle_timeout,
+            total_timeout,
+            heartbeat_secs,
+        ) = {
             let cfg = state.config.read().await;
             let (c, p, mr, dt) = resolve_alias(&cfg.aliases, &request.model);
             if !c.iter().any(|n| cfg.models.iter().any(|m| &m.name == n)) {
@@ -866,15 +1039,72 @@ pub async fn completions(
                 dt,
                 std::time::Duration::from_secs(cfg.server.backend_idle_timeout_secs),
                 std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs),
+                cfg.server.queue_heartbeat_secs,
             )
         };
+        state.manager.register_request(&request_id, &request.model);
 
-        // ── 2. Acquire an instance slot on one of the candidates (or queue).
-        let (model_name, guard) = state
+        // ── 2. Register admission before any slow spawn or migration.
+        let admission = state
             .manager
-            .acquire_for_candidates(&candidates, policy, make_room, drain_timeout)
+            .admit(
+                &candidates,
+                policy,
+                make_room,
+                drain_timeout,
+                Some(&request_id),
+            )
             .await
-            .map_err(|e| acquire_error(&request.model, e))?;
+            .map_err(|e| {
+                acquire_error_for_request(&state.manager, &request_id, &request.model, e)
+            })?;
+        let (model_name, guard) = match admission {
+            Admission::Assigned(model_name, guard) => {
+                state.manager.update_request_state(
+                    &request_id,
+                    RequestState::Assigned,
+                    Some(&model_name),
+                    None,
+                );
+                (model_name, guard)
+            }
+            Admission::Waiting(pending) if request.stream => {
+                state.manager.update_request_state(
+                    &request_id,
+                    RequestState::WaitingForSlot,
+                    None,
+                    None,
+                );
+                let context = WaitingSseContext {
+                    state: state.clone(),
+                    request_body: serde_json::to_value(&request).unwrap_or_default(),
+                    requested_model: request.model.clone(),
+                    backend_path: "/v1/completions".into(),
+                    idle_timeout,
+                    heartbeat_secs,
+                    api_user: key.label.clone(),
+                    request_id: request_id.clone(),
+                    alias: Some(request.model.clone()),
+                    record_debug: false,
+                    status_events: wait_events,
+                };
+                let stream = waiting_sse_stream(pending, context);
+                return Ok(sse_response(stream, &request_id));
+            }
+            Admission::Waiting(pending) => {
+                let assigned = pending
+                    .wait()
+                    .await
+                    .map_err(|e| acquire_error(&request.model, e))?;
+                state.manager.update_request_state(
+                    &request_id,
+                    RequestState::Assigned,
+                    Some(&assigned.0),
+                    None,
+                );
+                assigned
+            }
+        };
 
         // Capture instance ID now that we hold the slot guard.
         let instance_id = {
@@ -911,9 +1141,7 @@ pub async fn completions(
             .await
             .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
 
-            Ok(Sse::new(stream)
-                .keep_alive(KeepAlive::default())
-                .into_response())
+            Ok(sse_response(stream, &request_id))
         } else {
             let t0 = std::time::Instant::now();
             let response_body = forward_request_aggregate(
@@ -926,8 +1154,17 @@ pub async fn completions(
             let elapsed = t0.elapsed();
 
             log_completion(&response_body, &model_name, &instance_id, elapsed);
+            state.manager.update_request_state(
+                &request_id,
+                RequestState::Completed,
+                Some(&model_name),
+                None,
+            );
 
-            Ok(Json(response_body).into_response())
+            Ok(response_with_request_id(
+                Json(response_body).into_response(),
+                &request_id,
+            ))
         }
     }
     .instrument(span)
@@ -1228,13 +1465,24 @@ struct AudioTarget {
     debug_log_path: Option<std::path::PathBuf>,
 }
 
+enum AudioAdmission {
+    Assigned(AudioTarget),
+    Waiting {
+        pending: PendingAssignment,
+        idle_timeout: std::time::Duration,
+        total_timeout: std::time::Duration,
+        heartbeat_secs: u64,
+    },
+}
+
 /// Resolve `request_model` (alias → config model), verify it exists, and
 /// acquire an instance slot (spawning on demand).  Lock-free across awaits.
 async fn acquire_audio_target(
     state: &AppState,
     request_model: &str,
-) -> Result<AudioTarget, ApiError> {
-    let (candidates, policy, make_room, drain_timeout, idle_timeout, total_timeout) = {
+    request_id: &str,
+) -> Result<AudioAdmission, ApiError> {
+    let (candidates, policy, make_room, drain_timeout, idle_timeout, total_timeout, heartbeat_secs) = {
         let cfg = state.config.read().await;
         let (c, p, mr, dt) = resolve_alias(&cfg.aliases, request_model);
         if !c.iter().any(|n| cfg.models.iter().any(|m| &m.name == n)) {
@@ -1247,16 +1495,50 @@ async fn acquire_audio_target(
             dt,
             std::time::Duration::from_secs(cfg.server.backend_idle_timeout_secs),
             std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs),
+            cfg.server.queue_heartbeat_secs,
         )
     };
 
-    let (model_name, guard) = state
+    let admission = state
         .manager
-        .acquire_for_candidates(&candidates, policy, make_room, drain_timeout)
+        .admit(
+            &candidates,
+            policy,
+            make_room,
+            drain_timeout,
+            Some(request_id),
+        )
         .await
-        .map_err(|e| acquire_error(request_model, e))?;
+        .map_err(|e| acquire_error_for_request(&state.manager, request_id, request_model, e))?;
+    match admission {
+        Admission::Waiting(pending) => Ok(AudioAdmission::Waiting {
+            pending,
+            idle_timeout,
+            total_timeout,
+            heartbeat_secs,
+        }),
+        Admission::Assigned(model_name, guard) => Ok(AudioAdmission::Assigned(
+            build_audio_target(
+                state,
+                request_model,
+                model_name,
+                guard,
+                idle_timeout,
+                total_timeout,
+            )
+            .await?,
+        )),
+    }
+}
 
-    // Per-model debug log for the *chosen* model.
+async fn build_audio_target(
+    state: &AppState,
+    request_model: &str,
+    model_name: String,
+    guard: SlotGuard,
+    idle_timeout: std::time::Duration,
+    total_timeout: std::time::Duration,
+) -> Result<AudioTarget, ApiError> {
     let debug_log_path: Option<std::path::PathBuf> = {
         let cfg = state.config.read().await;
         cfg.models
@@ -1264,12 +1546,10 @@ async fn acquire_audio_target(
             .find(|m| m.name == model_name)
             .and_then(|m| m.debug_log.clone())
     };
-
     let (port, instance_id) = {
         let inst = guard.handle().inner().lock().unwrap();
         (inst.port, inst.id.clone())
     };
-
     Ok(AudioTarget {
         model_name,
         request_model: request_model.to_owned(),
@@ -1280,6 +1560,36 @@ async fn acquire_audio_target(
         total_timeout,
         debug_log_path,
     })
+}
+
+async fn finish_audio_admission(
+    state: &AppState,
+    request_model: &str,
+    admission: AudioAdmission,
+) -> Result<AudioTarget, ApiError> {
+    match admission {
+        AudioAdmission::Assigned(target) => Ok(target),
+        AudioAdmission::Waiting {
+            pending,
+            idle_timeout,
+            total_timeout,
+            ..
+        } => {
+            let (model_name, guard) = pending
+                .wait()
+                .await
+                .map_err(|e| acquire_error(request_model, e))?;
+            build_audio_target(
+                state,
+                request_model,
+                model_name,
+                guard,
+                idle_timeout,
+                total_timeout,
+            )
+            .await
+        }
+    }
 }
 
 /// Forward a raw POST (body bytes + Content-Type) to an audio backend and
@@ -1404,9 +1714,7 @@ async fn forward_audio_post(
             request_id.to_owned(),
             target.idle_timeout,
         );
-        return Ok(Sse::new(stream)
-            .keep_alive(KeepAlive::default())
-            .into_response());
+        return Ok(sse_response(Box::pin(stream), request_id));
     }
 
     // Aggregate the full body (wav, JSON, raw PCM) with the total timeout.
@@ -1465,6 +1773,7 @@ async fn forward_audio_post(
 pub async fn audio_speech(
     State(state): State<AppState>,
     key: ApiKey,
+    headers: HeaderMap,
     Json(mut body): Json<serde_json::Value>,
 ) -> Result<Response, ApiError> {
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -1474,8 +1783,40 @@ pub async fn audio_speech(
         .ok_or_else(|| ApiError::BadRequest("missing 'model' field".into()))?
         .to_owned();
     let span = tracing::info_span!("audio_speech", id = %request_id, model = %request_model);
+    let wait_events = wait_events_requested(&headers);
     async {
-        let target = acquire_audio_target(&state, &request_model).await?;
+        let admission = acquire_audio_target(&state, &request_model, &request_id).await?;
+        let wants_stream = body
+            .get("stream")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let target = match admission {
+            AudioAdmission::Waiting {
+                pending,
+                idle_timeout,
+                heartbeat_secs,
+                ..
+            } if wants_stream => {
+                let context = WaitingSseContext {
+                    state: state.clone(),
+                    request_body: body.clone(),
+                    requested_model: request_model.clone(),
+                    backend_path: "/v1/audio/speech".into(),
+                    idle_timeout,
+                    heartbeat_secs,
+                    api_user: key.label.clone(),
+                    request_id: request_id.clone(),
+                    alias: Some(request_model.clone()),
+                    record_debug: true,
+                    status_events: wait_events,
+                };
+                return Ok(sse_response(
+                    waiting_sse_stream(pending, context),
+                    &request_id,
+                ));
+            }
+            admission => finish_audio_admission(&state, &request_model, admission).await?,
+        };
         // Forward the resolved model name (strict backends validate it).
         body["model"] = serde_json::Value::String(target.model_name.clone());
         let bytes = serde_json::to_vec(&body)
@@ -1515,6 +1856,7 @@ pub async fn audio_transcriptions(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_owned();
+    let wait_events = wait_events_requested(&headers);
 
     if content_type.starts_with("multipart/form-data") {
         let boundary = multipart_boundary(&content_type)
@@ -1526,7 +1868,8 @@ pub async fn audio_transcriptions(
         let span =
             tracing::info_span!("audio_transcription", id = %request_id, model = %request_model);
         return async {
-            let target = acquire_audio_target(&state, &request_model).await?;
+            let admission = acquire_audio_target(&state, &request_model, &request_id).await?;
+            let target = finish_audio_admission(&state, &request_model, admission).await?;
             let body = if target.model_name == request_model {
                 body.to_vec()
             } else {
@@ -1558,7 +1901,38 @@ pub async fn audio_transcriptions(
         .to_owned();
     let span = tracing::info_span!("audio_transcription", id = %request_id, model = %request_model);
     async {
-        let target = acquire_audio_target(&state, &request_model).await?;
+        let admission = acquire_audio_target(&state, &request_model, &request_id).await?;
+        let wants_stream = json
+            .get("stream")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let target = match admission {
+            AudioAdmission::Waiting {
+                pending,
+                idle_timeout,
+                heartbeat_secs,
+                ..
+            } if wants_stream => {
+                let context = WaitingSseContext {
+                    state: state.clone(),
+                    request_body: json.clone(),
+                    requested_model: request_model.clone(),
+                    backend_path: "/v1/audio/transcriptions".into(),
+                    idle_timeout,
+                    heartbeat_secs,
+                    api_user: key.label.clone(),
+                    request_id: request_id.clone(),
+                    alias: Some(request_model.clone()),
+                    record_debug: true,
+                    status_events: wait_events,
+                };
+                return Ok(sse_response(
+                    waiting_sse_stream(pending, context),
+                    &request_id,
+                ));
+            }
+            admission => finish_audio_admission(&state, &request_model, admission).await?,
+        };
         json["model"] = serde_json::Value::String(target.model_name.clone());
         let bytes = serde_json::to_vec(&json)
             .map_err(|e| ApiError::BadRequest(format!("failed to encode request: {}", e)))?;
@@ -1590,7 +1964,8 @@ pub async fn audio_voices(
         .clone();
     let span = tracing::info_span!("audio_voices", id = %request_id, model = %request_model);
     async {
-        let target = acquire_audio_target(&state, &request_model).await?;
+        let admission = acquire_audio_target(&state, &request_model, &request_id).await?;
+        let target = finish_audio_admission(&state, &request_model, admission).await?;
         let backend_url = format!(
             "http://127.0.0.1:{}/v1/audio/voices?model={}",
             target.port,
@@ -1855,11 +2230,34 @@ pub async fn admin_unblock(
 // ── Helpers (lock-free) ──────────────────────────────────────────────────────
 
 /// Map an instance-acquisition failure to the HTTP error for this model.
+fn acquire_error_for_request(
+    manager: &InstanceManager,
+    request_id: &str,
+    model_name: &str,
+    error: AcquireError,
+) -> ApiError {
+    manager.update_request_state(
+        request_id,
+        if matches!(error, AcquireError::QueueTimeout) {
+            RequestState::Expired
+        } else {
+            RequestState::Failed
+        },
+        None,
+        Some("request admission failed"),
+    );
+    acquire_error(model_name, error)
+}
+
 fn acquire_error(model_name: &str, e: AcquireError) -> ApiError {
     match e {
         AcquireError::Blocked => ApiError::ModelBlocked(model_name.to_owned()),
         AcquireError::NoCapacity => ApiError::NoCapacity(format!(
             "model '{}' is at capacity and the queue is full",
+            model_name
+        )),
+        AcquireError::QueueTimeout => ApiError::QueueTimeout(format!(
+            "model '{}' did not receive capacity before the queue wait deadline",
             model_name
         )),
         AcquireError::Unavailable => ApiError::ModelUnavailable(format!(
@@ -2009,6 +2407,7 @@ async fn forward_request_aggregate(
 ///
 /// The `SlotGuard` is moved into the returned stream so the in-flight
 /// slot is released when the stream ends (via `Drop`).
+#[allow(clippy::too_many_arguments)]
 async fn build_sse_stream(
     client: reqwest::Client,
     backend_url: String,
@@ -2131,6 +2530,276 @@ async fn build_sse_stream(
     Ok(Box::pin(sse_stream))
 }
 
+type EventStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
+type AssignmentFuture =
+    Pin<Box<dyn Future<Output = Result<(String, SlotGuard), AcquireError>> + Send>>;
+
+/// Data needed to finish constructing an SSE backend stream after a queued
+/// request receives a slot.
+struct WaitingSseContext {
+    state: AppState,
+    request_body: serde_json::Value,
+    requested_model: String,
+    backend_path: String,
+    idle_timeout: std::time::Duration,
+    heartbeat_secs: u64,
+    api_user: String,
+    request_id: String,
+    alias: Option<String>,
+    record_debug: bool,
+    status_events: bool,
+}
+
+/// State for the pre-assignment SSE response.  The assignment future remains
+/// alive between comment heartbeats; once it resolves, the state becomes the
+/// ordinary backend stream.
+enum WaitingSseState {
+    Waiting {
+        assignment: AssignmentFuture,
+        context: Box<WaitingSseContext>,
+        heartbeat: Pin<Box<tokio::time::Sleep>>,
+    },
+    Forward(EventStream),
+}
+
+/// Build an SSE stream immediately after queue admission.  Before assignment
+/// it emits only standard SSE comment frames; after assignment it splices the
+/// normal OpenAI/backend stream without synthetic data chunks.
+fn waiting_sse_stream(pending: PendingAssignment, context: WaitingSseContext) -> EventStream {
+    let heartbeat_secs = context.heartbeat_secs.max(1);
+    let assignment: AssignmentFuture = Box::pin(pending.wait());
+    let heartbeat = Box::pin(tokio::time::sleep(std::time::Duration::from_secs(
+        heartbeat_secs,
+    )));
+    Box::pin(stream::unfold(
+        WaitingSseState::Waiting {
+            assignment,
+            context: Box::new(context),
+            heartbeat,
+        },
+        move |state| async move {
+            match state {
+                WaitingSseState::Waiting {
+                    mut assignment,
+                    context,
+                    mut heartbeat,
+                } => {
+                    tokio::select! {
+                        result = assignment.as_mut() => {
+                            let next = match result {
+                                Ok((model_name, guard)) => {
+                                    build_assigned_sse_stream(*context, model_name, guard).await
+                                }
+                                Err(error) => {
+                                    let state = if matches!(error, AcquireError::QueueTimeout) {
+                                        RequestState::Expired
+                                    } else {
+                                        RequestState::Failed
+                                    };
+                                    context.state.manager.update_request_state(
+                                        &context.request_id,
+                                        state,
+                                        None,
+                                        Some("queued request could not be assigned"),
+                                    );
+                                    Box::pin(stream::once(async move {
+                                        Ok(queue_wait_error_event(error))
+                                    })) as EventStream
+                                }
+                            };
+                            let mut next = next;
+                            next.next()
+                                .await
+                                .map(|item| (item, WaitingSseState::Forward(next)))
+                        }
+                        _ = heartbeat.as_mut() => {
+                            let event = if context.status_events {
+                                Event::default().event("llm-orch.status").data(
+                                    serde_json::json!({
+                                        "version": 1,
+                                        "state": "queued",
+                                        "request_id": context.request_id,
+                                        "model": context.requested_model,
+                                    })
+                                    .to_string(),
+                                )
+                            } else {
+                                let comment = format!(
+                                    "llm-orch waiting; request={}; model={}",
+                                    context.request_id, context.requested_model
+                                );
+                                Event::default().comment(comment)
+                            };
+                            heartbeat.as_mut().reset(
+                                tokio::time::Instant::now()
+                                    + std::time::Duration::from_secs(heartbeat_secs),
+                            );
+                            Some((
+                                Ok(event),
+                                WaitingSseState::Waiting {
+                                    assignment,
+                                    context,
+                                    heartbeat,
+                                },
+                            ))
+                        }
+                    }
+                }
+                WaitingSseState::Forward(mut stream) => stream
+                    .next()
+                    .await
+                    .map(|item| (item, WaitingSseState::Forward(stream))),
+            }
+        },
+    ))
+}
+
+fn queue_wait_error_event(error: AcquireError) -> Event {
+    Event::default().event("error").data(
+        serde_json::json!({
+            "error": {
+                "message": format!("request could not be assigned: {error:?}"),
+                "type": "queue_error"
+            }
+        })
+        .to_string(),
+    )
+}
+
+fn wait_events_requested(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-llm-orch-wait-events")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim() == "1")
+}
+
+/// Construct an SSE response with transport headers that keep intermediaries
+/// from caching or buffering the pre-assignment heartbeat stream.
+fn response_with_request_id(mut response: Response, request_id: &str) -> Response {
+    if let Ok(value) = header::HeaderValue::from_str(request_id) {
+        response.headers_mut().insert(
+            header::HeaderName::from_static("x-llm-orch-request-id"),
+            value,
+        );
+    }
+    response
+}
+
+fn sse_response(stream: EventStream, request_id: &str) -> Response {
+    let mut response = Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-cache"),
+    );
+    response.headers_mut().insert(
+        header::HeaderName::from_static("x-accel-buffering"),
+        header::HeaderValue::from_static("no"),
+    );
+    if let Ok(value) = header::HeaderValue::from_str(request_id) {
+        response.headers_mut().insert(
+            header::HeaderName::from_static("x-llm-orch-request-id"),
+            value,
+        );
+    }
+    response
+}
+
+async fn build_assigned_sse_stream(
+    context: WaitingSseContext,
+    model_name: String,
+    guard: SlotGuard,
+) -> EventStream {
+    let WaitingSseContext {
+        state,
+        mut request_body,
+        requested_model: _,
+        backend_path,
+        idle_timeout,
+        api_user,
+        request_id,
+        alias,
+        record_debug,
+        status_events: _,
+        heartbeat_secs: _,
+    } = context;
+    request_body["model"] = serde_json::Value::String(model_name.clone());
+    state
+        .manager
+        .update_request_state(&request_id, RequestState::Running, Some(&model_name), None);
+
+    let debug_log_path = if record_debug {
+        let cfg = state.config.read().await;
+        cfg.models
+            .iter()
+            .find(|model| model.name == model_name)
+            .and_then(|model| model.debug_log.clone())
+    } else {
+        None
+    };
+    let (port, instance_id) = {
+        let instance = guard.handle().inner().lock().unwrap();
+        (instance.port, instance.id.clone())
+    };
+    if let Some(ref path) = debug_log_path {
+        state.debug_loggers.write_line(
+            path,
+            &DebugLogEntry {
+                ts: ts_now(),
+                request_id: request_id.clone(),
+                model: model_name.clone(),
+                alias: alias.clone(),
+                instance_id: Some(instance_id.clone()),
+                dir: "request".into(),
+                stream: Some(true),
+                body: Some(request_body.clone()),
+                usage: None,
+                duration_ms: None,
+                error: None,
+            },
+        );
+    }
+    let backend_url = format!("http://127.0.0.1:{port}{backend_path}");
+    let debug = debug_log_path.map(|path| DebugStreamContext {
+        loggers: state.debug_loggers.clone(),
+        path,
+        request_id: request_id.clone(),
+        model_name: model_name.clone(),
+        alias,
+        instance_id: instance_id.clone(),
+        t0: std::time::Instant::now(),
+    });
+    match build_sse_stream(
+        state.client.clone(),
+        backend_url,
+        request_body,
+        guard,
+        model_name,
+        instance_id,
+        debug,
+        state.manager,
+        api_user,
+        request_id,
+        idle_timeout,
+    )
+    .await
+    {
+        Ok(stream) => stream,
+        Err(error) => Box::pin(stream::once(async move {
+            Ok(Event::default().event("error").data(
+                serde_json::json!({
+                    "error": {
+                        "message": format!("backend request failed: {error}"),
+                        "type": "backend_error"
+                    }
+                })
+                .to_string(),
+            ))
+        })),
+    }
+}
+
 // ── Stream wrappers ──────────────────────────────────────────────────────────
 
 /// A wrapper around a byte stream that converts backend SSE chunks into
@@ -2177,6 +2846,7 @@ impl<S> SseForwarder<S>
 where
     S: Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
 {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         stream: S,
         guard: SlotGuard,
@@ -2369,22 +3039,22 @@ impl<S> Drop for SseForwarder<S> {
             let mut gen_tokens = 0u64;
             let mut cached_tokens = 0u64;
             for chunk in self.chunks.iter().rev() {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(chunk) {
-                    if let Some(usage) = v.get("usage") {
-                        prompt_tokens = usage
-                            .get("prompt_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        gen_tokens = usage
-                            .get("completion_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        cached_tokens = usage
-                            .pointer("/prompt_tokens_details/cached_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        break;
-                    }
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(chunk)
+                    && let Some(usage) = v.get("usage")
+                {
+                    prompt_tokens = usage
+                        .get("prompt_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    gen_tokens = usage
+                        .get("completion_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    cached_tokens = usage
+                        .pointer("/prompt_tokens_details/cached_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    break;
                 }
             }
             self.manager.record_completion(
@@ -2407,6 +3077,16 @@ impl<S> Drop for SseForwarder<S> {
                 "stream ended without [DONE] (truncated or client disconnect) — no completion recorded"
             );
         }
+        self.manager.update_request_state(
+            &self.request_id,
+            if self.saw_done {
+                RequestState::Completed
+            } else {
+                RequestState::Cancelled
+            },
+            Some(&self.model_name),
+            None,
+        );
 
         // Debug log: streaming response (logged on drop so we capture partial
         // output even on client disconnect).
