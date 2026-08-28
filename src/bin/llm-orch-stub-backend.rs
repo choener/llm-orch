@@ -54,8 +54,10 @@ struct Cli {
     host: Option<String>,
     #[arg(long)]
     backend: Option<String>,
+    /// llama.cpp backend selector (`ROCm0,ROCm1,...`) or an audiocpp
+    /// device number; accepted and ignored by the test stub.
     #[arg(long)]
-    device: Option<usize>,
+    device: Option<String>,
     #[arg(long)]
     threads: Option<usize>,
     #[arg(long)]

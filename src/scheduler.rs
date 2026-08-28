@@ -184,7 +184,7 @@ impl ModelMetrics {
 
 /// Fingerprint of the configuration that defines the spawned backend
 /// process: the alias-resolved command line (`{port}` deliberately
-/// excluded — it differs per instance), the Vulkan device pool, declared
+/// excluded — it differs per instance), the selected device pool, declared
 /// VRAM, and context length.  Routing-only fields (`max_instances`,
 /// `max_concurrent`, `queue_depth`, `idle_ttl`, `autoscale`, `debug_log`,
 /// `priority`, `ram`) are excluded: changing them must not retire running
@@ -204,10 +204,13 @@ fn fingerprint_with_aliases(cmd_aliases: &HashMap<String, String>, cfg: &ModelCo
     devices.sort_unstable();
     let mut cuda_devices = cfg.cuda_devices.clone();
     cuda_devices.sort_unstable();
+    let mut rocm_devices = cfg.rocm_devices.clone();
+    rocm_devices.sort_unstable();
     let mut h = std::collections::hash_map::DefaultHasher::new();
     resolved.hash(&mut h);
     devices.hash(&mut h);
     cuda_devices.hash(&mut h);
+    rocm_devices.hash(&mut h);
     cfg.gpus.hash(&mut h);
     cfg.vram.hash(&mut h);
     cfg.context_length.hash(&mut h);
@@ -286,6 +289,9 @@ pub struct InstanceManager {
     /// optional).  Doubles as a capacity cap and as the fallback total
     /// when nvidia-smi metrics are unavailable for the device.
     cuda_vram_static: RwLock<HashMap<usize, u64>>,
+
+    /// ROCm device index → PCI slot mapping (from config).
+    rocm_slots: RwLock<HashMap<usize, String>>,
 
     /// GPU keep-alive manager (None if not configured).
     /// Rebuilt on config hot-reload when the keep-alive section changes.
@@ -389,6 +395,11 @@ impl InstanceManager {
             .unwrap_or_default();
 
         let (cuda_slots, cuda_vram_static) = cuda_device_maps(config);
+        let rocm_slots = config
+            .devices
+            .as_ref()
+            .map(|d| d.rocm.clone())
+            .unwrap_or_default();
 
         let (release_tx, release_rx) = mpsc::unbounded_channel();
         let (crash_tx, crash_rx) = mpsc::unbounded_channel();
@@ -409,6 +420,7 @@ impl InstanceManager {
             vram_limits: RwLock::new(vram_limits),
             cuda_slots: RwLock::new(cuda_slots),
             cuda_vram_static: RwLock::new(cuda_vram_static),
+            rocm_slots: RwLock::new(rocm_slots),
             keepalive: RwLock::new(keepalive),
             crash_limit: 3,
             spawn_timeout: Duration::from_secs(120),
@@ -683,7 +695,9 @@ impl InstanceManager {
         }
         // Without a device pool there is nothing to check — the spawn
         // proceeds unpinned (CPU or unrestricted GPUs).
-        let has_device_pool = !cfg.vulkan_devices.is_empty() || !cfg.cuda_devices.is_empty();
+        let has_device_pool = !cfg.vulkan_devices.is_empty()
+            || !cfg.cuda_devices.is_empty()
+            || !cfg.rocm_devices.is_empty();
         if !has_device_pool {
             return true;
         }
@@ -1243,7 +1257,9 @@ impl InstanceManager {
         // without GPU restriction (competing on GPUs already occupied by
         // existing instances) or with too few devices (a multi-GPU model
         // would not fit in memory).
-        let has_device_pool = !cfg.vulkan_devices.is_empty() || !cfg.cuda_devices.is_empty();
+        let has_device_pool = !cfg.vulkan_devices.is_empty()
+            || !cfg.cuda_devices.is_empty()
+            || !cfg.rocm_devices.is_empty();
         if has_device_pool && gpu_indices.len() < cfg.gpus {
             warn!(
                 model = %model_name,
@@ -1257,7 +1273,9 @@ impl InstanceManager {
         }
 
         // Device pinning follows the model's namespace: Vulkan models via
-        // GGML_VK_VISIBLE_DEVICES, CUDA models via CUDA_VISIBLE_DEVICES.
+        // GGML_VK_VISIBLE_DEVICES, CUDA models via CUDA_VISIBLE_DEVICES,
+        // and ROCm models via HIP_VISIBLE_DEVICES plus an explicit
+        // --device ROCmN selector.
         let model_backend = LlamaCppBackend::new(cfg.device_kind());
         let mut args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
         args.extend(model_backend.gpu_args(&gpu_indices));
@@ -1314,15 +1332,27 @@ impl InstanceManager {
         {
             let keepalive = self.keepalive.read().unwrap().clone();
             if let Some(ref ka) = keepalive {
-                // Keep-alive is AMD/Vulkan-only; NVIDIA GPUs are kept
-                // awake via persistence mode instead.
-                if cfg.device_kind() == DeviceKind::Vulkan {
-                    let vulkan_slots = self.vulkan_slots.read().unwrap();
-                    for vulkan_idx in &gpu_indices {
-                        if let Some(slot) = vulkan_slots.get(vulkan_idx) {
-                            ka.acquire(slot);
+                // Keep-alive applies to AMD devices exposed through either
+                // Vulkan or ROCm; NVIDIA GPUs are kept awake via persistence
+                // mode instead.
+                match cfg.device_kind() {
+                    DeviceKind::Vulkan => {
+                        let slots = self.vulkan_slots.read().unwrap();
+                        for idx in &gpu_indices {
+                            if let Some(slot) = slots.get(idx) {
+                                ka.acquire(slot);
+                            }
                         }
                     }
+                    DeviceKind::Rocm => {
+                        let slots = self.rocm_slots.read().unwrap();
+                        for idx in &gpu_indices {
+                            if let Some(slot) = slots.get(idx) {
+                                ka.acquire(slot);
+                            }
+                        }
+                    }
+                    DeviceKind::Cuda => {}
                 }
             }
         }
@@ -1436,12 +1466,12 @@ impl InstanceManager {
     }
 
     /// Pick the devices for a new instance from the model's device pool
-    /// (`vulkan_devices` or `cuda_devices`, per the model's
-    /// [`DeviceKind`]).  Returns up to `model_cfg.gpus` distinct devices
-    /// (empty when the pool can't satisfy the request — the caller
+    /// (`vulkan_devices`, `cuda_devices`, or `rocm_devices`, per the
+    /// model's [`DeviceKind`]).  Returns up to `model_cfg.gpus` distinct
+    /// devices (empty when the pool can't satisfy the request — the caller
     /// decides between CPU fallback and spawn refusal).
     ///
-    /// Per-GPU accounting is keyed by PCI slot so Vulkan and CUDA
+    /// Per-GPU accounting is keyed by PCI slot so Vulkan, CUDA, and ROCm
     /// indices can never alias each other.
     async fn select_gpus_for_model(&self, model_cfg: &ModelConfig) -> Vec<usize> {
         self.select_gpus_inner(model_cfg, &HashSet::new()).await
@@ -1458,12 +1488,14 @@ impl InstanceManager {
         let kind = model_cfg.device_kind();
         let pool = match kind {
             DeviceKind::Cuda => &model_cfg.cuda_devices,
+            DeviceKind::Rocm => &model_cfg.rocm_devices,
             DeviceKind::Vulkan => &model_cfg.vulkan_devices,
         };
         // Clone the (tiny) device maps — std RwLock guards are !Send and
         // must not live across the gpu_snapshot await below.
         let vulkan_slots = self.vulkan_slots.read().unwrap().clone();
         let cuda_slots = self.cuda_slots.read().unwrap().clone();
+        let rocm_slots = self.rocm_slots.read().unwrap().clone();
         let vram_limits = self.vram_limits.read().unwrap().clone();
         let cuda_vram_static = self.cuda_vram_static.read().unwrap().clone();
         let model_kinds: HashMap<String, DeviceKind> = self
@@ -1476,6 +1508,7 @@ impl InstanceManager {
 
         let (slots, static_vram) = match kind {
             DeviceKind::Cuda => (&cuda_slots, &cuda_vram_static),
+            DeviceKind::Rocm => (&rocm_slots, &vram_limits),
             DeviceKind::Vulkan => (&vulkan_slots, &vram_limits),
         };
         if pool.is_empty() || slots.is_empty() {
@@ -1493,6 +1526,7 @@ impl InstanceManager {
                 .unwrap_or(DeviceKind::Vulkan)
             {
                 DeviceKind::Cuda => cuda_slots.get(&idx).cloned(),
+                DeviceKind::Rocm => rocm_slots.get(&idx).cloned(),
                 DeviceKind::Vulkan => vulkan_slots.get(&idx).cloned(),
             }
         };
@@ -1566,11 +1600,12 @@ impl InstanceManager {
             }
 
             let gpu = gpus.iter().find(|g| g.pci_slot == pci_slot);
-            // Capacity rule: with metrics, the configured value (Vulkan
-            // vram_limit_mb / CUDA vram_mb) caps the reported total.
-            // Without metrics, only CUDA devices may fall back to their
-            // static vram_mb — NVIDIA exposes no sysfs VRAM, so a
-            // missing nvidia-smi must not make the device unusable.
+            // Capacity rule: with metrics, the configured value
+            // (Vulkan/ROCm vram_limit_mb or CUDA vram_mb) caps the
+            // reported total.  Without metrics, only CUDA devices may
+            // fall back to their static vram_mb — NVIDIA exposes no sysfs
+            // VRAM, so a missing nvidia-smi must not make the device
+            // unusable.
             let capacity = match (gpu, static_vram.get(&idx)) {
                 (Some(g), Some(&configured)) => configured.min(g.vram_total_bytes),
                 (Some(g), None) => g.vram_total_bytes,
@@ -1629,8 +1664,9 @@ impl InstanceManager {
 
         // Deterministic packing: least-loaded GPU first, then most free
         // VRAM, then lowest index.  Selection order is also the emission
-        // order into GGML_VK_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES —
-        // kept stable because device order has semantics in llama.cpp.
+        // order into GGML_VK_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES /
+        // HIP_VISIBLE_DEVICES — kept stable because device order has
+        // semantics in llama.cpp.
         candidates.sort_by(|(a_idx, a_free), (b_idx, b_free)| {
             let count_of = |idx: &usize| {
                 slots
@@ -1832,24 +1868,35 @@ impl InstanceManager {
         // spawns landing on the same GPU.
         let keepalive = self.keepalive.read().unwrap().clone();
         if let Some(ref ka) = keepalive {
-            // Paired with the acquire at spawn: keep-alive only ever runs
-            // for Vulkan-kind models.  A model removed from the config
-            // falls back to the Vulkan translation (pre-removal
-            // semantics), matching the pre-CUDA behavior.
-            let is_cuda = self
+            // Paired with the acquire at spawn: keep-alive applies to
+            // Vulkan- and ROCm-kind AMD models.  A model removed from the
+            // config falls back to Vulkan translation, matching the
+            // pre-CUDA semantics.
+            let kind = self
                 .model_configs
                 .read()
                 .unwrap()
                 .get(model_name)
-                .map(|c| c.device_kind() == DeviceKind::Cuda)
-                .unwrap_or(false);
-            if !is_cuda {
-                let vulkan_slots = self.vulkan_slots.read().unwrap();
-                for vulkan_idx in gpu_indices {
-                    if let Some(slot) = vulkan_slots.get(vulkan_idx) {
-                        ka.release(slot);
+                .map(|c| c.device_kind())
+                .unwrap_or(DeviceKind::Vulkan);
+            match kind {
+                DeviceKind::Vulkan => {
+                    let slots = self.vulkan_slots.read().unwrap();
+                    for idx in gpu_indices {
+                        if let Some(slot) = slots.get(idx) {
+                            ka.release(slot);
+                        }
                     }
                 }
+                DeviceKind::Rocm => {
+                    let slots = self.rocm_slots.read().unwrap();
+                    for idx in gpu_indices {
+                        if let Some(slot) = slots.get(idx) {
+                            ka.release(slot);
+                        }
+                    }
+                }
+                DeviceKind::Cuda => {}
             }
         }
     }
@@ -2116,6 +2163,11 @@ impl InstanceManager {
         let (cuda_slots, cuda_vram_static) = cuda_device_maps(config);
         *self.cuda_slots.write().unwrap() = cuda_slots;
         *self.cuda_vram_static.write().unwrap() = cuda_vram_static;
+        *self.rocm_slots.write().unwrap() = config
+            .devices
+            .as_ref()
+            .map(|d| d.rocm.clone())
+            .unwrap_or_default();
         *self.drain_idle_timeout_secs.write().unwrap() = config.server.drain_idle_timeout_secs;
         self.ports
             .lock()
@@ -2143,21 +2195,32 @@ impl InstanceManager {
                 let in_use_slots: Vec<String> = {
                     let instances = self.instances.read().unwrap();
                     let vulkan_slots = self.vulkan_slots.read().unwrap();
+                    let rocm_slots = self.rocm_slots.read().unwrap();
                     let model_configs = self.model_configs.read().unwrap();
-                    instances
-                        .iter()
-                        // Keep-alive is Vulkan-only — CUDA instances never
-                        // acquired a reference at spawn.
-                        .filter(|(name, _)| {
-                            model_configs
-                                .get(*name)
-                                .map(|c| c.device_kind() == DeviceKind::Vulkan)
-                                .unwrap_or(true)
-                        })
-                        .flat_map(|(_, list)| list)
-                        .flat_map(|h| h.inner().lock().unwrap().gpu_indices.clone())
-                        .filter_map(|idx| vulkan_slots.get(&idx).cloned())
-                        .collect()
+                    let mut slots_in_use = Vec::new();
+                    // Keep-alive applies to AMD instances exposed via
+                    // Vulkan or ROCm; CUDA instances never acquired a
+                    // reference at spawn.
+                    for (name, list) in instances.iter() {
+                        let kind = model_configs
+                            .get(name)
+                            .map(|c| c.device_kind())
+                            .unwrap_or(DeviceKind::Vulkan);
+                        let slots = match kind {
+                            DeviceKind::Vulkan => &*vulkan_slots,
+                            DeviceKind::Rocm => &*rocm_slots,
+                            DeviceKind::Cuda => continue,
+                        };
+                        for handle in list {
+                            let indices = handle.inner().lock().unwrap().gpu_indices.clone();
+                            for idx in indices {
+                                if let Some(slot) = slots.get(&idx) {
+                                    slots_in_use.push(slot.clone());
+                                }
+                            }
+                        }
+                    }
+                    slots_in_use
                 };
                 for slot in in_use_slots {
                     ka.acquire(&slot);
@@ -3326,6 +3389,17 @@ models:
         );
         assert_ne!(base, fingerprint_with_aliases(&no_aliases, &m3));
 
+        // rocm_devices change → different fingerprint (namespace and order).
+        let mut rocm = model.clone();
+        rocm.rocm_devices = vec![1, 0];
+        let mut rocm_reordered = model.clone();
+        rocm_reordered.rocm_devices = vec![0, 1];
+        assert_eq!(
+            fingerprint_with_aliases(&no_aliases, &rocm),
+            fingerprint_with_aliases(&no_aliases, &rocm_reordered)
+        );
+        assert_ne!(base, fingerprint_with_aliases(&no_aliases, &rocm));
+
         // vram / context_length / gpus changes → different fingerprint.
         let mut m5 = model.clone();
         m5.vram = 1024;
@@ -3645,6 +3719,131 @@ models:
         assert!(
             placement.is_empty(),
             "fewer candidates than gpus must yield no placement, got {placement:?}"
+        );
+    }
+
+    // ── ROCm placement ────────────────────────────────────────────────
+
+    const ROCM_GPU_YAML: &str = r#"
+server: {}
+apikeys_file: apikeys.txt
+devices:
+  rocm:
+    0: "0000:0a:00.0"
+    1: "0000:0b:00.0"
+    2: "0000:0c:00.0"
+    3: "0000:0d:00.0"
+models:
+  - name: big
+    context_length: 4096
+    cmd: "sleep 3600"
+    idle_ttl: 60
+    vram: 20000
+    gpus: 2
+    rocm_devices: [0, 1, 2, 3]
+"#;
+
+    fn rocm_gpu_manager() -> InstanceManager {
+        let config: crate::config::Config = serde_yaml_ng::from_str(ROCM_GPU_YAML).unwrap();
+        let snapshot = Arc::new(tokio::sync::RwLock::new(vec![
+            gpu_metrics(0, "0000:0a:00.0", 48000),
+            gpu_metrics(1, "0000:0b:00.0", 48000),
+            gpu_metrics(2, "0000:0c:00.0", 48000),
+            gpu_metrics(3, "0000:0d:00.0", 48000),
+        ]));
+        let (mgr, _release_rx, _crash_rx) = InstanceManager::new(&config, snapshot, None);
+        mgr
+    }
+
+    #[tokio::test]
+    async fn rocm_select_tiles_pool_across_instances() {
+        let mgr = rocm_gpu_manager();
+        let cfg = mgr
+            .model_configs
+            .read()
+            .unwrap()
+            .get("big")
+            .cloned()
+            .unwrap();
+
+        let first = mgr.select_gpus_for_model(&cfg).await;
+        assert_eq!(first.len(), 2);
+        assert_ne!(first[0], first[1], "devices must be distinct");
+
+        register_ready(&mgr, "big", first.clone(), 54321);
+        let second = mgr.select_gpus_for_model(&cfg).await;
+        assert_eq!(second.len(), 2);
+        assert!(
+            second.iter().all(|d| !first.contains(d)),
+            "second instance must avoid devices of the first: {first:?} vs {second:?}"
+        );
+
+        register_ready(&mgr, "big", second.clone(), 54322);
+        assert!(mgr.select_gpus_for_model(&cfg).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rocm_select_respects_per_gpu_vram_shares() {
+        let mgr = rocm_gpu_manager();
+        register_ready(&mgr, "big", vec![0, 1], 54321);
+
+        let small: ModelConfig = serde_yaml_ng::from_str(
+            "name: small\ncontext_length: 4096\ncmd: \"sleep 1\"\nvram: 30000\ngpus: 1\nrocm_devices: [0, 1, 2, 3]",
+        )
+        .unwrap();
+        mgr.model_configs
+            .write()
+            .unwrap()
+            .insert("small".to_owned(), small.clone());
+        let placement = mgr.select_gpus_for_model(&small).await;
+        assert_eq!(placement.len(), 1);
+        assert!(
+            placement[0] == 2 || placement[0] == 3,
+            "must avoid GPUs with only 28000 MB free, got {placement:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rocm_and_vulkan_share_vram_accounting_by_pci_slot() {
+        let yaml = r#"
+server: {}
+apikeys_file: apikeys.txt
+devices:
+  vulkan:
+    0: "0000:0a:00.0"
+  rocm:
+    0: "0000:0a:00.0"
+models:
+  - name: vulkan-model
+    context_length: 4096
+    cmd: "sleep 3600"
+    vram: 30000
+    vulkan_devices: [0]
+  - name: rocm-model
+    context_length: 4096
+    cmd: "sleep 3600"
+    vram: 30000
+    rocm_devices: [0]
+"#;
+        let config: crate::config::Config = serde_yaml_ng::from_str(yaml).unwrap();
+        let snapshot = Arc::new(tokio::sync::RwLock::new(vec![gpu_metrics(
+            0,
+            "0000:0a:00.0",
+            48000,
+        )]));
+        let (mgr, _release_rx, _crash_rx) = InstanceManager::new(&config, snapshot, None);
+        let rocm_cfg = mgr
+            .model_configs
+            .read()
+            .unwrap()
+            .get("rocm-model")
+            .cloned()
+            .unwrap();
+        register_ready(&mgr, "vulkan-model", vec![0], 54321);
+
+        assert!(
+            mgr.select_gpus_for_model(&rocm_cfg).await.is_empty(),
+            "ROCm placement must account for Vulkan VRAM on the same PCI slot"
         );
     }
 

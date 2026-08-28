@@ -60,7 +60,7 @@ pub struct Instance {
     /// `None` in tests or after shutdown.
     pub release_tx: Option<mpsc::UnboundedSender<String>>,
 
-    /// Fingerprint of the spawn-relevant config (resolved `cmd`, Vulkan
+    /// Fingerprint of the spawn-relevant config (resolved `cmd`, selected
     /// device pool, `vram`, `context_length`) this instance was launched
     /// with.  Set by the manager at spawn time; `0` means "unset" (tests).
     /// On config reload, instances whose fingerprint no longer matches are

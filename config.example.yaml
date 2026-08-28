@@ -49,16 +49,32 @@ apikeys_file: "apikeys.txt"
 # Device mapping
 # ---------------------------------------------------------------------------
 # Map backend device indices to PCI slots.  The indices here are what
-# GGML_VK_VISIBLE_DEVICES and similar env vars use — they correspond to
-# the backend's enumeration order (e.g. Vulkan0 → 0, Vulkan1 → 1).
+# GGML_VK_VISIBLE_DEVICES, HIP_VISIBLE_DEVICES, and similar env vars use —
+# they correspond to the backend's enumeration order (e.g. Vulkan0 → 0,
+# ROCm0 → 0).
 devices:
   vulkan:
     0: "0000:03:00.0"  # dGPU — find with `llama-server --list-devices`
     # 1: "0000:7b:00.0" # iGPU — too small for LLMs
 
+  # ROCm (AMD) devices — separate namespace.  Models reference these
+  # indices via `rocm_devices` (mutually exclusive with `vulkan_devices`
+  # and `cuda_devices` on the same model) and are pinned via
+  # HIP_VISIBLE_DEVICES plus llama.cpp's explicit `--device ROCmN`.
+  # The PCI mapping may refer to the same physical AMD card as `vulkan`;
+  # the scheduler accounts for both namespaces by PCI slot.
+  # rocm:
+  #   0: "0000:03:00.0"
+  #   1: "0000:7b:00.0"
+
+  # Optional per-GPU VRAM limits (MB), shared by Vulkan and ROCm indices.
+  # vram_limit_mb:
+  #   0: 24576
+
   # CUDA (NVIDIA) devices — separate namespace.  Models reference these
   # indices via `cuda_devices` (mutually exclusive with `vulkan_devices`
-  # on the same model) and are pinned via CUDA_VISIBLE_DEVICES.
+  # and `rocm_devices` on the same model) and are pinned via
+  # CUDA_VISIBLE_DEVICES.
   # PCI slots are validated against /sys/bus/pci/devices/; find them with
   # `nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader` (strip the
   # domain down to 4 hex digits: 00000000:65:00.0 → 0000:65:00.0).
@@ -91,7 +107,7 @@ cmd_aliases:
       --n-gpu-layers 99
 
   # CPU-only variant of the llama alias.  Models without a device pool
-  # (no vulkan_devices/cuda_devices) are CPU-only: llm-orch pins no GPU
+  # (no vulkan_devices/cuda_devices/rocm_devices) are CPU-only: llm-orch pins no GPU
   # and injects --n-gpu-layers 0 itself when the command declares no
   # offload count — stating it here keeps the command self-documenting.
   llama-cpu: |
@@ -120,8 +136,8 @@ cmd_aliases:
 # loaded.  The command runs periodically per active GPU and stops when the
 # last instance on that GPU is unloaded.
 #
-# AMD/Vulkan only — NVIDIA GPUs are not auto-suspended this way (enable
-# persistence mode instead: `nvidia-smi -pm 1`).
+# AMD Vulkan/ROCm only — NVIDIA GPUs are not auto-suspended this way
+# (enable persistence mode instead: `nvidia-smi -pm 1`).
 #
 # keep_alive:
 #   amd:
@@ -163,7 +179,8 @@ models:
 
   # --- Example 2: a model too large for one GPU — spans two ----------------
   # `gpus: 2` splits the model evenly across two devices (llama.cpp's
-  # default tensor split over GGML_VK_VISIBLE_DEVICES).  `vram` is
+  # default tensor split over the selected backend's visibility variable).
+  # `vram` is
   # reserved on EACH occupied GPU, so this reserves 2×20000 MB; the
   # orchestrator picks two devices from the pool with enough free VRAM
   # each.  For asymmetric splits use --tensor-split in cmd and set vram
@@ -214,9 +231,28 @@ models:
   #       --model /models/qwen3-32b-q4_k_m.gguf
   #       --ctx-size 32768
 
+  # --- Example 2d: a ROCm model — pinned via HIP_VISIBLE_DEVICES ----------
+  # ROCm models also receive an explicit --device ROCmN selector.  The N
+  # values are ranks in the HIP-visible set, so a selected pool [2, 4]
+  # becomes HIP_VISIBLE_DEVICES=2,4 and --device ROCm0,ROCm1.  A ROCm model
+  # may use the same physical AMD GPU as a Vulkan model when VRAM permits.
+  # - name: "qwen3-32b-rocm"
+  #   context_length: 32768
+  #   max_instances: 1
+  #   max_concurrent: 4
+  #   vram: 20000             # MB reserved per occupied GPU
+  #   gpus: 1
+  #   idle_ttl: 600
+  #   queue_depth: 10
+  #   rocm_devices: [0, 1]    # pool: ROCm devices 0 and 1
+  #   cmd: |
+  #     {llama}
+  #       --model /models/qwen3-32b-q4_k_m.gguf
+  #       --ctx-size 32768
+
   # --- Example 3: a smaller model — runs on CPU ----------------------------
-  # No device pool = CPU-only: llm-orch pins no GPU and enforces
-  # --n-gpu-layers 0 (declared in the {llama-cpu} alias).  `ram` declares
+  # No device pool (Vulkan, CUDA, or ROCm) = CPU-only: llm-orch pins no GPU
+  # and enforces --n-gpu-layers 0 (declared in the {llama-cpu} alias).  `ram` declares
   # the system RAM footprint — weights plus KV cache at the configured
   # context length (informational today).
   - name: "deepseek-coder-7b"

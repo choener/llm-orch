@@ -144,7 +144,8 @@ in
 
         # ── Hardening ─────────────────────────────────────────────────
         # Constrained so that spawning llama.cpp backends and accessing
-        # GPUs (Vulkan via /dev/dri, CUDA via /dev/nvidia*) keeps working.
+        # GPUs (Vulkan/ROCm via /dev/dri and /dev/kfd, CUDA via
+        # /dev/nvidia*) keeps working.
         NoNewPrivileges = true;
         ProtectSystem = "strict";
         ProtectHome = "read-only";
@@ -161,7 +162,8 @@ in
         PrivateDevices = false;
         DevicePolicy = "closed";
         DeviceAllow = [
-          "char-drm rw"      # Vulkan: /dev/dri/* (AMD/Intel; NVIDIA with nvidia-drm)
+          "char-drm rw"      # Vulkan/ROCm: /dev/dri/* (AMD/Intel; NVIDIA with nvidia-drm)
+          "char-kfd rw"      # ROCm/HIP: /dev/kfd
           "char-nvidia* rw"  # CUDA: /dev/nvidia*, /dev/nvidia-uvm*, /dev/nvidia-caps/*
         ];
         ProtectKernelTunables = true;

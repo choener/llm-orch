@@ -106,14 +106,24 @@ impl Config {
                     m.name
                 )));
             }
-            if !m.vulkan_devices.is_empty() && !m.cuda_devices.is_empty() {
+            let configured_pools = [
+                !m.vulkan_devices.is_empty(),
+                !m.cuda_devices.is_empty(),
+                !m.rocm_devices.is_empty(),
+            ]
+            .into_iter()
+            .filter(|configured| *configured)
+            .count();
+            if configured_pools > 1 {
                 return Err(ConfigError::Validation(format!(
-                    "model '{}': vulkan_devices and cuda_devices are mutually exclusive (a model uses exactly one device namespace)",
+                    "model '{}': vulkan_devices, cuda_devices, and rocm_devices are mutually exclusive (a model uses exactly one device namespace)",
                     m.name
                 )));
             }
             let (pool_len, ns) = if !m.cuda_devices.is_empty() {
                 (m.cuda_devices.len(), "cuda_devices")
+            } else if !m.rocm_devices.is_empty() {
+                (m.rocm_devices.len(), "rocm_devices")
             } else {
                 (m.vulkan_devices.len(), "vulkan_devices")
             };
@@ -132,7 +142,7 @@ impl Config {
                 // guessing at intent at spawn time.
                 if let Some(declared) = cpu_cmd_offload_decl(&self.cmd_aliases, m) {
                     return Err(ConfigError::Validation(format!(
-                        "model '{}': CPU-only (no device pool) but its command requests GPU offload ({declared}) — add vulkan_devices/cuda_devices or drop the flag (use a CPU alias)",
+                        "model '{}': CPU-only (no device pool) but its command requests GPU offload ({declared}) — add vulkan_devices/cuda_devices/rocm_devices or drop the flag (use a CPU alias)",
                         m.name
                     )));
                 }
@@ -292,6 +302,29 @@ impl Config {
                     )));
                 }
             }
+
+            // --- rocm ---
+            // ROCm GPUs are AMD DRM devices.  Unlike Vulkan, which may use
+            // other DRM vendors too, reject a ROCm mapping that does not
+            // identify an AMD card so a typo cannot become an unplaceable
+            // model later in the scheduler.
+            let amd_slots = list_amd_pci_slots();
+            let existing_amd_slots: HashSet<&str> = amd_slots.iter().map(|s| s.as_str()).collect();
+            let mut seen_rocm = HashSet::new();
+            for (idx, slot) in &devs.rocm {
+                if !existing_amd_slots.contains(slot.as_str()) {
+                    return Err(ConfigError::Validation(format!(
+                        "devices.rocm.{}: PCI slot '{}' not found as an AMD GPU in /sys/class/drm/card*/device/",
+                        idx, slot
+                    )));
+                }
+                if !seen_rocm.insert(slot) {
+                    return Err(ConfigError::Validation(format!(
+                        "devices.rocm: PCI slot '{}' assigned to multiple indices",
+                        slot
+                    )));
+                }
+            }
         }
 
         // --- model vulkan_devices ---
@@ -321,6 +354,25 @@ impl Config {
                     if !valid_indices.contains(idx) {
                         return Err(ConfigError::Validation(format!(
                             "model '{}': cuda_device {} not defined in devices.cuda",
+                            m.name, idx
+                        )));
+                    }
+                }
+            }
+        }
+
+        // --- model rocm_devices ---
+        {
+            let valid_indices: HashSet<usize> = self
+                .devices
+                .as_ref()
+                .map(|d| d.rocm.keys().copied().collect())
+                .unwrap_or_default();
+            for m in &self.models {
+                for idx in &m.rocm_devices {
+                    if !valid_indices.contains(idx) {
+                        return Err(ConfigError::Validation(format!(
+                            "model '{}': rocm_device {} not defined in devices.rocm",
                             m.name, idx
                         )));
                     }
@@ -467,22 +519,31 @@ pub struct ModelConfig {
     pub cmd: String,
 
     /// Vulkan device indices this model can be placed on (from `devices.vulkan`).
-    /// Empty = CPU only (unless `cuda_devices` is set).
-    /// Mutually exclusive with `cuda_devices`.
+    /// Empty = CPU only (unless `cuda_devices` or `rocm_devices` is set).
+    /// Mutually exclusive with the other device namespaces.
     #[serde(default)]
     pub vulkan_devices: Vec<usize>,
 
     /// CUDA device indices this model can be placed on (from `devices.cuda`).
     /// When non-empty the model is a CUDA model: placement uses the CUDA
     /// pool and instances are pinned via `CUDA_VISIBLE_DEVICES`.
-    /// Mutually exclusive with `vulkan_devices`.
+    /// Mutually exclusive with `vulkan_devices` and `rocm_devices`.
     #[serde(default)]
     pub cuda_devices: Vec<usize>,
 
+    /// ROCm device indices this model can be placed on (from `devices.rocm`).
+    /// When non-empty the model is a ROCm model: placement uses the ROCm
+    /// pool and instances are pinned via `HIP_VISIBLE_DEVICES` plus llama.cpp's
+    /// explicit `--device ROCmN` selection.
+    /// Mutually exclusive with `vulkan_devices` and `cuda_devices`.
+    #[serde(default)]
+    pub rocm_devices: Vec<usize>,
+
     /// Number of devices each instance of this model spans.
     /// The model is split evenly across them (llama.cpp's default tensor
-    /// split over `GGML_VK_VISIBLE_DEVICES` / `CUDA_VISIBLE_DEVICES`):
-    /// `vram` is reserved on **each** occupied GPU, so `vram: 20000,
+    /// split over `GGML_VK_VISIBLE_DEVICES` / `CUDA_VISIBLE_DEVICES` /
+    /// `HIP_VISIBLE_DEVICES`). The `vram` value is reserved on **each**
+    /// occupied GPU, so `vram: 20000,
     /// gpus: 2` reserves 2×20000 MB.  Asymmetric splits (`--tensor-split`
     /// in `cmd`) are possible; then `vram` is a conservative per-GPU
     /// reservation.  Must be `>= 1` and `<=` the device pool size.
@@ -503,13 +564,13 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
-    /// Device namespace this model is placed on.  A model is a CUDA model
-    /// iff `cuda_devices` is non-empty (validation guarantees the two
-    /// pools are mutually exclusive); otherwise it is a Vulkan model
-    /// (`vulkan_devices` possibly empty = CPU-only).
+    /// Device namespace this model is placed on.  Validation guarantees
+    /// that at most one GPU pool is configured; an empty pool means CPU-only.
     pub fn device_kind(&self) -> crate::backend::DeviceKind {
         if !self.cuda_devices.is_empty() {
             crate::backend::DeviceKind::Cuda
+        } else if !self.rocm_devices.is_empty() {
+            crate::backend::DeviceKind::Rocm
         } else {
             crate::backend::DeviceKind::Vulkan
         }
@@ -630,15 +691,18 @@ fn default_autoscale_cooldown() -> u64 {
 
 /// Global device index → PCI slot mapping.
 ///
-/// Each backend gets its own namespace (e.g. `vulkan`, `cuda`).  The
-/// indices here are what `GGML_VK_VISIBLE_DEVICES` /
-/// `CUDA_VISIBLE_DEVICES` use — they correspond to the backend's
-/// enumeration order, not sysfs card numbers.
+/// Each backend gets its own namespace (e.g. `vulkan`, `cuda`, `rocm`).
+/// The indices here are what the backend visibility variables use — they
+/// correspond to the backend's enumeration order, not sysfs card numbers.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DevicesConfig {
     /// Vulkan device index → PCI slot name.
     #[serde(default)]
     pub vulkan: HashMap<usize, String>,
+
+    /// ROCm device index → PCI slot name.
+    #[serde(default)]
+    pub rocm: HashMap<usize, String>,
 
     /// CUDA device index → device definition.
     #[serde(default)]
@@ -669,9 +733,26 @@ pub struct CudaDeviceConfig {
 
 /// List PCI slot names from `/sys/class/drm/card*/device/uevent`.
 fn list_pci_slots() -> Vec<String> {
+    list_drm_pci_slots(false)
+}
+
+/// List PCI slot names for AMD DRM devices.
+fn list_amd_pci_slots() -> Vec<String> {
+    list_drm_pci_slots(true)
+}
+
+fn list_drm_pci_slots(amd_only: bool) -> Vec<String> {
     let mut slots = Vec::new();
     for i in 0..16 {
-        let uevent = format!("/sys/class/drm/card{}/device/uevent", i);
+        let device = std::path::PathBuf::from(format!("/sys/class/drm/card{}/device", i));
+        if amd_only
+            && std::fs::read_to_string(device.join("vendor"))
+                .map(|vendor| vendor.trim() != "0x1002")
+                .unwrap_or(true)
+        {
+            continue;
+        }
+        let uevent = device.join("uevent");
         if let Ok(contents) = std::fs::read_to_string(&uevent) {
             for line in contents.lines() {
                 if let Some(slot) = line.strip_prefix("PCI_SLOT_NAME=") {
@@ -1024,6 +1105,11 @@ models:
         list_pci_slots()
     }
 
+    /// Real AMD DRM PCI slots (what devices.rocm validates against).
+    fn real_amd_slots() -> Vec<String> {
+        list_amd_pci_slots()
+    }
+
     #[test]
     fn rejects_model_with_both_device_namespaces() {
         let yaml = BASE.replace(
@@ -1031,6 +1117,106 @@ models:
             "cmd: \"sleep 3600\"\n    vulkan_devices: [0]\n    cuda_devices: [0]",
         );
         expect_validation_error(&yaml, "mutually exclusive");
+    }
+
+    #[test]
+    fn rejects_model_with_vulkan_and_rocm_namespaces() {
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\n    vulkan_devices: [0]\n    rocm_devices: [0]",
+        );
+        expect_validation_error(&yaml, "mutually exclusive");
+    }
+
+    #[test]
+    fn rejects_gpus_exceeding_rocm_pool() {
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\n    gpus: 3\n    rocm_devices: [0, 1]",
+        );
+        expect_validation_error(&yaml, "gpus (3) exceeds rocm_devices count (2)");
+    }
+
+    #[test]
+    fn rejects_rocm_device_without_devices_section() {
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\n    rocm_devices: [0]",
+        );
+        expect_validation_error(&yaml, "rocm_device 0 not defined in devices.rocm");
+    }
+
+    #[test]
+    fn rejects_undefined_rocm_device_index() {
+        let slots = real_amd_slots();
+        if slots.is_empty() {
+            return;
+        }
+        let yaml = BASE
+            .replace(
+                "apikeys_file: apikeys.txt",
+                &format!(
+                    "apikeys_file: apikeys.txt\ndevices:\n  rocm:\n    0: \"{}\"",
+                    slots[0]
+                ),
+            )
+            .replace(
+                "cmd: \"sleep 3600\"",
+                "cmd: \"sleep 3600\"\n    rocm_devices: [1]",
+            );
+        expect_validation_error(&yaml, "rocm_device 1 not defined in devices.rocm");
+    }
+
+    #[test]
+    fn accepts_multi_gpu_rocm_model() {
+        let slots = real_amd_slots();
+        if slots.len() < 2 {
+            return;
+        }
+        let yaml = BASE
+            .replace(
+                "apikeys_file: apikeys.txt",
+                &format!(
+                    "apikeys_file: apikeys.txt\ndevices:\n  rocm:\n    0: \"{}\"\n    1: \"{}\"",
+                    slots[0], slots[1]
+                ),
+            )
+            .replace(
+                "cmd: \"sleep 3600\"",
+                "cmd: \"sleep 3600\"\n    gpus: 2\n    rocm_devices: [0, 1]",
+            );
+        let cfg = parse(&yaml).unwrap();
+        let devs = cfg.devices.unwrap();
+        assert_eq!(devs.rocm.len(), 2);
+        assert_eq!(
+            cfg.models[0].device_kind(),
+            crate::backend::DeviceKind::Rocm
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_rocm_slots() {
+        let slots = real_amd_slots();
+        if slots.is_empty() {
+            return;
+        }
+        let yaml = BASE.replace(
+            "apikeys_file: apikeys.txt",
+            &format!(
+                "apikeys_file: apikeys.txt\ndevices:\n  rocm:\n    0: \"{0}\"\n    1: \"{0}\"",
+                slots[0]
+            ),
+        );
+        expect_validation_error(&yaml, "devices.rocm: PCI slot");
+    }
+
+    #[test]
+    fn rejects_non_amd_rocm_slot() {
+        let yaml = BASE.replace(
+            "apikeys_file: apikeys.txt",
+            "apikeys_file: apikeys.txt\ndevices:\n  rocm:\n    0: \"0000:ff:ff.f\"",
+        );
+        expect_validation_error(&yaml, "not found as an AMD GPU");
     }
 
     #[test]

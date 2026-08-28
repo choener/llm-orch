@@ -5,7 +5,7 @@
 ## 🚀 Key Features
 
 - **Dynamic Instance Management**: Spawns `llama.cpp` backends on demand. Models are loaded when requested and can be unloaded after a period of inactivity (`idle_ttl`).
-- **GPU VRAM-Aware Scheduling**: Intelligently selects GPUs based on available VRAM and specified Vulkan device pools to prevent oversubscription.
+- **GPU VRAM-Aware Scheduling**: Intelligently selects GPUs based on available VRAM and specified Vulkan, ROCm, or CUDA device pools to prevent oversubscription.
 - **Load-Based Autoscaling**: Automatically scales the number of parallel instances for a model based on exponentially-weighted moving average (EMA) load metrics.
 - **Hot-Reloading**: Update your `config.yaml` or `apikeys.txt` at runtime; changes are applied immediately without restarting the orchestrator.
 - **Request Queueing**: Implements a FIFO queue for requests when all available instances are at capacity, preventing server crashes under heavy load.
@@ -39,7 +39,7 @@ cp config.example.yaml config.yaml
 cp apikeys.example.txt apikeys.txt
 ```
 
-Edit `config.yaml` to point to your model files and define your GPU layout. Make sure your `devices.vulkan` mapping matches the output of `llama-server --list-devices`.
+Edit `config.yaml` to point to your model files and define your GPU layout. Make sure your `devices.vulkan` / `devices.rocm` mappings match the corresponding output of `llama-server --list-devices`.
 
 ### 3. Run
 Start the orchestrator:
@@ -68,7 +68,7 @@ In `config.yaml`, each model definition controls its lifecycle:
 - `max_concurrent`: How many parallel requests a single instance can handle (slots).
 - `vram`: Declared VRAM usage in MB used by the scheduler to pick a GPU.
 - `idle_ttl`: Seconds to keep the model loaded after the last request.
-- `vulkan_devices`: The pool of GPU indices this model is allowed to use.
+- `vulkan_devices`, `cuda_devices`, or `rocm_devices`: The pool of backend GPU indices this model is allowed to use. These namespaces are mutually exclusive per model.
 
 ### Autoscaling
 
@@ -167,6 +167,50 @@ also get the decision log lines: `autoscale: scaling up (load_m5=..., threshold=
 expired, ...` for the n -> 0 unload. Actions are sparse by design: evaluated
 every 30 s and at most one per `cooldown_secs`.
 
+### ROCm (AMD) devices
+ROCm models use a separate llama.cpp backend namespace from Vulkan. This is
+important when `llama-server` was built with both backends: an AMD GPU may be
+listed once as `Vulkan0` and once as `ROCm0`, so selecting only
+`HIP_VISIBLE_DEVICES` is not enough to force the backend. llm-orch sets both
+`HIP_VISIBLE_DEVICES` and llama.cpp's explicit `--device ROCmN` selector.
+
+Configure ROCm devices as an index-to-PCI mapping, just like Vulkan:
+
+```yaml
+devices:
+  rocm:
+    0: "0000:03:00.0"   # find with `llama-server --list-devices`
+    1: "0000:04:00.0"
+  # Optional limits shared by Vulkan and ROCm device indices.
+  vram_limit_mb:
+    0: 24576
+
+models:
+  - name: "qwen3-32b-rocm"
+    context_length: 32768
+    vram: 20000          # reserved per occupied GPU
+    gpus: 1
+    rocm_devices: [0, 1]
+    cmd: |
+      llama-server
+        --host 127.0.0.1
+        --port {port}
+        --model /models/qwen3-32b-q4_k_m.gguf
+        --ctx-size {context_length}
+```
+
+For a multi-GPU instance, `rocm_devices: [0, 1]` with `gpus: 2` results in
+`HIP_VISIBLE_DEVICES=0,1` and `--device ROCm0,ROCm1`. If the selected pool is
+`[2, 4]`, llm-orch uses `HIP_VISIBLE_DEVICES=2,4` and still selects
+`ROCm0,ROCm1`, because HIP renumbers the restricted visible devices.
+
+ROCm mappings must point to AMD DRM devices. The same physical AMD GPU may be
+listed in both `devices.vulkan` and `devices.rocm`; the model chooses exactly
+one backend, while scheduler VRAM accounting is shared by PCI slot. Thus the
+GPU can host both workloads when the declared VRAM reservations fit, but it
+will not be oversubscribed according to those reservations. A ROCm-enabled
+llama.cpp build and the ROCm runtime must be available to the service.
+
 ### CUDA (NVIDIA) devices
 Device placement works for NVIDIA GPUs with full parity to the Vulkan path:
 
@@ -185,14 +229,14 @@ models:
     # ...
     vram: 20000             # reserved per occupied GPU
     gpus: 2                 # span two GPUs (CUDA_VISIBLE_DEVICES=<a>,<b>)
-    cuda_devices: [0, 1]    # mutually exclusive with vulkan_devices
+    cuda_devices: [0, 1]    # mutually exclusive with Vulkan/ROCm pools
 ```
 
 - Instances are pinned via `CUDA_VISIBLE_DEVICES` (selection order = emission order, like Vulkan's `GGML_VK_VISIBLE_DEVICES`).
 - VRAM capacity comes from periodic `nvidia-smi` queries; `vram_mb` caps that value and serves as the fallback total when `nvidia-smi` is unavailable. A CUDA device with neither metrics nor `vram_mb` is unusable for placement.
 - `nvidia-smi` must be on llm-orch's PATH for live metrics. Under the NixOS module: `services.llm-orch.extraPackages = [ config.hardware.nvidia.package ];`.
 - You need a CUDA-enabled llama.cpp build (e.g. `pkgs.llama-cpp.override { cudaSupport = true; }` as the module's `llamaPackage`, or an absolute store path in your `cmd`).
-- GPU keep-alive is AMD-only; NVIDIA GPUs don't need it — enable persistence mode instead (`nvidia-smi -pm 1`).
+- GPU keep-alive is AMD-only and applies to both Vulkan and ROCm instances; NVIDIA GPUs don't need it — enable persistence mode instead (`nvidia-smi -pm 1`).
 
 ### Aliases
 Aliases allow you to expose the same model under different names with different personas:
@@ -279,7 +323,7 @@ The service reads its files directly (hot-reload requires this), so ownership ma
 
 ### Hardening notes
 
-The unit runs with `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp`, `NoNewPrivileges`, no capabilities, and cgroup-level device filtering (`DevicePolicy=closed` with `DeviceAllow` for the `char-drm` (Vulkan) and `char-nvidia*` (CUDA) device groups; unresolvable groups are skipped on hosts without the matching hardware). `MemoryDenyWriteExecute=false` is set because GPU runtimes JIT-compile at runtime. Model files under `/home` remain readable; tighten permissions yourself if they must stay private.
+The unit runs with `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp`, `NoNewPrivileges`, no capabilities, and cgroup-level device filtering (`DevicePolicy=closed` with `DeviceAllow` for the `char-drm` (Vulkan/ROCm), `char-kfd` (ROCm/HIP), and `char-nvidia*` (CUDA) device groups; unresolvable groups are skipped on hosts without the matching hardware). `MemoryDenyWriteExecute=false` is set because GPU runtimes JIT-compile at runtime. Model files under `/home` remain readable; tighten permissions yourself if they must stay private.
 
 ## 🛠 Development
 

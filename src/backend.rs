@@ -31,7 +31,7 @@ pub trait Backend: Send + Sync {
 ///
 /// Determines which environment variable device indices are pinned
 /// through.  A model's kind follows its configured device pool
-/// (`vulkan_devices` vs `cuda_devices`).
+/// (`vulkan_devices`, `cuda_devices`, or `rocm_devices`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DeviceKind {
     /// Vulkan backend — pinned via `GGML_VK_VISIBLE_DEVICES`.
@@ -39,14 +39,19 @@ pub enum DeviceKind {
     Vulkan,
     /// CUDA backend — pinned via `CUDA_VISIBLE_DEVICES`.
     Cuda,
+    /// ROCm/HIP backend — pinned via `HIP_VISIBLE_DEVICES`.
+    Rocm,
 }
 
 /// Backend for llama.cpp built with Vulkan, ROCm, or CUDA.
 ///
-/// GPU selection uses `GGML_VK_VISIBLE_DEVICES` (Vulkan) or
-/// `CUDA_VISIBLE_DEVICES` (CUDA) depending on [`DeviceKind`].  The indices
-/// passed to `gpu_env` are logical backend device indices, not sysfs card
-/// numbers.  Their order is preserved — it has semantics in llama.cpp
+/// GPU selection uses `GGML_VK_VISIBLE_DEVICES` (Vulkan),
+/// `CUDA_VISIBLE_DEVICES` (CUDA), or `HIP_VISIBLE_DEVICES` (ROCm)
+/// depending on [`DeviceKind`].  ROCm additionally receives an explicit
+/// `--device ROCmN` argument because a binary built with both ROCm and
+/// Vulkan otherwise may select the Vulkan copy of the same AMD GPU.  The
+/// indices passed to `gpu_env` are logical backend device indices, not sysfs
+/// card numbers.  Their order is preserved — it has semantics in llama.cpp
 /// (tensor split order).
 pub struct LlamaCppBackend {
     kind: DeviceKind,
@@ -92,8 +97,21 @@ impl LlamaCppBackend {
 }
 
 impl Backend for LlamaCppBackend {
-    fn gpu_args(&self, _indices: &[usize]) -> Vec<String> {
-        Vec::new()
+    fn gpu_args(&self, indices: &[usize]) -> Vec<String> {
+        if self.kind != DeviceKind::Rocm || indices.is_empty() {
+            return Vec::new();
+        }
+
+        // HIP_VISIBLE_DEVICES restricts and renumbers the visible devices.
+        // Use those post-filter ranks in --device rather than the original
+        // host indices: HIP_VISIBLE_DEVICES=2,4 exposes ROCm0 and ROCm1.
+        let devices = indices
+            .iter()
+            .enumerate()
+            .map(|(rank, _)| format!("ROCm{rank}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        vec!["--device".to_string(), devices]
     }
 
     fn gpu_env(&self, indices: &[usize]) -> Vec<(String, String)> {
@@ -103,6 +121,7 @@ impl Backend for LlamaCppBackend {
         let var = match self.kind {
             DeviceKind::Vulkan => "GGML_VK_VISIBLE_DEVICES",
             DeviceKind::Cuda => "CUDA_VISIBLE_DEVICES",
+            DeviceKind::Rocm => "HIP_VISIBLE_DEVICES",
         };
         let list = indices
             .iter()
@@ -380,9 +399,32 @@ mod tests {
     }
 
     #[test]
-    fn gpu_env_empty_pool_sets_nothing() {
+    fn gpu_args_and_env_select_rocm_backend() {
+        let backend = LlamaCppBackend::new(DeviceKind::Rocm);
+        assert_eq!(
+            backend.gpu_args(&[2, 4]),
+            vec!["--device".to_string(), "ROCm0,ROCm1".to_string()],
+            "--device uses HIP's post-filter visible ranks"
+        );
+        assert_eq!(
+            backend.gpu_env(&[2, 4]),
+            vec![("HIP_VISIBLE_DEVICES".to_string(), "2,4".to_string())]
+        );
+    }
+
+    #[test]
+    fn gpu_args_for_non_rocm_backends_are_empty() {
         for kind in [DeviceKind::Vulkan, DeviceKind::Cuda] {
-            assert!(LlamaCppBackend::new(kind).gpu_env(&[]).is_empty());
+            assert!(LlamaCppBackend::new(kind).gpu_args(&[0, 1]).is_empty());
+        }
+    }
+
+    #[test]
+    fn gpu_env_empty_pool_sets_nothing() {
+        for kind in [DeviceKind::Vulkan, DeviceKind::Cuda, DeviceKind::Rocm] {
+            let backend = LlamaCppBackend::new(kind);
+            assert!(backend.gpu_args(&[]).is_empty());
+            assert!(backend.gpu_env(&[]).is_empty());
         }
     }
 
