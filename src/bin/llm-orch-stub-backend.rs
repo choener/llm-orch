@@ -65,6 +65,10 @@ struct Cli {
     /// stub survives llm-orch's automatic `--spec-draft-device` injection.
     #[arg(long)]
     spec_draft_device: Option<String>,
+    /// Speculative-decoding type (`draft-mtp`, `ngram-cache`, …) —
+    /// accepted and ignored.
+    #[arg(long)]
+    spec_type: Option<String>,
     #[arg(long)]
     threads: Option<usize>,
     #[arg(long)]

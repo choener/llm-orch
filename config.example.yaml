@@ -331,14 +331,19 @@ models:
   #   cmd: "{audiocpp}"
 
   # --- Example 5: speculative decoding with a draft model -------------------
-  # When the command declares a draft model (`--spec-draft-model`,
-  # `-md`, `--model-draft`, or the `--spec-draft-hf` variants), llm-orch
-  # automatically pins the draft to the same device(s) the instance is
-  # placed on by appending `--spec-draft-device VulkanN,…` (CUDA/ROCm
-  # prefixes for those namespaces) at spawn time — llama.cpp would
-  # otherwise run the draft on the CPU.  No config is needed beyond the
-  # draft flags; an explicit `--spec-draft-device`/`--device-draft`/`-devd`
-  # or `--spec-draft-ngl 0` in `cmd` is always respected.
+  # When the command enables draft-model speculation — a draft-model flag
+  # (`--spec-draft-model`, `-md`, `--model-draft`, or the `--spec-draft-hf`
+  # variants) or `--spec-type draft-simple|draft-eagle3|draft-mtp` (incl.
+  # internal MTP heads like Qwen3.6/3.8, which load into their own draft
+  # context) — llm-orch automatically pins the draft to the same device(s)
+  # the instance is placed on by appending `--spec-draft-device VulkanN,…`
+  # (CUDA/ROCm prefixes for those namespaces) at spawn time.  Without it
+  # llama.cpp runs the draft context on its process-default backend, which
+  # is *not* the model's pinned device (e.g. HIP on a Vulkan-pinned model)
+  # and can OOM against the already-loaded model.  Self-speculative ngram
+  # types have no draft context and are never touched.  An explicit
+  # `--spec-draft-device`/`--device-draft`/`-devd` or `--spec-draft-ngl 0`
+  # in `cmd` is always respected.
   # - name: "qwen3-32b-spec"
   #   context_length: 32768
   #   max_instances: 1

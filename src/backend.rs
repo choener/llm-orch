@@ -86,6 +86,17 @@ const DRAFT_MODEL_FLAGS: [&str; 6] = [
 /// keeps the draft on the CPU).
 const DRAFT_DEVICE_FLAGS: [&str; 3] = ["--spec-draft-device", "--device-draft", "-devd"];
 
+/// `--spec-type` values that create a separate draft-model context
+/// (`ctx_dft`) with its own device selection.  These need the draft device
+/// pin even without a `--spec-draft-model` flag — an internal MTP head
+/// (Qwen3.6/3.8) lives in the main GGUF but is still loaded into a draft
+/// context whose default device is llama.cpp's process-default backend,
+/// *not* the main model's pinned device, so it can land on the wrong
+/// backend (e.g. HIP) and OOM against the already-loaded model.
+/// The `ngram-*` types are self-speculative (no draft model) and must not
+/// trigger injection.
+const DRAFT_SPEC_TYPES: [&str; 3] = ["draft-simple", "draft-eagle3", "draft-mtp"];
+
 /// Draft offload-layer flags.  An explicit value of `0` pins the draft
 /// model to the CPU; injecting a device flag would then be pointless.
 const DRAFT_NGL_FLAGS: [&str; 4] = [
@@ -112,6 +123,36 @@ fn declares_any_flag(args: &[String], flags: &[&str]) -> bool {
         let (flag, _) = arg.split_once('=').unwrap_or((arg.as_str(), ""));
         flags.contains(&flag)
     })
+}
+
+/// Whether a `--spec-type` declaration enables draft-model-based
+/// speculation: the value (comma-separated list, `--spec-type X` or
+/// `--spec-type=X`) contains any of [`DRAFT_SPEC_TYPES`].
+fn spec_type_has_draft(args: &[String]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let (flag, inline) = match args[i].split_once('=') {
+            Some((f, v)) => (f, Some(v)),
+            None => (args[i].as_str(), None),
+        };
+        if flag == "--spec-type" {
+            let value = match inline {
+                Some(v) => v,
+                None => match args.get(i + 1) {
+                    Some(v) => {
+                        i += 1; // consume the value token
+                        v.as_str()
+                    }
+                    None => return false,
+                },
+            };
+            if value.split(',').any(|t| DRAFT_SPEC_TYPES.contains(&t)) {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Whether the command line's last draft-offload declaration is an
@@ -162,7 +203,11 @@ impl LlamaCppBackend {
     /// - the program is a llama.cpp program (basename starts with `llama-`),
     /// - the instance is GPU-pinned (`indices` non-empty; a CPU-only
     ///   model keeps its draft on the CPU), and
-    /// - the command declares a draft model, and
+    /// - the command enables draft-model speculation: a draft-model flag
+    ///   (`--spec-draft-model`, `-md`, …) or `--spec-type` with a draft-*
+    ///   value (`draft-simple`, `draft-eagle3`, `draft-mtp` — including
+    ///   internal MTP heads, which live in the main GGUF but still load
+    ///   into a separate draft context), and
     /// - the command does not already control the draft device
     ///   (`--spec-draft-device`/`-devd`/`--device-draft`, incl. `none`)
     ///   or pin the draft to the CPU (`--spec-draft-ngl 0`).
@@ -176,7 +221,7 @@ impl LlamaCppBackend {
         if !basename.starts_with("llama-") || indices.is_empty() {
             return;
         }
-        if !declares_any_flag(args, &DRAFT_MODEL_FLAGS) {
+        if !declares_any_flag(args, &DRAFT_MODEL_FLAGS) && !spec_type_has_draft(args) {
             return;
         }
         if declares_any_flag(args, &DRAFT_DEVICE_FLAGS) || draft_offload_is_zero(args) {
@@ -725,6 +770,80 @@ mod tests {
                 "ngl {value}: {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn injects_spec_draft_device_for_spec_type_draft_variants() {
+        // Internal MTP heads (Qwen3.6/3.8) load into their own draft
+        // context: `--spec-type draft-mtp` alone must trigger the pin.
+        for (flag, value) in [
+            ("--spec-type", "draft-mtp"),
+            ("--spec-type", "draft-simple"),
+            ("--spec-type", "draft-eagle3"),
+            ("--spec-type", "draft-mtp,ngram-cache"),
+            ("--spec-type=draft-eagle3", ""),
+        ] {
+            let mut args = s(&["--model", "m.gguf"]);
+            if value.is_empty() {
+                args.push(flag.to_string());
+            } else {
+                args.extend([flag.to_string(), value.to_string()]);
+            }
+            LlamaCppBackend::inject_spec_draft_device(
+                "llama-server",
+                &mut args,
+                DeviceKind::Vulkan,
+                &[0],
+            );
+            assert!(
+                args.ends_with(&["--spec-draft-device".to_string(), "Vulkan0".to_string()]),
+                "{flag} {value}: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn spec_type_ngram_never_injects() {
+        // Self-speculative n-gram types have no draft model context.
+        for value in [
+            "ngram-simple",
+            "ngram-cache",
+            "ngram-map-k4v,ngram-mod",
+            "none",
+        ] {
+            let mut args = s(&["--spec-type", value]);
+            LlamaCppBackend::inject_spec_draft_device(
+                "llama-server",
+                &mut args,
+                DeviceKind::Vulkan,
+                &[0],
+            );
+            assert_eq!(args, s(&["--spec-type", value]), "{value}");
+        }
+    }
+
+    #[test]
+    fn spec_type_respects_explicit_draft_device_and_ngl_zero() {
+        let mut args = s(&["--spec-type", "draft-mtp", "--spec-draft-device", "CUDA1"]);
+        LlamaCppBackend::inject_spec_draft_device(
+            "llama-server",
+            &mut args,
+            DeviceKind::Vulkan,
+            &[0],
+        );
+        assert_eq!(
+            args,
+            s(&["--spec-type", "draft-mtp", "--spec-draft-device", "CUDA1"])
+        );
+
+        let mut args = s(&["--spec-type", "draft-mtp", "-ngld", "0"]);
+        LlamaCppBackend::inject_spec_draft_device(
+            "llama-server",
+            &mut args,
+            DeviceKind::Vulkan,
+            &[0],
+        );
+        assert_eq!(args, s(&["--spec-type", "draft-mtp", "-ngld", "0"]));
     }
 
     #[test]

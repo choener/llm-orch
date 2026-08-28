@@ -18,11 +18,18 @@ flat pool form `[0,1]` + `gpus`.
 
 - [x] `src/backend.rs`: `LlamaCppBackend::inject_spec_draft_device(program, args, kind, indices)`
   - llama-* programs only; no-op when `indices` empty (CPU-only → draft stays CPU)
-  - only when a draft-model flag is declared
+  - fires when draft-model speculation is enabled: a draft-model flag
+    (`--spec-draft-model`/`-md`/`--model-draft`, `--spec-draft-hf`/`-hfd`/`--hf-repo-draft`)
+    OR `--spec-type` with a `draft-simple|draft-eagle3|draft-mtp` value
+    (comma-separated supported) — internal MTP heads (Qwen3.6/3.8) also
+    load into a separate draft context whose default device is the
+    process-default backend, NOT the model's pinned device (observed:
+    HIP `cudaMalloc` OOM on a Vulkan-pinned model)
   - never override an explicit draft-device flag (`--spec-draft-device`/`-devd`/`--device-draft`)
   - skip when draft offload explicitly 0 (`--spec-draft-ngl 0`/`-ngld 0`/`--gpu-layers-draft 0`/`--n-gpu-layers-draft 0`)
   - append `--spec-draft-device Vulkan0,…` using post-filter ranks
-  - unit tests (5 new)
+  - unit tests (8: 5 original + spec-type variants, ngram non-trigger, override)
+  - integration test: `--spec-type draft-mtp` → injected, `ngram-cache` → not
 - [x] `src/config.rs`: `DevicePool` enum (Pool / Placements), custom Deserialize
   (flat `[0,1]` → Pool; nested `[[0],[1]]` → Placements; `[]` → empty Pool)
 - [x] `src/config.rs`: validation — nested form: `gpus` must stay 1, inner lists
@@ -46,6 +53,15 @@ flat pool form `[0,1]` + `gpus`.
   flags + `--argv-log` test support
 
 ## Verified facts (llama.cpp)
+
+- `--spec-type` names: `draft-simple`, `draft-eagle3`, `draft-mtp`, `ngram-simple`,
+  `ngram-map-k`, `ngram-map-k4v`, `ngram-mod`, `ngram-cache`, `none`.
+  Only the draft-* types create a draft-model context (`ctx_dft`).
+- Observed on the user's host: internal MTP (`creating MTP draft context
+  against the target model`) with no `--spec-draft-device` allocated on the
+  HIP/CUDA backend (`cudaMalloc failed: out of memory`, `failed to allocate
+  ROCm0 buffer`) while the main model is Vulkan-pinned — the draft context
+  defaults to the process-default backend, not the model's devices.
 
 - `--spec-draft-device <dev1,dev2,..>` takes device names as printed by
   `--list-devices` (`Vulkan0`, `CUDA0`, `ROCm0`); `none` = don't offload;

@@ -1307,6 +1307,8 @@ fn draft_models_yaml(llama_stub: &str, argv_logs: &[&Path]) -> String {
     );
     for (i, (name, extra)) in [
         ("spec", "--spec-draft-model draft.gguf"),
+        ("spec-type", "--spec-type draft-mtp"),
+        ("ngram", "--spec-type ngram-cache"),
         ("plain", ""),
         (
             "explicit",
@@ -1345,6 +1347,8 @@ async fn spawn_injects_spec_draft_device_for_draft_models() {
     let dir = temp_dir("draft-device");
     let llama_stub = llama_stub_link(&dir);
     let argv_spec = dir.join("argv-spec.txt");
+    let argv_spec_type = dir.join("argv-spec-type.txt");
+    let argv_ngram = dir.join("argv-ngram.txt");
     let argv_plain = dir.join("argv-plain.txt");
     let argv_explicit = dir.join("argv-explicit.txt");
 
@@ -1352,13 +1356,19 @@ async fn spawn_injects_spec_draft_device_for_draft_models() {
     // real one before boot.
     let yaml = draft_models_yaml(
         &llama_stub.display().to_string(),
-        &[&argv_spec, &argv_plain, &argv_explicit],
+        &[
+            &argv_spec,
+            &argv_spec_type,
+            &argv_ngram,
+            &argv_plain,
+            &argv_explicit,
+        ],
     )
     .replace("pci: \"{}\"", &format!("pci: \"{slot}\""));
 
     let srv = boot(&dir, "tester: secret-key\n", &yaml).await;
     let client = reqwest::Client::new();
-    for model in ["spec", "plain", "explicit"] {
+    for model in ["spec", "spec-type", "ngram", "plain", "explicit"] {
         let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
             .json(&chat_body(model))
             .send()
@@ -1377,6 +1387,25 @@ async fn spawn_injects_spec_draft_device_for_draft_models() {
         draft_device_value(&argv).as_deref(),
         Some("CUDA0"),
         "draft device must be injected for draft models: {argv:?}"
+    );
+
+    // `spec-type`: internal-MTP-style enabling (`--spec-type draft-mtp`,
+    // no draft-model file flag) must also pin the draft context — its
+    // default device is llama.cpp's process-default backend, not the
+    // model's.
+    let argv = argv_of(&argv_spec_type);
+    assert_eq!(
+        draft_device_value(&argv).as_deref(),
+        Some("CUDA0"),
+        "draft device must be injected for --spec-type draft-mtp: {argv:?}"
+    );
+
+    // `ngram`: self-speculative types have no draft context.
+    let argv = argv_of(&argv_ngram);
+    assert_eq!(
+        draft_device_value(&argv),
+        None,
+        "no draft-device flag for ngram speculation: {argv:?}"
     );
 
     // `plain`: no draft model → nothing injected.
