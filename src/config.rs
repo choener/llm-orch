@@ -120,37 +120,72 @@ impl Config {
                     m.name
                 )));
             }
-            let (pool_len, ns) = if !m.cuda_devices.is_empty() {
-                (m.cuda_devices.len(), "cuda_devices")
+            let (pool, ns) = if !m.cuda_devices.is_empty() {
+                (&m.cuda_devices, "cuda_devices")
             } else if !m.rocm_devices.is_empty() {
-                (m.rocm_devices.len(), "rocm_devices")
+                (&m.rocm_devices, "rocm_devices")
             } else {
-                (m.vulkan_devices.len(), "vulkan_devices")
+                (&m.vulkan_devices, "vulkan_devices")
             };
-            if pool_len == 0 {
-                // CPU-only model: spanning multiple devices is meaningless.
-                if m.gpus != 1 {
-                    return Err(ConfigError::Validation(format!(
-                        "model '{}': gpus ({}) exceeds device count (0) (CPU-only models must use gpus: 1)",
-                        m.name, m.gpus
-                    )));
+            match pool {
+                DevicePool::Pool(devices) if devices.is_empty() => {
+                    // CPU-only model: spanning multiple devices is meaningless.
+                    if m.gpus != 1 {
+                        return Err(ConfigError::Validation(format!(
+                            "model '{}': gpus ({}) exceeds device count (0) (CPU-only models must use gpus: 1)",
+                            m.name, m.gpus
+                        )));
+                    }
+                    // A CPU-only llama.cpp model must not request GPU offload in
+                    // its command: llama.cpp's default is to offload as many
+                    // layers as fit, so the contradiction would silently load
+                    // onto GPU 0.  Rejected here, at config load, rather than
+                    // guessing at intent at spawn time.
+                    if let Some(declared) = cpu_cmd_offload_decl(&self.cmd_aliases, m) {
+                        return Err(ConfigError::Validation(format!(
+                            "model '{}': CPU-only (no device pool) but its command requests GPU offload ({declared}) — add vulkan_devices/cuda_devices/rocm_devices or drop the flag (use a CPU alias)",
+                            m.name
+                        )));
+                    }
                 }
-                // A CPU-only llama.cpp model must not request GPU offload in
-                // its command: llama.cpp's default is to offload as many
-                // layers as fit, so the contradiction would silently load
-                // onto GPU 0.  Rejected here, at config load, rather than
-                // guessing at intent at spawn time.
-                if let Some(declared) = cpu_cmd_offload_decl(&self.cmd_aliases, m) {
-                    return Err(ConfigError::Validation(format!(
-                        "model '{}': CPU-only (no device pool) but its command requests GPU offload ({declared}) — add vulkan_devices/cuda_devices/rocm_devices or drop the flag (use a CPU alias)",
-                        m.name
-                    )));
+                DevicePool::Pool(devices) => {
+                    if m.gpus > devices.len() {
+                        return Err(ConfigError::Validation(format!(
+                            "model '{}': gpus ({}) exceeds {} count ({})",
+                            m.name,
+                            m.gpus,
+                            ns,
+                            devices.len()
+                        )));
+                    }
                 }
-            } else if m.gpus > pool_len {
-                return Err(ConfigError::Validation(format!(
-                    "model '{}': gpus ({}) exceeds {} count ({})",
-                    m.name, m.gpus, ns, pool_len
-                )));
+                DevicePool::Placements(placements) => {
+                    // Each placement's device count is its own span — `gpus`
+                    // is meaningless here and must stay at its default of 1.
+                    if m.gpus != 1 {
+                        return Err(ConfigError::Validation(format!(
+                            "model '{}': gpus ({}) must stay 1 when {} uses placement lists (each placement's device count is its span)",
+                            m.name, m.gpus, ns
+                        )));
+                    }
+                    for (i, placement) in placements.iter().enumerate() {
+                        if placement.is_empty() {
+                            return Err(ConfigError::Validation(format!(
+                                "model '{}': {} placement {} is empty",
+                                m.name, ns, i
+                            )));
+                        }
+                        let mut seen = HashSet::new();
+                        for idx in placement {
+                            if !seen.insert(idx) {
+                                return Err(ConfigError::Validation(format!(
+                                    "model '{}': {} placement {} repeats device {}",
+                                    m.name, ns, i, idx
+                                )));
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -342,8 +377,8 @@ impl Config {
         if let Some(ref devs) = self.devices {
             let valid_indices: HashSet<&usize> = devs.vulkan.keys().collect();
             for m in &self.models {
-                for idx in &m.vulkan_devices {
-                    if !valid_indices.contains(idx) {
+                for idx in m.vulkan_devices.iter_indices() {
+                    if !valid_indices.contains(&idx) {
                         return Err(ConfigError::Validation(format!(
                             "model '{}': vulkan_device {} not defined in devices.vulkan",
                             m.name, idx
@@ -361,8 +396,8 @@ impl Config {
                 .map(|d| d.cuda.keys().copied().collect())
                 .unwrap_or_default();
             for m in &self.models {
-                for idx in &m.cuda_devices {
-                    if !valid_indices.contains(idx) {
+                for idx in m.cuda_devices.iter_indices() {
+                    if !valid_indices.contains(&idx) {
                         return Err(ConfigError::Validation(format!(
                             "model '{}': cuda_device {} not defined in devices.cuda",
                             m.name, idx
@@ -380,8 +415,8 @@ impl Config {
                 .map(|d| d.rocm.keys().copied().collect())
                 .unwrap_or_default();
             for m in &self.models {
-                for idx in &m.rocm_devices {
-                    if !valid_indices.contains(idx) {
+                for idx in m.rocm_devices.iter_indices() {
+                    if !valid_indices.contains(&idx) {
                         return Err(ConfigError::Validation(format!(
                             "model '{}': rocm_device {} not defined in devices.rocm",
                             m.name, idx
@@ -513,6 +548,119 @@ impl Default for PortRange {
 // Model definitions
 // ---------------------------------------------------------------------------
 
+/// A model's device pool, in one of two YAML forms:
+///
+/// - flat pool: `[0, 1]` — each instance spans `gpus` devices chosen from
+///   the list (legacy form), or
+/// - explicit placements: `[[0],[1]]` — each inner list is one complete
+///   device set; every instance uses exactly one of them.  `[[0],[1]]` is
+///   single-GPU (either one is fine), `[[0,1]]` is dual-GPU (using both).
+#[derive(Debug, Clone)]
+pub enum DevicePool {
+    /// Legacy flat pool: the scheduler picks `gpus` devices per instance.
+    Pool(Vec<usize>),
+    /// Explicit placement alternatives: each inner list is one complete
+    /// device set for an instance (its own span).  `gpus` must stay 1.
+    Placements(Vec<Vec<usize>>),
+}
+
+impl Default for DevicePool {
+    fn default() -> Self {
+        DevicePool::Pool(Vec::new())
+    }
+}
+
+impl DevicePool {
+    /// Whether no devices are configured at all (CPU-only model).
+    pub fn is_empty(&self) -> bool {
+        match self {
+            DevicePool::Pool(devices) => devices.is_empty(),
+            DevicePool::Placements(placements) => placements.is_empty(),
+        }
+    }
+
+    /// The flat pool, when configured in the legacy form.
+    pub fn as_pool(&self) -> Option<&Vec<usize>> {
+        match self {
+            DevicePool::Pool(devices) => Some(devices),
+            DevicePool::Placements(_) => None,
+        }
+    }
+
+    /// The explicit placement alternatives, when configured in that form.
+    pub fn as_placements(&self) -> Option<&Vec<Vec<usize>>> {
+        match self {
+            DevicePool::Pool(_) => None,
+            DevicePool::Placements(placements) => Some(placements),
+        }
+    }
+
+    /// Every referenced device index, in configuration order (duplicates
+    /// possible across placement alternatives).  Pools are tiny — an owned
+    /// copy keeps the signature simple.
+    pub fn iter_indices(&self) -> Vec<usize> {
+        match self {
+            DevicePool::Pool(devices) => devices.clone(),
+            DevicePool::Placements(placements) => placements.iter().flatten().copied().collect(),
+        }
+    }
+
+    /// Order-insensitive, deduplicated index set — used for fingerprinting.
+    /// Placement structure does not change the spawned process, only the
+    /// device set an instance ends up on does.
+    pub fn canonical_indices(&self) -> Vec<usize> {
+        let mut indices: Vec<usize> = self.iter_indices();
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    }
+}
+
+impl<'de> Deserialize<'de> for DevicePool {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_yaml_ng::Value::deserialize(deserializer)?;
+        let seq = value
+            .as_sequence()
+            .ok_or_else(|| serde::de::Error::custom("expected a list of device indices"))?;
+        match seq.first() {
+            // `[]` — no devices (CPU-only).
+            None => Ok(DevicePool::Pool(Vec::new())),
+            // `[[0],[1]]` — explicit placement alternatives.
+            Some(first) if first.is_sequence() => {
+                let mut placements = Vec::with_capacity(seq.len());
+                for item in seq {
+                    let inner = item.as_sequence().ok_or_else(|| {
+                        serde::de::Error::custom("placement must be a list of device indices")
+                    })?;
+                    let mut devices = Vec::with_capacity(inner.len());
+                    for device in inner {
+                        let index = device.as_u64().ok_or_else(|| {
+                            serde::de::Error::custom("device index must be a non-negative integer")
+                        })?;
+                        devices.push(index as usize);
+                    }
+                    placements.push(devices);
+                }
+                Ok(DevicePool::Placements(placements))
+            }
+            // `[0, 1]` — flat pool (legacy form).
+            Some(_) => {
+                let mut devices = Vec::with_capacity(seq.len());
+                for item in seq {
+                    let index = item.as_u64().ok_or_else(|| {
+                        serde::de::Error::custom("device index must be a non-negative integer")
+                    })?;
+                    devices.push(index as usize);
+                }
+                Ok(DevicePool::Pool(devices))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelConfig {
     /// Unique model name, used as the identifier in `/v1/models` and alias targets.
@@ -566,26 +714,36 @@ pub struct ModelConfig {
     /// `{max_concurrent}` with the model's declared `max_concurrent`.
     pub cmd: String,
 
-    /// Vulkan device indices this model can be placed on (from `devices.vulkan`).
+    /// Vulkan devices this model can be placed on (from `devices.vulkan`).
     /// Empty = CPU only (unless `cuda_devices` or `rocm_devices` is set).
     /// Mutually exclusive with the other device namespaces.
+    ///
+    /// Two forms are accepted:
+    /// - flat pool: `[0, 1]` — each instance spans `gpus` devices chosen
+    ///   from the pool (legacy form), or
+    /// - explicit placements: `[[0],[1]]` — each inner list is one complete
+    ///   device set; every instance uses exactly one of them (its own
+    ///   span).  `[[0],[1]]` is single-GPU (either one), `[[0,1]]` is
+    ///   dual-GPU (using both).  `gpus` must stay 1.
     #[serde(default)]
-    pub vulkan_devices: Vec<usize>,
+    pub vulkan_devices: DevicePool,
 
-    /// CUDA device indices this model can be placed on (from `devices.cuda`).
+    /// CUDA devices this model can be placed on (from `devices.cuda`).
     /// When non-empty the model is a CUDA model: placement uses the CUDA
     /// pool and instances are pinned via `CUDA_VISIBLE_DEVICES`.
     /// Mutually exclusive with `vulkan_devices` and `rocm_devices`.
+    /// Same two forms as `vulkan_devices`.
     #[serde(default)]
-    pub cuda_devices: Vec<usize>,
+    pub cuda_devices: DevicePool,
 
-    /// ROCm device indices this model can be placed on (from `devices.rocm`).
+    /// ROCm devices this model can be placed on (from `devices.rocm`).
     /// When non-empty the model is a ROCm model: placement uses the ROCm
     /// pool and instances are pinned via `HIP_VISIBLE_DEVICES` plus llama.cpp's
     /// explicit `--device ROCmN` selection.
     /// Mutually exclusive with `vulkan_devices` and `cuda_devices`.
+    /// Same two forms as `vulkan_devices`.
     #[serde(default)]
-    pub rocm_devices: Vec<usize>,
+    pub rocm_devices: DevicePool,
 
     /// Number of devices each instance of this model spans.
     /// The model is split evenly across them (llama.cpp's default tensor
@@ -612,6 +770,13 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
+    /// Whether any GPU device pool is configured (Vulkan, CUDA, or ROCm).
+    pub fn has_device_pool(&self) -> bool {
+        !self.vulkan_devices.is_empty()
+            || !self.cuda_devices.is_empty()
+            || !self.rocm_devices.is_empty()
+    }
+
     /// Device namespace this model is placed on.  Validation guarantees
     /// that at most one GPU pool is configured; an empty pool means CPU-only.
     pub fn device_kind(&self) -> crate::backend::DeviceKind {
@@ -1135,6 +1300,112 @@ models:
             "cmd: \"sleep 3600\"\n    gpus: 2\n    vulkan_devices: [0, 1]",
         );
         parse(&yaml).unwrap();
+    }
+
+    // ── explicit placement lists (nested form) ────────────────────────
+
+    #[test]
+    fn parses_flat_and_nested_device_pools() {
+        // Legacy flat pool.
+        let cfg: ModelConfig = serde_yaml_ng::from_str(
+            "name: m\ncontext_length: 4096\ncmd: \"sleep 1\"\nvulkan_devices: [0, 1]",
+        )
+        .unwrap();
+        assert!(matches!(cfg.vulkan_devices, DevicePool::Pool(ref d) if d == &vec![0, 1]));
+
+        // Explicit single-GPU alternatives.
+        let cfg: ModelConfig = serde_yaml_ng::from_str(
+            "name: m\ncontext_length: 4096\ncmd: \"sleep 1\"\nvulkan_devices: [[0],[1]]",
+        )
+        .unwrap();
+        assert!(
+            matches!(cfg.vulkan_devices, DevicePool::Placements(ref p) if p == &vec![vec![0], vec![1]])
+        );
+
+        // Explicit dual-GPU placement.
+        let cfg: ModelConfig = serde_yaml_ng::from_str(
+            "name: m\ncontext_length: 4096\ncmd: \"sleep 1\"\nvulkan_devices: [[0,1]]",
+        )
+        .unwrap();
+        assert!(
+            matches!(cfg.vulkan_devices, DevicePool::Placements(ref p) if p == &vec![vec![0, 1]])
+        );
+
+        // Empty list = no devices (CPU-only).
+        let cfg: ModelConfig = serde_yaml_ng::from_str(
+            "name: m\ncontext_length: 4096\ncmd: \"sleep 1\"\nvulkan_devices: []",
+        )
+        .unwrap();
+        assert!(cfg.vulkan_devices.is_empty());
+        assert!(matches!(cfg.vulkan_devices, DevicePool::Pool(_)));
+    }
+
+    #[test]
+    fn accepts_nested_single_and_dual_gpu_placements() {
+        let slots = real_drm_slots();
+        if slots.len() < 2 {
+            return;
+        }
+        for placements in ["[[0],[1]]", "[[0,1]]"] {
+            let yaml = BASE
+                .replace(
+                    "apikeys_file: apikeys.txt",
+                    &format!(
+                        "apikeys_file: apikeys.txt\ndevices:\n  vulkan:\n    0: \"{}\"\n    1: \"{}\"",
+                        slots[0], slots[1]
+                    ),
+                )
+                .replace(
+                    "cmd: \"sleep 3600\"",
+                    &format!("cmd: \"sleep 3600\"\n    vulkan_devices: {placements}"),
+                );
+            parse(&yaml).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_gpus_with_nested_placements() {
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\n    gpus: 2\n    vulkan_devices: [[0],[1]]",
+        );
+        expect_validation_error(&yaml, "gpus (2) must stay 1");
+    }
+
+    #[test]
+    fn rejects_empty_and_duplicate_placements() {
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\n    vulkan_devices: [[], [0]]",
+        );
+        expect_validation_error(&yaml, "placement 0 is empty");
+
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\n    vulkan_devices: [[0, 0]]",
+        );
+        expect_validation_error(&yaml, "placement 0 repeats device 0");
+    }
+
+    #[test]
+    fn rejects_undefined_device_in_placement() {
+        let slots = real_drm_slots();
+        if slots.is_empty() {
+            return;
+        }
+        let yaml = BASE
+            .replace(
+                "apikeys_file: apikeys.txt",
+                &format!(
+                    "apikeys_file: apikeys.txt\ndevices:\n  vulkan:\n    0: \"{}\"",
+                    slots[0]
+                ),
+            )
+            .replace(
+                "cmd: \"sleep 3600\"",
+                "cmd: \"sleep 3600\"\n    vulkan_devices: [[0],[1]]",
+            );
+        expect_validation_error(&yaml, "vulkan_device 1 not defined in devices.vulkan");
     }
 
     #[test]

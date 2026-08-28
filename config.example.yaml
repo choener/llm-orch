@@ -200,6 +200,16 @@ models:
   # orchestrator picks two devices from the pool with enough free VRAM
   # each.  For asymmetric splits use --tensor-split in cmd and set vram
   # to the largest per-GPU share.
+  #
+  # Alternative: instead of a flat pool + `gpus`, list explicit placement
+  # alternatives — each inner list is one complete device set an instance
+  # may use, and its length is the span.  `[[0],[1]]` is single-GPU
+  # (either one is fine), `[[0,1]]` is dual-GPU (using both).  With this
+  # form `gpus` must stay 1.  These placements also pin a speculative-
+  # decoding draft model (see Example 5): the draft runs on exactly the
+  # device(s) of the instance's placement.
+  #   vulkan_devices: [[0], [1]]    # one GPU per instance
+  #   vulkan_devices: [[0, 1]]      # both GPUs per instance
   # - name: "qwen3.6-27b-q8"
   #   context_length: 32768
   #   max_instances: 1
@@ -319,6 +329,30 @@ models:
   #   queue_depth: 5
   #   # vulkan_devices: [0]      # uncomment for GPU placement
   #   cmd: "{audiocpp}"
+
+  # --- Example 5: speculative decoding with a draft model -------------------
+  # When the command declares a draft model (`--spec-draft-model`,
+  # `-md`, `--model-draft`, or the `--spec-draft-hf` variants), llm-orch
+  # automatically pins the draft to the same device(s) the instance is
+  # placed on by appending `--spec-draft-device VulkanN,…` (CUDA/ROCm
+  # prefixes for those namespaces) at spawn time — llama.cpp would
+  # otherwise run the draft on the CPU.  No config is needed beyond the
+  # draft flags; an explicit `--spec-draft-device`/`--device-draft`/`-devd`
+  # or `--spec-draft-ngl 0` in `cmd` is always respected.
+  # - name: "qwen3-32b-spec"
+  #   context_length: 32768
+  #   max_instances: 1
+  #   max_concurrent: 4
+  #   vram: 26000             # main model + draft model on one GPU
+  #   idle_ttl: 600
+  #   queue_depth: 10
+  #   vulkan_devices: [[0]]   # or [[0],[1]] / [[0,1]] — the draft follows
+  #   cmd: |
+  #     {llama}
+  #       --model /models/qwen3-32b-q4_k_m.gguf
+  #       --ctx-size 32768
+  #       --spec-draft-model /models/qwen3-1.7b-q4_k_m.gguf
+  #       --spec-draft-ngl 99   # offload all draft layers
 
 # ---------------------------------------------------------------------------
 # Aliases

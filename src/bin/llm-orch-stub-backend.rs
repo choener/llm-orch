@@ -58,12 +58,24 @@ struct Cli {
     /// device number; accepted and ignored by the test stub.
     #[arg(long)]
     device: Option<String>,
+    /// Speculative-decoding draft model path — accepted and ignored.
+    #[arg(long)]
+    spec_draft_model: Option<String>,
+    /// Speculative-decoding draft device pin — accepted and ignored so the
+    /// stub survives llm-orch's automatic `--spec-draft-device` injection.
+    #[arg(long)]
+    spec_draft_device: Option<String>,
     #[arg(long)]
     threads: Option<usize>,
     #[arg(long)]
     busy_timeout_ms: Option<u64>,
     #[arg(long)]
     model_spec_override: Option<String>,
+    /// Write the process argv (program excluded, one argument per line) to
+    /// this file at startup — lets integration tests assert the exact
+    /// command line llm-orch assembled.
+    #[arg(long)]
+    argv_log: Option<String>,
     #[arg(long)]
     voice_dir: Option<String>,
     #[arg(long)]
@@ -85,6 +97,12 @@ struct StubConfig {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    if let Some(path) = &cli.argv_log {
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        if let Err(e) = std::fs::write(path, argv.join("\n")) {
+            eprintln!("argv-log: failed to write {path}: {e}");
+        }
+    }
     let cfg = StubConfig {
         chunks: cli.chunks,
         chunk_delay: Duration::from_millis(cli.chunk_delay_ms),

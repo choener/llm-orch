@@ -7,7 +7,7 @@ use crate::backend::{
     Backend, DeviceKind, LlamaCppBackend, ReadyOutcome, output_lines, poll_readiness,
     shutdown_child, spawn_process,
 };
-use crate::config::{AliasPolicy, MakeRoomMode, ModelConfig};
+use crate::config::{AliasPolicy, DevicePool, MakeRoomMode, ModelConfig};
 use crate::gpu::GpuMetrics;
 use crate::http_client;
 use crate::instance::{Instance, InstanceHandle, InstanceLoadPurpose, InstanceState, SlotGuard};
@@ -935,12 +935,9 @@ fn fingerprint_with_aliases(cmd_aliases: &HashMap<String, String>, cfg: &ModelCo
     for (key, value) in cmd_aliases {
         resolved = resolved.replace(&format!("{{{}}}", key), value);
     }
-    let mut devices = cfg.vulkan_devices.clone();
-    devices.sort_unstable();
-    let mut cuda_devices = cfg.cuda_devices.clone();
-    cuda_devices.sort_unstable();
-    let mut rocm_devices = cfg.rocm_devices.clone();
-    rocm_devices.sort_unstable();
+    let devices = cfg.vulkan_devices.canonical_indices();
+    let cuda_devices = cfg.cuda_devices.canonical_indices();
+    let rocm_devices = cfg.rocm_devices.canonical_indices();
     let mut h = std::collections::hash_map::DefaultHasher::new();
     resolved.hash(&mut h);
     devices.hash(&mut h);
@@ -1764,10 +1761,7 @@ impl InstanceManager {
         }
         // Without a device pool there is nothing to check — the spawn
         // proceeds unpinned (CPU or unrestricted GPUs).
-        let has_device_pool = !cfg.vulkan_devices.is_empty()
-            || !cfg.cuda_devices.is_empty()
-            || !cfg.rocm_devices.is_empty();
-        if !has_device_pool {
+        if !cfg.has_device_pool() {
             return true;
         }
         let available = if excluding.is_empty() {
@@ -3096,10 +3090,7 @@ impl InstanceManager {
         // without GPU restriction (competing on GPUs already occupied by
         // existing instances) or with too few devices (a multi-GPU model
         // would not fit in memory).
-        let has_device_pool = !cfg.vulkan_devices.is_empty()
-            || !cfg.cuda_devices.is_empty()
-            || !cfg.rocm_devices.is_empty();
-        if has_device_pool && placement.is_none() {
+        if cfg.has_device_pool() && placement.is_none() {
             warn!(
                 model = %model_name,
                 kind = ?cfg.device_kind(),
@@ -3179,6 +3170,11 @@ impl InstanceManager {
         if gpu_indices.is_empty() {
             LlamaCppBackend::enforce_cpu_offload(prog, &mut args);
         }
+        // Speculative decoding: pin the draft model to the same device(s)
+        // the instance is placed on (`--spec-draft-device`).  No-op unless
+        // the command declares a draft model and leaves the draft device
+        // to us.
+        LlamaCppBackend::inject_spec_draft_device(prog, &mut args, cfg.device_kind(), &gpu_indices);
         let envs = model_backend.gpu_env(&gpu_indices);
 
         // Spawn.
@@ -3372,9 +3368,11 @@ impl InstanceManager {
 
     /// Pick the devices for a new instance from the model's device pool
     /// (`vulkan_devices`, `cuda_devices`, or `rocm_devices`, per the
-    /// model's [`DeviceKind`]).  Returns up to `model_cfg.gpus` distinct
-    /// devices (empty when the pool can't satisfy the request — the caller
-    /// decides between CPU fallback and spawn refusal).
+    /// model's [`DeviceKind`]).  For a flat pool this returns up to
+    /// `model_cfg.gpus` distinct devices; for explicit placements it
+    /// returns exactly one configured alternative.  Empty when the pool
+    /// can't satisfy the request — the caller decides between CPU
+    /// fallback and spawn refusal.
     ///
     /// Per-GPU accounting is keyed by PCI slot so Vulkan, CUDA, and ROCm
     /// indices can never alias each other.
@@ -3433,7 +3431,16 @@ impl InstanceManager {
             DeviceKind::Rocm => &model_cfg.rocm_devices,
             DeviceKind::Vulkan => &model_cfg.vulkan_devices,
         };
-        if indices.len() != model_cfg.gpus || indices.iter().any(|index| !pool.contains(index)) {
+        // Flat pool: any `gpus`-sized subset.  Explicit placements: the
+        // indices must match one alternative exactly (order included — the
+        // migration planner hands back the selector's own emission order).
+        let valid = match pool {
+            DevicePool::Pool(devices) => {
+                indices.len() == model_cfg.gpus && indices.iter().all(|i| devices.contains(i))
+            }
+            DevicePool::Placements(placements) => placements.iter().any(|p| p == indices),
+        };
+        if !valid {
             return None;
         }
         let pci_slots = self.pci_slots_for_config(model_cfg, indices)?;
@@ -3615,7 +3622,7 @@ impl InstanceManager {
 
         let model_vram_bytes = model_cfg.vram * 1024 * 1024;
         let mut candidates: Vec<(usize, u64)> = Vec::new();
-        for &idx in pool {
+        for idx in pool.iter_indices() {
             let pci_slot = match slots.get(&idx) {
                 Some(s) => s.as_str(),
                 None => {
@@ -3666,16 +3673,6 @@ impl InstanceManager {
         }
 
         let needed = model_cfg.gpus;
-        if candidates.len() < needed {
-            debug!(
-                model = %model_cfg.name,
-                needed,
-                available = candidates.len(),
-                "not enough GPU candidates"
-            );
-            return None;
-        }
-
         let instance_counts: HashMap<String, usize> = {
             let instances = self.instances.read().unwrap();
             let mut counts = HashMap::new();
@@ -3713,11 +3710,89 @@ impl InstanceManager {
                 .then(b_free.cmp(a_free))
                 .then(a_idx.cmp(b_idx))
         });
-        let chosen: Vec<usize> = candidates
-            .iter()
-            .take(needed)
-            .map(|(idx, _)| *idx)
-            .collect();
+        let count_of = |idx: &usize| {
+            slots
+                .get(idx)
+                .and_then(|slot| instance_counts.get(slot))
+                .copied()
+                .unwrap_or(0)
+        };
+        let candidate_free: HashMap<usize, u64> = candidates.iter().copied().collect();
+        let chosen: Vec<usize> = match pool.as_placements() {
+            // Explicit placements: the instance must land on exactly one
+            // alternative, every device of which is feasible (not occupied,
+            // not blocked, enough free VRAM).  Among feasible alternatives
+            // pick the best with the same spirit as the pool packing:
+            // least-loaded GPUs first, then most free VRAM, then lowest
+            // indices.  Deterministic.
+            Some(placements) => {
+                let mut best: Option<(&Vec<usize>, usize, u64, usize)> = None; // (devices, max count, min free, idx sum)
+                for placement in placements {
+                    if placement.is_empty() {
+                        continue; // rejected by config validation
+                    }
+                    if placement
+                        .iter()
+                        .any(|idx| !candidate_free.contains_key(idx))
+                    {
+                        debug!(
+                            model = %model_cfg.name,
+                            placement = ?placement,
+                            "placement not fully feasible — skipping"
+                        );
+                        continue;
+                    }
+                    let max_count = placement.iter().map(count_of).max().unwrap_or(0);
+                    let min_free = placement
+                        .iter()
+                        .map(|idx| candidate_free[idx])
+                        .min()
+                        .unwrap_or(0);
+                    let idx_sum: usize = placement.iter().sum();
+                    let better = match best {
+                        None => true,
+                        Some((_, b_max_count, b_min_free, b_idx_sum)) => {
+                            max_count < b_max_count
+                                || (max_count == b_max_count && min_free > b_min_free)
+                                || (max_count == b_max_count
+                                    && min_free == b_min_free
+                                    && idx_sum < b_idx_sum)
+                        }
+                    };
+                    if better {
+                        best = Some((placement, max_count, min_free, idx_sum));
+                    }
+                }
+                match best {
+                    Some((placement, _, _, _)) => placement.clone(),
+                    None => {
+                        debug!(
+                            model = %model_cfg.name,
+                            placements = placements.len(),
+                            "no placement alternative fully feasible"
+                        );
+                        return None;
+                    }
+                }
+            }
+            // Legacy flat pool: any `gpus`-sized subset, packed greedily.
+            None => {
+                if candidates.len() < needed {
+                    debug!(
+                        model = %model_cfg.name,
+                        needed,
+                        available = candidates.len(),
+                        "not enough GPU candidates"
+                    );
+                    return None;
+                }
+                candidates
+                    .iter()
+                    .take(needed)
+                    .map(|(idx, _)| *idx)
+                    .collect()
+            }
+        };
         let pci_slots: Vec<String> = chosen
             .iter()
             .filter_map(|idx| slots.get(idx).cloned())
@@ -6118,9 +6193,9 @@ models:
 
         // vulkan_devices change → different fingerprint (order-insensitive).
         let mut m3 = model.clone();
-        m3.vulkan_devices = vec![1, 0];
+        m3.vulkan_devices = DevicePool::Pool(vec![1, 0]);
         let mut m4 = model.clone();
-        m4.vulkan_devices = vec![0, 1];
+        m4.vulkan_devices = DevicePool::Pool(vec![0, 1]);
         assert_eq!(
             fingerprint_with_aliases(&no_aliases, &m3),
             fingerprint_with_aliases(&no_aliases, &m4)
@@ -6129,9 +6204,9 @@ models:
 
         // rocm_devices change → different fingerprint (namespace and order).
         let mut rocm = model.clone();
-        rocm.rocm_devices = vec![1, 0];
+        rocm.rocm_devices = DevicePool::Pool(vec![1, 0]);
         let mut rocm_reordered = model.clone();
-        rocm_reordered.rocm_devices = vec![0, 1];
+        rocm_reordered.rocm_devices = DevicePool::Pool(vec![0, 1]);
         assert_eq!(
             fingerprint_with_aliases(&no_aliases, &rocm),
             fingerprint_with_aliases(&no_aliases, &rocm_reordered)
@@ -6900,6 +6975,111 @@ models:
         );
     }
 
+    // ── explicit placement lists (nested form) ────────────────────────
+
+    #[tokio::test]
+    async fn select_uses_explicit_dual_gpu_placement() {
+        // [[0,1]]: one placement spanning both GPUs — the instance must
+        // land on exactly that pair.
+        let mgr = multi_gpu_manager();
+        let cfg: ModelConfig = serde_yaml_ng::from_str(
+            "name: dual\ncontext_length: 4096\ncmd: \"sleep 1\"\nvram: 20000\nvulkan_devices: [[0,1]]",
+        )
+        .unwrap();
+        let placement = mgr.select_gpus_for_model(&cfg).await;
+        assert_eq!(placement, vec![0, 1], "dual placement must use both GPUs");
+    }
+
+    #[tokio::test]
+    async fn select_avoids_occupied_single_gpu_placement() {
+        // [[0],[1]]: single-GPU alternatives, either one is fine.  With GPU
+        // 0 already carrying an instance of the model, GPU 1 is chosen.
+        let mgr = multi_gpu_manager();
+        let cfg: ModelConfig = serde_yaml_ng::from_str(
+            "name: single\ncontext_length: 4096\ncmd: \"sleep 1\"\nvram: 20000\nvulkan_devices: [[0],[1]]",
+        )
+        .unwrap();
+        register_ready(&mgr, "single", vec![0], 54321);
+        let placement = mgr.select_gpus_for_model(&cfg).await;
+        assert_eq!(placement, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn select_picks_best_heterogeneous_placement() {
+        // [[0],[1,2]]: one single-GPU and one dual-GPU alternative.  Both
+        // empty, [0] wins on lower index sum; once GPU 0 is occupied, the
+        // instance spans 1 and 2.
+        let mgr = multi_gpu_manager();
+        let cfg: ModelConfig = serde_yaml_ng::from_str(
+            "name: mixed\ncontext_length: 4096\ncmd: \"sleep 1\"\nvram: 20000\nvulkan_devices: [[0],[1,2]]",
+        )
+        .unwrap();
+        assert_eq!(mgr.select_gpus_for_model(&cfg).await, vec![0]);
+
+        register_ready(&mgr, "mixed", vec![0], 54321);
+        assert_eq!(mgr.select_gpus_for_model(&cfg).await, vec![1, 2]);
+
+        // All alternatives infeasible → no placement.
+        register_ready(&mgr, "mixed", vec![1, 2], 54322);
+        assert!(mgr.select_gpus_for_model(&cfg).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_placement_snapshot_rejects_non_alternative() {
+        // Migration may only place an instance on one of the configured
+        // alternatives — a random 2-subset of the union is not valid.
+        let mgr = multi_gpu_manager();
+        let cfg: ModelConfig = serde_yaml_ng::from_str(
+            "name: mixed\ncontext_length: 4096\ncmd: \"sleep 1\"\nvram: 20000\nvulkan_devices: [[0],[1,2]]",
+        )
+        .unwrap();
+        assert!(
+            mgr.explicit_placement_snapshot(&cfg, &[1, 2]).is_some(),
+            "configured alternative must be accepted"
+        );
+        assert!(
+            mgr.explicit_placement_snapshot(&cfg, &[2, 1]).is_none(),
+            "permutation of an alternative is not a configured placement"
+        );
+        assert!(
+            mgr.explicit_placement_snapshot(&cfg, &[0, 1]).is_none(),
+            "cross-alternative subset must be rejected"
+        );
+    }
+
+    #[test]
+    fn fingerprint_ignores_placement_structure_and_order() {
+        // The spawned process depends on the device set, not on how the
+        // config groups it into placement alternatives.
+        let base: ModelConfig = serde_yaml_ng::from_str(
+            "name: m\ncontext_length: 4096\ncmd: \"sleep 1\"\nvram: 1000\nvulkan_devices: [[0],[1]]",
+        )
+        .unwrap();
+        let aliases = HashMap::new();
+        let f = fingerprint_with_aliases(&aliases, &base);
+
+        let mut reordered = base.clone();
+        reordered.vulkan_devices = DevicePool::Placements(vec![vec![1], vec![0]]);
+        assert_eq!(f, fingerprint_with_aliases(&aliases, &reordered));
+
+        // The device set is what defines the process: the same union
+        // grouped as a dual-GPU placement or as two single-GPU
+        // alternatives has the same fingerprint (gpus stays 1).
+        let mut dual = base.clone();
+        dual.vulkan_devices = DevicePool::Placements(vec![vec![0, 1]]);
+        assert_eq!(f, fingerprint_with_aliases(&aliases, &dual));
+        let mut flat = base.clone();
+        flat.vulkan_devices = DevicePool::Pool(vec![0, 1]);
+        assert_eq!(f, fingerprint_with_aliases(&aliases, &flat));
+
+        // A different span (gpus: 2) changes the spawned process and must
+        // change the fingerprint.
+        let mut flat_dual = base.clone();
+        flat_dual.vulkan_devices = DevicePool::Pool(vec![0, 1]);
+        flat_dual.gpus = 2;
+        assert_ne!(f, fingerprint_with_aliases(&aliases, &flat_dual));
+    }
+
     // ── ROCm placement ────────────────────────────────────────────────
 
     const ROCM_GPU_YAML: &str = r#"
@@ -7253,9 +7433,9 @@ models:
             serde_yaml_ng::from_str("name: m\ncontext_length: 4096\ncmd: \"sleep 1\"\nvram: 1000")
                 .unwrap();
         let mut vk = base.clone();
-        vk.vulkan_devices = vec![0];
+        vk.vulkan_devices = DevicePool::Pool(vec![0]);
         let mut cu = base.clone();
-        cu.cuda_devices = vec![0];
+        cu.cuda_devices = DevicePool::Pool(vec![0]);
         let aliases = HashMap::new();
         assert_ne!(
             fingerprint_with_aliases(&aliases, &vk),

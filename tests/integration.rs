@@ -1289,3 +1289,112 @@ async fn alias_targets_hot_reloaded() {
         "the reloaded alias must route to m2"
     );
 }
+
+// ── Speculative decoding: --spec-draft-device injection ─────────────────────
+
+/// A symlink named `llama-stub` pointing at the stub backend binary —
+/// the `llama-*` basename is what makes llm-orch treat it as a llama.cpp
+/// program (offload enforcement, draft-device injection).
+fn llama_stub_link(dir: &Path) -> PathBuf {
+    let link = dir.join("llama-stub");
+    std::os::unix::fs::symlink(STUB_BIN, &link).unwrap();
+    link
+}
+
+fn draft_models_yaml(llama_stub: &str, argv_logs: &[&Path]) -> String {
+    let mut yaml = String::from(
+        "devices:\n  cuda:\n    0:\n      pci: \"{}\"\n      vram_mb: 48000\nmodels:\n",
+    );
+    for (i, (name, extra)) in [
+        ("spec", "--spec-draft-model draft.gguf"),
+        ("plain", ""),
+        (
+            "explicit",
+            "--spec-draft-model draft.gguf --spec-draft-device none",
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        yaml.push_str(&format!(
+            "  - name: {name}\n    context_length: 4096\n    cmd: \"{llama_stub} --port {{port}} --argv-log {} {}\"\n    max_instances: 1\n    max_concurrent: 1\n    vram: 1000\n    cuda_devices: [[0]]\n",
+            argv_logs[i].display(),
+            extra
+        ));
+    }
+    yaml
+}
+
+fn argv_of(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.to_string())
+        .collect()
+}
+
+fn draft_device_value(argv: &[String]) -> Option<String> {
+    argv.windows(2)
+        .find(|w| w[0] == "--spec-draft-device")
+        .map(|w| w[1].clone())
+}
+
+#[tokio::test]
+async fn spawn_injects_spec_draft_device_for_draft_models() {
+    let Some(slot) = real_pci_slot() else { return };
+    let dir = temp_dir("draft-device");
+    let llama_stub = llama_stub_link(&dir);
+    let argv_spec = dir.join("argv-spec.txt");
+    let argv_plain = dir.join("argv-plain.txt");
+    let argv_explicit = dir.join("argv-explicit.txt");
+
+    // The model YAML is built with a placeholder PCI slot; substitute the
+    // real one before boot.
+    let yaml = draft_models_yaml(
+        &llama_stub.display().to_string(),
+        &[&argv_spec, &argv_plain, &argv_explicit],
+    )
+    .replace("pci: \"{}\"", &format!("pci: \"{slot}\""));
+
+    let srv = boot(&dir, "tester: secret-key\n", &yaml).await;
+    let client = reqwest::Client::new();
+    for model in ["spec", "plain", "explicit"] {
+        let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+            .json(&chat_body(model))
+            .send()
+            .await
+            .unwrap();
+        if resp.status() != 200 {
+            let body = resp.text().await.unwrap_or_default();
+            panic!("{model} must be servable, got body: {body}");
+        }
+    }
+
+    // `spec`: draft model declared → injected to the instance's device
+    // (CUDA0 = post-filter rank of the [[0]] placement).
+    let argv = argv_of(&argv_spec);
+    assert_eq!(
+        draft_device_value(&argv).as_deref(),
+        Some("CUDA0"),
+        "draft device must be injected for draft models: {argv:?}"
+    );
+
+    // `plain`: no draft model → nothing injected.
+    let argv = argv_of(&argv_plain);
+    assert_eq!(
+        draft_device_value(&argv),
+        None,
+        "no draft-device flag without a draft model: {argv:?}"
+    );
+
+    // `explicit`: user-declared draft device is never overridden.
+    let argv = argv_of(&argv_explicit);
+    assert_eq!(
+        argv.iter()
+            .filter(|a| a.as_str() == "--spec-draft-device")
+            .count(),
+        1,
+        "explicit --spec-draft-device must not be duplicated: {argv:?}"
+    );
+    assert_eq!(draft_device_value(&argv).as_deref(), Some("none"));
+}

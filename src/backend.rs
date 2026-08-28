@@ -69,7 +69,127 @@ impl Default for LlamaCppBackend {
     }
 }
 
+/// Draft-model flags in a llama.cpp command line: declaring one of these
+/// activates speculative decoding with a separate draft model that needs
+/// its own device pinning (`--spec-draft-device`).
+const DRAFT_MODEL_FLAGS: [&str; 6] = [
+    "--spec-draft-model",
+    "--model-draft",
+    "-md",
+    "--spec-draft-hf",
+    "--hf-repo-draft",
+    "-hfd",
+];
+
+/// Draft-device flags: an explicit user declaration that must never be
+/// overridden by llm-orch's automatic injection (including `none`, which
+/// keeps the draft on the CPU).
+const DRAFT_DEVICE_FLAGS: [&str; 3] = ["--spec-draft-device", "--device-draft", "-devd"];
+
+/// Draft offload-layer flags.  An explicit value of `0` pins the draft
+/// model to the CPU; injecting a device flag would then be pointless.
+const DRAFT_NGL_FLAGS: [&str; 4] = [
+    "--spec-draft-ngl",
+    "-ngld",
+    "--gpu-layers-draft",
+    "--n-gpu-layers-draft",
+];
+
+/// Backend device-name prefix used by llama.cpp's `--device` and
+/// `--spec-draft-device` values (`Vulkan0`, `CUDA0`, `ROCm0`, …).
+fn device_name_prefix(kind: DeviceKind) -> &'static str {
+    match kind {
+        DeviceKind::Vulkan => "Vulkan",
+        DeviceKind::Cuda => "CUDA",
+        DeviceKind::Rocm => "ROCm",
+    }
+}
+
+/// Whether `args` contains any of `flags`, in `--flag value` or
+/// `--flag=value` form (presence only; values are ignored).
+fn declares_any_flag(args: &[String], flags: &[&str]) -> bool {
+    args.iter().any(|arg| {
+        let (flag, _) = arg.split_once('=').unwrap_or((arg.as_str(), ""));
+        flags.contains(&flag)
+    })
+}
+
+/// Whether the command line's last draft-offload declaration is an
+/// explicit `0` (draft fully on CPU).  Unparseable values (`auto`, …) and
+/// absent declarations return `false`.
+fn draft_offload_is_zero(args: &[String]) -> bool {
+    let mut last: Option<i64> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let (flag, inline) = match args[i].split_once('=') {
+            Some((f, v)) => (f, Some(v)),
+            None => (args[i].as_str(), None),
+        };
+        if DRAFT_NGL_FLAGS.contains(&flag) {
+            match inline {
+                Some(v) => {
+                    if let Ok(n) = v.parse::<i64>() {
+                        last = Some(n);
+                    }
+                }
+                None => {
+                    if let Some(n) = args.get(i + 1).and_then(|v| v.parse::<i64>().ok()) {
+                        last = Some(n);
+                        i += 1; // consume the value token
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    last == Some(0)
+}
+
 impl LlamaCppBackend {
+    /// Pin a speculative-decoding draft model to the same device(s) the
+    /// main model instance is placed on.
+    ///
+    /// llama.cpp runs the draft on the CPU when `--spec-draft-device` is
+    /// absent, silently wasting the GPUs the model is pinned to.  When the
+    /// command declares a draft model (`--spec-draft-model`, `-md`, …),
+    /// this appends `--spec-draft-device <VulkanN|CUDAN|ROCmN,…>` naming
+    /// every device of the placement.  Device names use the post-filter
+    /// visible namespace (ranks in `indices`, not host indices) — the
+    /// visibility env vars renumber devices, exactly like the ROCm
+    /// `--device ROCmN` handling above.
+    ///
+    /// No-op unless all of these hold:
+    /// - the program is a llama.cpp program (basename starts with `llama-`),
+    /// - the instance is GPU-pinned (`indices` non-empty; a CPU-only
+    ///   model keeps its draft on the CPU), and
+    /// - the command declares a draft model, and
+    /// - the command does not already control the draft device
+    ///   (`--spec-draft-device`/`-devd`/`--device-draft`, incl. `none`)
+    ///   or pin the draft to the CPU (`--spec-draft-ngl 0`).
+    pub fn inject_spec_draft_device(
+        program: &str,
+        args: &mut Vec<String>,
+        kind: DeviceKind,
+        indices: &[usize],
+    ) {
+        let basename = program.rsplit('/').next().unwrap_or(program);
+        if !basename.starts_with("llama-") || indices.is_empty() {
+            return;
+        }
+        if !declares_any_flag(args, &DRAFT_MODEL_FLAGS) {
+            return;
+        }
+        if declares_any_flag(args, &DRAFT_DEVICE_FLAGS) || draft_offload_is_zero(args) {
+            return;
+        }
+        let prefix = device_name_prefix(kind);
+        let devices = (0..indices.len())
+            .map(|rank| format!("{prefix}{rank}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        args.extend(["--spec-draft-device".to_string(), devices]);
+    }
+
     /// Enforce CPU-only execution for a deviceless llama.cpp spawn.
     ///
     /// llama.cpp's default is to offload as many layers as fit, so a
@@ -105,10 +225,8 @@ impl Backend for LlamaCppBackend {
         // HIP_VISIBLE_DEVICES restricts and renumbers the visible devices.
         // Use those post-filter ranks in --device rather than the original
         // host indices: HIP_VISIBLE_DEVICES=2,4 exposes ROCm0 and ROCm1.
-        let devices = indices
-            .iter()
-            .enumerate()
-            .map(|(rank, _)| format!("ROCm{rank}"))
+        let devices = (0..indices.len())
+            .map(|rank| format!("{}{rank}", device_name_prefix(self.kind)))
             .collect::<Vec<_>>()
             .join(",");
         vec!["--device".to_string(), devices]
@@ -481,6 +599,165 @@ mod tests {
             LlamaCppBackend::enforce_cpu_offload("llama-server", &mut args);
             assert_eq!(args, s(&["--n-gpu-layers", value]));
         }
+    }
+
+    #[test]
+    fn injects_spec_draft_device_on_draft_model_declaration() {
+        let mut args = s(&["--model", "m.gguf", "--spec-draft-model", "draft.gguf"]);
+        LlamaCppBackend::inject_spec_draft_device(
+            "llama-server",
+            &mut args,
+            DeviceKind::Vulkan,
+            &[0, 2],
+        );
+        assert!(
+            args.ends_with(&[
+                "--spec-draft-device".to_string(),
+                "Vulkan0,Vulkan1".to_string()
+            ]),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn injects_spec_draft_device_uses_post_filter_ranks() {
+        // Host indices 2,4 become visible ranks 0,1 — the names llama.cpp
+        // resolves against must be the post-filter ones.
+        for (kind, prefix, env) in [
+            (DeviceKind::Vulkan, "Vulkan", "GGML_VK_VISIBLE_DEVICES"),
+            (DeviceKind::Cuda, "CUDA", "CUDA_VISIBLE_DEVICES"),
+            (DeviceKind::Rocm, "ROCm", "HIP_VISIBLE_DEVICES"),
+        ] {
+            let mut args = s(&["-md", "draft.gguf"]);
+            LlamaCppBackend::inject_spec_draft_device("llama-server", &mut args, kind, &[2, 4]);
+            let expected = format!("{prefix}0,{prefix}1");
+            assert!(
+                args.ends_with(&["--spec-draft-device".to_string(), expected]),
+                "{kind:?}: {args:?}"
+            );
+            // The pinned env var uses the host indices; the flag the ranks.
+            let backend = LlamaCppBackend::new(kind);
+            assert_eq!(backend.gpu_env(&[2, 4]), vec![(env.into(), "2,4".into())]);
+        }
+    }
+
+    #[test]
+    fn injects_spec_draft_device_recognizes_hf_and_equals_forms() {
+        for flag in ["--spec-draft-hf", "--hf-repo-draft", "-hfd"] {
+            let mut args = s(&[flag, "user/draft"]);
+            LlamaCppBackend::inject_spec_draft_device(
+                "llama-server",
+                &mut args,
+                DeviceKind::Cuda,
+                &[0],
+            );
+            assert!(
+                args.ends_with(&["--spec-draft-device".to_string(), "CUDA0".to_string()]),
+                "{flag}: {args:?}"
+            );
+        }
+        let mut args = s(&["--spec-draft-model=draft.gguf"]);
+        LlamaCppBackend::inject_spec_draft_device(
+            "llama-server",
+            &mut args,
+            DeviceKind::Rocm,
+            &[1],
+        );
+        assert!(
+            args.ends_with(&["--spec-draft-device".to_string(), "ROCm0".to_string()]),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn spec_draft_injection_respects_explicit_user_control() {
+        // Explicit draft-device flags (incl. `none`) are never overridden.
+        for flag in ["--spec-draft-device", "--device-draft", "-devd"] {
+            let mut args = s(&["-md", "draft.gguf", flag, "Vulkan0"]);
+            LlamaCppBackend::inject_spec_draft_device(
+                "llama-server",
+                &mut args,
+                DeviceKind::Vulkan,
+                &[0, 1],
+            );
+            assert_eq!(args, s(&["-md", "draft.gguf", flag, "Vulkan0"]), "{flag}");
+        }
+        let mut args = s(&["--spec-draft-model", "d.gguf", "--spec-draft-device=none"]);
+        LlamaCppBackend::inject_spec_draft_device(
+            "llama-server",
+            &mut args,
+            DeviceKind::Vulkan,
+            &[0],
+        );
+        assert_eq!(
+            args,
+            s(&["--spec-draft-model", "d.gguf", "--spec-draft-device=none"])
+        );
+
+        // Explicit `--spec-draft-ngl 0` pins the draft to the CPU — nothing
+        // to inject.  Any other value (or `auto`) still gets the device.
+        for zero_form in [
+            vec!["-ngld", "0"],
+            vec!["--gpu-layers-draft", "0"],
+            vec!["--spec-draft-ngl=0"],
+        ] {
+            let mut expected = s(&["-md", "d.gguf"]);
+            expected.extend(zero_form.iter().map(|x| x.to_string()));
+            let mut args = expected.clone();
+            LlamaCppBackend::inject_spec_draft_device(
+                "llama-server",
+                &mut args,
+                DeviceKind::Vulkan,
+                &[0],
+            );
+            assert_eq!(args, expected, "{zero_form:?}");
+        }
+        for value in ["4", "auto"] {
+            let mut args = s(&["-md", "d.gguf", "--spec-draft-ngl", value]);
+            LlamaCppBackend::inject_spec_draft_device(
+                "llama-server",
+                &mut args,
+                DeviceKind::Vulkan,
+                &[0],
+            );
+            assert!(
+                args.ends_with(&["--spec-draft-device".to_string(), "Vulkan0".to_string()]),
+                "ngl {value}: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn spec_draft_injection_noops_without_draft_or_gpus() {
+        // No draft model declared → nothing injected.
+        let mut args = s(&["--model", "m.gguf"]);
+        LlamaCppBackend::inject_spec_draft_device(
+            "llama-server",
+            &mut args,
+            DeviceKind::Vulkan,
+            &[0],
+        );
+        assert_eq!(args, s(&["--model", "m.gguf"]));
+
+        // CPU-only instance (no pinned devices) → draft stays on CPU.
+        let mut args = s(&["-md", "d.gguf"]);
+        LlamaCppBackend::inject_spec_draft_device(
+            "llama-server",
+            &mut args,
+            DeviceKind::Vulkan,
+            &[],
+        );
+        assert_eq!(args, s(&["-md", "d.gguf"]));
+
+        // Non-llama programs are never touched.
+        let mut args = s(&["-md", "d.gguf"]);
+        LlamaCppBackend::inject_spec_draft_device(
+            "audiocpp_server",
+            &mut args,
+            DeviceKind::Vulkan,
+            &[0],
+        );
+        assert_eq!(args, s(&["-md", "d.gguf"]));
     }
 
     #[test]
