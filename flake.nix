@@ -45,6 +45,9 @@
           rust-analyzer
           cargo-expand
           jq
+          # scripts/benchmark-llm.py
+          python3
+          python3Packages.httpx
         ];
 
         # Ensure cargo-expand can find the nightly rustfmt it needs, or
