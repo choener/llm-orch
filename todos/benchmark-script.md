@@ -31,6 +31,13 @@ Add `scripts/benchmark-llm.py` — a Python benchmark for OpenAI-compatible endp
 ### 7. Smoke test
 - [x] Run the script against a locally spawned `llm-orch` + `llm-orch-stub-backend` (test config in /tmp) with small sizes; verify ping, sizing ladder, unique prefixes, TTFT/timings/fallback paths, `--repeats`, `--csv`, and exit codes.
 
+### 8. Fix gen tok/s not showing (reasoning models + stream usage)
+- [x] TTFT: count the first `reasoning_content` delta (Qwen3 emits only thinking tokens for a long time; the old code waited for `delta.content` and never saw it — with `max_tokens` fully spent on reasoning the stream ends with zero content tokens).
+- [x] Send `stream_options: {"include_usage": true}` in stream mode — llama.cpp omits `usage` otherwise, so `completion_tokens` was always `None`.
+- [x] Fall back `completion_tokens` to `timings.predicted_n` (mirrors the `prompt_n` fallback for prompt tokens).
+- [x] Compute gen tok/s from `timings.predicted_ms` when present (llama.cpp ground truth, includes reasoning tokens), else wall clock `completion_tokens / (total − TTFT)`; track `gen_source` (`timings`|`wall`) in table + CSV.
+- [x] Verified: `gen tok/s` now shows (e.g. 40 tok/s @ max_tokens=512, source `timings/timings`), TTFT set, CSV has `gen_source` column.
+
 ## Notes
 - Follows existing scripts' env-var convention (`LLM_ORCH_URL`, `APIKEY_LLM_ORCH`).
 - Every request gets a fresh random prefix so KV/prefix caches never apply — that is the point of the measurement.

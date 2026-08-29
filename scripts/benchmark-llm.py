@@ -14,13 +14,16 @@ Flow
 Prompt processing (PP) is measured three ways; the best available wins:
   * llama.cpp `timings` (prompt_ms / prompt_per_second) when the backend
     returns it — llm-orch passes non-standard fields through untouched;
-  * time-to-first-token (TTFT) in stream mode — prefill + first decode;
+  * time-to-first-token (TTFT) in stream mode — prefill + first decode
+    (for reasoning models the first reasoning token counts);
   * total wall time with --max-tokens 1 — prefill dominates a 1-token
     completion.
 
 Generation: --max-tokens caps the generated output (default 1 = pure
 prompt-processing mode); with larger values the script also reports decode
-tok/s.  --stream/--no-stream controls whether TTFT is measured.
+tok/s — from llama.cpp `timings.predicted_ms` when present (includes
+reasoning tokens), else completion_tokens / (total − TTFT).
+--stream/--no-stream controls whether TTFT is measured.
 
 Usage
 -----
@@ -69,6 +72,7 @@ class Result:
     pp_tok_s: float | None = None
     pp_source: str = "-"  # "timings" | "ttft" | "total"
     gen_tok_s: float | None = None
+    gen_source: str = "-"  # "timings" | "wall"
     error: str | None = None
 
 
@@ -131,7 +135,9 @@ def send_request(client, url, payload, stream):
                     if ttft is None:
                         choices = chunk.get("choices") or []
                         delta = (choices[0].get("delta") if choices else None) or {}
-                        if delta.get("content"):
+                        # First streamed token: visible content, or
+                        # reasoning_content for reasoning models (Qwen3 ...).
+                        if delta.get("content") or delta.get("reasoning_content"):
                             ttft = time.perf_counter() - t0
             total = time.perf_counter() - t0
             return {"usage": usage, "timings": timings}, ttft, total, None
@@ -223,6 +229,10 @@ def run_request(client, url, model, content, max_tokens, stream, label, repeat):
         "stream": stream,
         "temperature": 0,
     }
+    # llama.cpp only sends usage in streams when asked; needed for
+    # completion_tokens (and the wall-clock gen rate fallback).
+    if stream:
+        payload["stream_options"] = {"include_usage": True}
     obj, ttft_ms, total_ms, err = send_request(client, url, payload, stream)
     r = Result(label=label, repeat=repeat, ttft_ms=ttft_ms, total_ms=total_ms)
     if err:
@@ -234,6 +244,8 @@ def run_request(client, url, model, content, max_tokens, stream, label, repeat):
     if r.prompt_tokens is None:
         r.prompt_tokens = timings.get("prompt_n")
     r.completion_tokens = usage.get("completion_tokens")
+    if r.completion_tokens is None:
+        r.completion_tokens = timings.get("predicted_n")
     r.pp_ms = timings.get("prompt_ms")
     if r.pp_ms is not None:
         r.pp_source = "timings"
@@ -243,8 +255,15 @@ def run_request(client, url, model, content, max_tokens, stream, label, repeat):
         r.pp_ms, r.pp_source = total_ms, "total"
     if r.pp_ms and r.pp_ms > 0 and r.prompt_tokens:
         r.pp_tok_s = r.prompt_tokens / (r.pp_ms / 1000.0)
-    if r.completion_tokens and ttft_ms is not None and total_ms > ttft_ms:
+    pred_ms = timings.get("predicted_ms")
+    if r.completion_tokens and pred_ms and pred_ms > 0:
+        # llama.cpp ground truth: total decode time for predicted_n tokens
+        # (includes reasoning tokens).
+        r.gen_tok_s = r.completion_tokens / (pred_ms / 1000.0)
+        r.gen_source = "timings"
+    elif r.completion_tokens and ttft_ms is not None and total_ms > ttft_ms:
         r.gen_tok_s = r.completion_tokens / ((total_ms - ttft_ms) / 1000.0)
+        r.gen_source = "wall"
     return r
 
 
@@ -262,7 +281,8 @@ def print_results(results):
         for r in rs:
             print(f"{label:<16} {r.repeat:>3} {fmt_int(r.prompt_tokens):>10} "
                   f"{fmt_ms(r.ttft_ms):>9} {fmt_ms(r.total_ms):>9} {fmt_ms(r.pp_ms):>8} "
-                  f"{fmt_rate(r.pp_tok_s):>10} {fmt_rate(r.gen_tok_s):>9}  {r.pp_source}"
+                  f"{fmt_rate(r.pp_tok_s):>10} {fmt_rate(r.gen_tok_s):>9}  "
+                  f"{r.pp_source}/{r.gen_source}"
                   + (f"  ERROR: {r.error}" if r.error else ""))
         if len(rs) > 1:
             print_summary(rs)
@@ -296,14 +316,14 @@ def write_csv(path, results, model, url, stream, max_tokens):
         if new:
             w.writerow(["ts", "model", "url", "query", "repeat", "prompt_tokens",
                         "completion_tokens", "ttft_ms", "total_ms", "pp_ms",
-                        "pp_tok_s", "gen_tok_s", "pp_source", "stream",
-                        "max_tokens", "error"])
+                        "pp_tok_s", "gen_tok_s", "pp_source", "gen_source",
+                        "stream", "max_tokens", "error"])
         for r in results:
             w.writerow([time.strftime("%Y-%m-%dT%H:%M:%S"), model, url, r.label,
                         r.repeat, r.prompt_tokens, r.completion_tokens,
                         fmt_csv(r.ttft_ms), fmt_csv(r.total_ms), fmt_csv(r.pp_ms),
                         fmt_csv(r.pp_tok_s), fmt_csv(r.gen_tok_s), r.pp_source,
-                        stream, max_tokens, r.error])
+                        r.gen_source, stream, max_tokens, r.error])
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
@@ -375,7 +395,8 @@ def main():
                 print(f"  [{i}/{total}] {label} rep {rep}: "
                       f"{fmt_int(r.prompt_tokens)} tok | TTFT {fmt_ms(r.ttft_ms)} ms | "
                       f"total {fmt_ms(r.total_ms)} ms | PP {fmt_ms(r.pp_ms)} ms "
-                      f"({r.pp_source}) @ {fmt_rate(r.pp_tok_s)} tok/s"
+                      f"({r.pp_source}) @ {fmt_rate(r.pp_tok_s)} tok/s | "
+                      f"gen {fmt_rate(r.gen_tok_s)} tok/s"
                       + (f"  ERROR: {r.error}" if r.error else ""), flush=True)
 
         print()
