@@ -3158,8 +3158,14 @@ impl InstanceManager {
 
         // Device pinning follows the model's namespace: Vulkan models via
         // GGML_VK_VISIBLE_DEVICES, CUDA models via CUDA_VISIBLE_DEVICES,
-        // and ROCm models via HIP_VISIBLE_DEVICES plus an explicit
-        // --device ROCmN selector.
+        // and ROCm models via HIP_VISIBLE_DEVICES.  Every kind also gets
+        // an explicit --device <Prefix><rank>,… selector naming the
+        // post-filter visible ranks — without it llama.cpp would use all
+        // devices its build enumerates (including other backends' GPUs)
+        // and row-split the instance across them.  The append is
+        // unconditional: llama.cpp is last-value-wins, so a command that
+        // slipped past config validation can still not escape its
+        // placement.
         let model_backend = LlamaCppBackend::new(cfg.device_kind());
         let mut args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
         args.extend(model_backend.gpu_args(&gpu_indices));

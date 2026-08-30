@@ -100,6 +100,17 @@ impl Config {
                     m.name
                 )));
             }
+            // llm-orch owns device placement: it pins the instance with
+            // the namespace's visibility env var and appends the matching
+            // `--device <rank>,…` (and `--spec-draft-device …`) selector
+            // itself.  An operator-declared selector would silently lose
+            // to that append and desync VRAM accounting from reality.
+            if let Some(declared) = cmd_device_flag_decl(&self.cmd_aliases, m) {
+                return Err(ConfigError::Validation(format!(
+                    "model '{}': command declares {declared} — device placement is owned by llm-orch (vulkan_devices/cuda_devices/rocm_devices; keep a draft on the CPU with --spec-draft-ngl 0)",
+                    m.name
+                )));
+            }
             if m.gpus == 0 {
                 return Err(ConfigError::Validation(format!(
                     "model '{}': gpus must be >= 1",
@@ -812,6 +823,47 @@ pub fn resolve_model_cmd(
         .replace("{name}", &cfg.name)
 }
 
+/// Detect an operator-declared device selector in a model's resolved
+/// command line.  Returns a human-readable description of the offending
+/// flag (e.g. `--device`) when the command runs a llama.cpp program and
+/// declares the main-device selector (`--device`/`-dev`) or a draft-device
+/// selector (`--spec-draft-device`/`--device-draft`/`-devd`); `None`
+/// otherwise.
+///
+/// llm-orch owns device placement: it appends `--device <Prefix><rank>,…`
+/// and `--spec-draft-device …` from the model's device pool.  An operator
+/// declaration would either be silently overridden (llama.cpp is
+/// last-value-wins and llm-orch appends last) or mislead about the actual
+/// placement — either way VRAM accounting would diverge from reality, so
+/// it is rejected at config load.  A CPU-resident draft is declared with
+/// `--spec-draft-ngl 0`, not a device flag.
+///
+/// Non-llama.cpp programs (e.g. `audiocpp_server`) select their compute
+/// device through their own interface and are not checked.
+fn cmd_device_flag_decl(cmd_aliases: &HashMap<String, String>, m: &ModelConfig) -> Option<String> {
+    let resolved = resolve_model_cmd(cmd_aliases, m, 0);
+    let parts = shlex::split(&resolved)?;
+    let program = parts.first()?;
+    let basename = program.rsplit('/').next().unwrap_or(program);
+    if !basename.starts_with("llama-") {
+        return None;
+    }
+    let args = &parts[1..];
+    use crate::backend::{DRAFT_DEVICE_FLAGS, MAIN_DEVICE_FLAGS, declares_any_flag};
+    if let Some(flag) = MAIN_DEVICE_FLAGS
+        .iter()
+        .find(|flag| declares_any_flag(args, std::slice::from_ref(*flag)))
+    {
+        return Some((*flag).to_string());
+    }
+    if declares_any_flag(args, &DRAFT_DEVICE_FLAGS) {
+        return Some(
+            "a draft-device flag (--spec-draft-device / --device-draft / -devd)".to_string(),
+        );
+    }
+    None
+}
+
 /// Detect a GPU-offload request in a CPU-only model's resolved command
 /// line.  Returns a human-readable description of the offending
 /// declaration (e.g. `--n-gpu-layers 99`) when the command runs a
@@ -1262,6 +1314,110 @@ models:
     cmd: "{llama} --model m.gguf"
 "#;
         expect_validation_error(yaml, "requests GPU offload (--n-gpu-layers 99)");
+    }
+
+    #[test]
+    fn rejects_llama_model_declaring_main_device_flag() {
+        // llm-orch appends `--device` from the placement itself; an
+        // operator declaration would silently lose to that append.
+        for (flag, needle) in [
+            ("--device Vulkan0", "--device"),
+            ("--device=Vulkan0", "--device"),
+            ("-dev ROCm0", "-dev"),
+            ("-dev=ROCm0", "-dev"),
+        ] {
+            let yaml = BASE.replace(
+                "cmd: \"sleep 3600\"",
+                &format!("cmd: \"llama-server --model m.gguf {flag}\""),
+            );
+            expect_validation_error(&yaml, &format!("declares {needle}"));
+        }
+    }
+
+    #[test]
+    fn rejects_llama_model_declaring_draft_device_flag() {
+        // Same ownership rule for the draft model's device.  `--spec-draft-ngl 0`
+        // remains the supported way to keep a draft on the CPU.
+        for flag in [
+            "--spec-draft-device none",
+            "--spec-draft-device=Vulkan0",
+            "--device-draft CUDA0",
+            "-devd CUDA0",
+        ] {
+            let yaml = BASE.replace(
+                "cmd: \"sleep 3600\"",
+                &format!("cmd: \"llama-server --model m.gguf {flag}\""),
+            );
+            expect_validation_error(&yaml, "declares a draft-device flag");
+        }
+    }
+
+    #[test]
+    fn rejects_device_flag_hidden_in_alias() {
+        let yaml = r#"
+server: {}
+apikeys_file: apikeys.txt
+cmd_aliases:
+  llama: |
+    llama-server
+      --port {port}
+      --device Vulkan0
+models:
+  - name: m
+    context_length: 4096
+    cmd: "{llama} --model m.gguf"
+"#;
+        expect_validation_error(yaml, "declares --device");
+    }
+
+    #[test]
+    fn device_flag_check_applies_to_gpu_models_too() {
+        // Not just a CPU-only concern: a pooled model declaring its own
+        // `--device` would desync VRAM accounting from the actual spawn.
+        let yaml = r#"
+server: {}
+apikeys_file: apikeys.txt
+devices:
+  cuda:
+    0:
+      pci: "0000:01:00.0"
+      vram_mb: 48000
+models:
+  - name: m
+    context_length: 4096
+    cmd: "llama-server --model m.gguf --device CUDA0"
+    cuda_devices: [0]
+"#;
+        // The PCI slot may not exist on this host; the device-flag error
+        // must fire regardless (it precedes the devices-section check).
+        match parse(yaml) {
+            Err(ConfigError::Validation(msg)) => assert!(
+                msg.contains("declares --device"),
+                "unexpected validation error: {msg}"
+            ),
+            other => panic!("expected device-flag validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_non_llama_program_with_device_like_args() {
+        // Non-llama.cpp programs select their compute device through their
+        // own interface; llm-orch must not police their flags.
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"audiocpp_server --config server.json --device cuda:0\"",
+        );
+        parse(&yaml).unwrap();
+    }
+
+    #[test]
+    fn accepts_llama_model_with_draft_ngl_zero() {
+        // The supported way to keep a draft model on the CPU.
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"llama-server --model m.gguf --spec-draft-model d.gguf --spec-draft-ngl 0\"",
+        );
+        parse(&yaml).unwrap();
     }
 
     #[test]

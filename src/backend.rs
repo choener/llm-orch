@@ -30,29 +30,35 @@ pub trait Backend: Send + Sync {
 /// Device namespace a llama.cpp build uses for GPU selection.
 ///
 /// Determines which environment variable device indices are pinned
-/// through.  A model's kind follows its configured device pool
+/// through and which device-name prefix the `--device` selector uses.
+/// A model's kind follows its configured device pool
 /// (`vulkan_devices`, `cuda_devices`, or `rocm_devices`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DeviceKind {
-    /// Vulkan backend — pinned via `GGML_VK_VISIBLE_DEVICES`.
+    /// Vulkan backend — pinned via `GGML_VK_VISIBLE_DEVICES` + `--device VulkanN`.
     #[default]
     Vulkan,
-    /// CUDA backend — pinned via `CUDA_VISIBLE_DEVICES`.
+    /// CUDA backend — pinned via `CUDA_VISIBLE_DEVICES` + `--device CUDAN`.
     Cuda,
-    /// ROCm/HIP backend — pinned via `HIP_VISIBLE_DEVICES`.
+    /// ROCm/HIP backend — pinned via `HIP_VISIBLE_DEVICES` + `--device ROCmN`.
     Rocm,
 }
 
 /// Backend for llama.cpp built with Vulkan, ROCm, or CUDA.
 ///
-/// GPU selection uses `GGML_VK_VISIBLE_DEVICES` (Vulkan),
-/// `CUDA_VISIBLE_DEVICES` (CUDA), or `HIP_VISIBLE_DEVICES` (ROCm)
-/// depending on [`DeviceKind`].  ROCm additionally receives an explicit
-/// `--device ROCmN` argument because a binary built with both ROCm and
-/// Vulkan otherwise may select the Vulkan copy of the same AMD GPU.  The
-/// indices passed to `gpu_env` are logical backend device indices, not sysfs
-/// card numbers.  Their order is preserved — it has semantics in llama.cpp
-/// (tensor split order).
+/// GPU selection combines a per-backend visibility environment variable
+/// (`GGML_VK_VISIBLE_DEVICES` / `CUDA_VISIBLE_DEVICES` /
+/// `HIP_VISIBLE_DEVICES`, depending on [`DeviceKind`]) with an explicit
+/// `--device <Vulkan|CUDA|ROCm><rank>[,…]` selector.  The env var alone
+/// filters only its own backend's enumeration — a multi-backend
+/// llama-server build (e.g. Vulkan + ROCm) still sees the other backend's
+/// GPUs, and without `--device` llama.cpp row-splits an instance across
+/// every enumerated accelerator.  The selector names *post-filter ranks*
+/// (the env var renumbers the visible devices starting at 0, in list
+/// order), never host indices — `GGML_VK_VISIBLE_DEVICES=1` makes that GPU
+/// `Vulkan0`.  The indices passed to `gpu_env` are logical backend device
+/// indices, not sysfs card numbers.  Their order is preserved — it has
+/// semantics in llama.cpp (tensor split order).
 pub struct LlamaCppBackend {
     kind: DeviceKind,
 }
@@ -84,7 +90,16 @@ const DRAFT_MODEL_FLAGS: [&str; 6] = [
 /// Draft-device flags: an explicit user declaration that must never be
 /// overridden by llm-orch's automatic injection (including `none`, which
 /// keeps the draft on the CPU).
-const DRAFT_DEVICE_FLAGS: [&str; 3] = ["--spec-draft-device", "--device-draft", "-devd"];
+///
+/// Config validation rejects these in llama.cpp command lines (llm-orch
+/// owns draft-device placement); exposed for that check.
+pub const DRAFT_DEVICE_FLAGS: [&str; 3] = ["--spec-draft-device", "--device-draft", "-devd"];
+
+/// Main-device selector flags: llama.cpp's `--device` (alias `-dev`, env
+/// `LLAMA_ARG_DEVICE`).  llm-orch owns device placement and appends the
+/// selector itself; a user declaration is a config error.  Exposed for
+/// config validation.
+pub const MAIN_DEVICE_FLAGS: [&str; 2] = ["--device", "-dev"];
 
 /// `--spec-type` values that create a separate draft-model context
 /// (`ctx_dft`) with its own device selection.  These need the draft device
@@ -118,7 +133,7 @@ fn device_name_prefix(kind: DeviceKind) -> &'static str {
 
 /// Whether `args` contains any of `flags`, in `--flag value` or
 /// `--flag=value` form (presence only; values are ignored).
-fn declares_any_flag(args: &[String], flags: &[&str]) -> bool {
+pub fn declares_any_flag(args: &[String], flags: &[&str]) -> bool {
     args.iter().any(|arg| {
         let (flag, _) = arg.split_once('=').unwrap_or((arg.as_str(), ""));
         flags.contains(&flag)
@@ -263,13 +278,16 @@ impl LlamaCppBackend {
 
 impl Backend for LlamaCppBackend {
     fn gpu_args(&self, indices: &[usize]) -> Vec<String> {
-        if self.kind != DeviceKind::Rocm || indices.is_empty() {
+        if indices.is_empty() {
             return Vec::new();
         }
 
-        // HIP_VISIBLE_DEVICES restricts and renumbers the visible devices.
-        // Use those post-filter ranks in --device rather than the original
-        // host indices: HIP_VISIBLE_DEVICES=2,4 exposes ROCm0 and ROCm1.
+        // The visibility env var restricts and renumbers the visible
+        // devices.  Name the post-filter ranks in --device rather than the
+        // original host indices: HIP_VISIBLE_DEVICES=2,4 exposes ROCm0 and
+        // ROCm1; GGML_VK_VISIBLE_DEVICES=1 exposes Vulkan0.  Without this
+        // selector llama.cpp would use every device its build enumerates
+        // (including other backends' GPUs) and row-split across them.
         let devices = (0..indices.len())
             .map(|rank| format!("{}{rank}", device_name_prefix(self.kind)))
             .collect::<Vec<_>>()
@@ -562,23 +580,30 @@ mod tests {
     }
 
     #[test]
-    fn gpu_args_and_env_select_rocm_backend() {
-        let backend = LlamaCppBackend::new(DeviceKind::Rocm);
-        assert_eq!(
-            backend.gpu_args(&[2, 4]),
-            vec!["--device".to_string(), "ROCm0,ROCm1".to_string()],
-            "--device uses HIP's post-filter visible ranks"
-        );
-        assert_eq!(
-            backend.gpu_env(&[2, 4]),
-            vec![("HIP_VISIBLE_DEVICES".to_string(), "2,4".to_string())]
-        );
-    }
-
-    #[test]
-    fn gpu_args_for_non_rocm_backends_are_empty() {
-        for kind in [DeviceKind::Vulkan, DeviceKind::Cuda] {
-            assert!(LlamaCppBackend::new(kind).gpu_args(&[0, 1]).is_empty());
+    fn gpu_args_pin_devices_for_all_backends() {
+        // --device names the post-filter visible ranks, not host indices:
+        // the visibility env var renumbers devices from 0 in list order
+        // (GGML_VK_VISIBLE_DEVICES=2,4 → Vulkan0,Vulkan1).
+        for (kind, prefix, env) in [
+            (DeviceKind::Vulkan, "Vulkan", "GGML_VK_VISIBLE_DEVICES"),
+            (DeviceKind::Cuda, "CUDA", "CUDA_VISIBLE_DEVICES"),
+            (DeviceKind::Rocm, "ROCm", "HIP_VISIBLE_DEVICES"),
+        ] {
+            let backend = LlamaCppBackend::new(kind);
+            assert_eq!(
+                backend.gpu_args(&[2, 4]),
+                vec!["--device".to_string(), format!("{prefix}0,{prefix}1")],
+                "{kind:?}: --device uses the post-filter visible ranks"
+            );
+            assert_eq!(
+                backend.gpu_env(&[2, 4]),
+                vec![(env.to_string(), "2,4".to_string())]
+            );
+            assert_eq!(
+                backend.gpu_args(&[1]),
+                vec!["--device".to_string(), format!("{prefix}0")],
+                "{kind:?}: a single visible device is rank 0"
+            );
         }
     }
 

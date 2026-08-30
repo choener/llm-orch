@@ -67,6 +67,18 @@ apikeys_file: "apikeys.txt"
 # GGML_VK_VISIBLE_DEVICES, HIP_VISIBLE_DEVICES, and similar env vars use —
 # they correspond to the backend's enumeration order (e.g. Vulkan0 → 0,
 # ROCm0 → 0).
+#
+# Every GPU-pinned llama.cpp model is spawned with BOTH the namespace's
+# visibility env var and an explicit `--device <Vulkan|CUDA|ROCm><rank>,…`
+# selector.  The selector names ranks in the *visible* set: the env var
+# renumbers devices from 0 in list order, so a placement on host devices
+# [2, 4] becomes e.g. GGML_VK_VISIBLE_DEVICES=2,4 + `--device Vulkan0,Vulkan1`.
+# Without the selector a multi-backend llama-server build (Vulkan + ROCm,
+# Vulkan + CUDA) would enumerate the other backend's GPUs as well and
+# row-split the instance across all of them — outside the scheduler's
+# placement and VRAM accounting.  Declaring `--device`/`-dev` (or a
+# draft-device flag) in a model's `cmd` is a config error for the same
+# reason; keep a draft model on the CPU with `--spec-draft-ngl 0`.
 devices:
   vulkan:
     0: "0000:03:00.0"  # dGPU — find with `llama-server --list-devices`
@@ -224,7 +236,7 @@ models:
   #       --model /models/qwen3.6-27b-q8_0.gguf
   #       --ctx-size 32768
 
-  # --- Example 2b: a CUDA model — pinned via CUDA_VISIBLE_DEVICES ----------
+  # --- Example 2b: a CUDA model — CUDA_VISIBLE_DEVICES + --device CUDA0 ---
   # - name: "qwen3-14b-cuda"
   #   context_length: 32768
   #   max_instances: 1
@@ -240,8 +252,9 @@ models:
 
   # --- Example 2c: a CUDA model spanning two GPUs ---------------------------
   # `gpus: 2` selects two devices from the `cuda_devices` pool and pins
-  # them as CUDA_VISIBLE_DEVICES=<a>,<b> (selection order = emission
-  # order); `vram` is reserved on EACH occupied GPU.
+  # them as CUDA_VISIBLE_DEVICES=<a>,<b> + --device CUDA0,CUDA1 (selection
+  # order = emission order = post-filter rank order); `vram` is reserved
+  # on EACH occupied GPU.
   # - name: "qwen3-32b-cuda"
   #   context_length: 32768
   #   max_instances: 1
@@ -256,11 +269,11 @@ models:
   #       --model /models/qwen3-32b-q4_k_m.gguf
   #       --ctx-size 32768
 
-  # --- Example 2d: a ROCm model — pinned via HIP_VISIBLE_DEVICES ----------
-  # ROCm models also receive an explicit --device ROCmN selector.  The N
-  # values are ranks in the HIP-visible set, so a selected pool [2, 4]
-  # becomes HIP_VISIBLE_DEVICES=2,4 and --device ROCm0,ROCm1.  A ROCm model
-  # may use the same physical AMD GPU as a Vulkan model when VRAM permits.
+  # --- Example 2d: a ROCm model — HIP_VISIBLE_DEVICES + --device ROCmN ---
+  # The N values are ranks in the HIP-visible set, so a selected pool
+  # [2, 4] becomes HIP_VISIBLE_DEVICES=2,4 and --device ROCm0,ROCm1 — the
+  # same rank naming every namespace gets.  A ROCm model may use the same
+  # physical AMD GPU as a Vulkan model when VRAM permits.
   # - name: "qwen3-32b-rocm"
   #   context_length: 32768
   #   max_instances: 1
@@ -295,6 +308,26 @@ models:
       {llama-cpu}
         --model /models/deepseek-coder-7b-q4_k_m.gguf
         --ctx-size 16384
+
+  # --- Example 3b: a pure-CPU embedding model -------------------------------
+  # Same CPU-only pattern, ideal for small embedding/rerank models: omit
+  # every device pool, keep `gpus: 1` (the default), and llm-orch spawns
+  # the server with --n-gpu-layers 0 enforced — it never touches a GPU,
+  # even on a multi-GPU host.  Requesting GPU offload in the command of a
+  # deviceless model is a config error.
+  # - name: "bge-m3-embed"
+  #   context_length: 8192
+  #   max_instances: 2        # CPU models scale out by parallel processes
+  #   max_concurrent: 8
+  #   vram: 0
+  #   ram: 2500
+  #   idle_ttl: 300
+  #   queue_depth: 20
+  #   cmd: |
+  #     {llama-cpu}
+  #       --model /models/bge-m3-q8_0.gguf
+  #       --ctx-size 8192
+  #       --embeddings
 
   # --- Example 3: a multimodal model ----------------------------------------
   - name: "llava-13b"
@@ -341,9 +374,10 @@ models:
   # llama.cpp runs the draft context on its process-default backend, which
   # is *not* the model's pinned device (e.g. HIP on a Vulkan-pinned model)
   # and can OOM against the already-loaded model.  Self-speculative ngram
-  # types have no draft context and are never touched.  An explicit
-  # `--spec-draft-device`/`--device-draft`/`-devd` or `--spec-draft-ngl 0`
-  # in `cmd` is always respected.
+  # types have no draft context and are never touched.  Declaring
+  # `--spec-draft-device`/`--device-draft`/`-devd` in `cmd` is a config
+  # error (llm-orch owns placement); `--spec-draft-ngl 0` is respected and
+  # keeps the draft on the CPU — then no device pin is injected.
   # - name: "qwen3-32b-spec"
   #   context_length: 32768
   #   max_instances: 1

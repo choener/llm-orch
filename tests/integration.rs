@@ -1098,6 +1098,24 @@ fn real_pci_slots(count: usize) -> Option<Vec<String>> {
     (slots.len() >= count).then(|| slots.into_iter().take(count).collect())
 }
 
+/// Real DRM GPU PCI slots (what `devices.vulkan` validates against),
+/// enumerated like `config.rs`'s `list_drm_pci_slots`.  Empty when the
+/// host exposes no DRM cards — the Vulkan device-pin tests then skip.
+fn real_drm_slots() -> Vec<String> {
+    let mut slots = Vec::new();
+    for i in 0..16 {
+        let uevent = format!("/sys/class/drm/card{i}/device/uevent");
+        if let Ok(contents) = std::fs::read_to_string(uevent) {
+            for line in contents.lines() {
+                if let Some(slot) = line.strip_prefix("PCI_SLOT_NAME=") {
+                    slots.push(slot.trim().to_string());
+                }
+            }
+        }
+    }
+    slots
+}
+
 /// Two resident 30 GB CUDA models share two synthetic 100 GB capacities;
 /// the 90 GB target fits only after one resident model is migrated.
 fn migration_cuda_yaml(listen_port: u16, slots: &[String]) -> String {
@@ -1305,15 +1323,14 @@ fn draft_models_yaml(llama_stub: &str, argv_logs: &[&Path]) -> String {
     let mut yaml = String::from(
         "devices:\n  cuda:\n    0:\n      pci: \"{}\"\n      vram_mb: 48000\nmodels:\n",
     );
+    // No model may declare its own draft-device flag (`--spec-draft-device
+    // none`, `-devd …`, …): config validation rejects those — llm-orch owns
+    // device placement for main and draft models alike.
     for (i, (name, extra)) in [
         ("spec", "--spec-draft-model draft.gguf"),
         ("spec-type", "--spec-type draft-mtp"),
         ("ngram", "--spec-type ngram-cache"),
         ("plain", ""),
-        (
-            "explicit",
-            "--spec-draft-model draft.gguf --spec-draft-device none",
-        ),
     ]
     .iter()
     .enumerate()
@@ -1350,25 +1367,18 @@ async fn spawn_injects_spec_draft_device_for_draft_models() {
     let argv_spec_type = dir.join("argv-spec-type.txt");
     let argv_ngram = dir.join("argv-ngram.txt");
     let argv_plain = dir.join("argv-plain.txt");
-    let argv_explicit = dir.join("argv-explicit.txt");
 
     // The model YAML is built with a placeholder PCI slot; substitute the
     // real one before boot.
     let yaml = draft_models_yaml(
         &llama_stub.display().to_string(),
-        &[
-            &argv_spec,
-            &argv_spec_type,
-            &argv_ngram,
-            &argv_plain,
-            &argv_explicit,
-        ],
+        &[&argv_spec, &argv_spec_type, &argv_ngram, &argv_plain],
     )
     .replace("pci: \"{}\"", &format!("pci: \"{slot}\""));
 
     let srv = boot(&dir, "tester: secret-key\n", &yaml).await;
     let client = reqwest::Client::new();
-    for model in ["spec", "spec-type", "ngram", "plain", "explicit"] {
+    for model in ["spec", "spec-type", "ngram", "plain"] {
         let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
             .json(&chat_body(model))
             .send()
@@ -1415,15 +1425,145 @@ async fn spawn_injects_spec_draft_device_for_draft_models() {
         None,
         "no draft-device flag without a draft model: {argv:?}"
     );
+}
 
-    // `explicit`: user-declared draft device is never overridden.
-    let argv = argv_of(&argv_explicit);
-    assert_eq!(
-        argv.iter()
-            .filter(|a| a.as_str() == "--spec-draft-device")
-            .count(),
-        1,
-        "explicit --spec-draft-device must not be duplicated: {argv:?}"
+// ── Main-device selector: --device injection ────────────────────────────────
+
+/// Value of the first `--device` occurrence in an argv.
+fn device_value(argv: &[String]) -> Option<String> {
+    argv.windows(2)
+        .find(|w| w[0] == "--device")
+        .map(|w| w[1].clone())
+}
+
+/// Every GPU-pinned llama.cpp model — Vulkan here — must be spawned with
+/// an explicit `--device <Prefix><rank>` selector naming the post-filter
+/// visible ranks.  Without it llama.cpp would use every device its build
+/// enumerates (all backends) and row-split the instance across them,
+/// leaking outside the scheduler's placement.
+#[tokio::test]
+async fn spawn_pins_vulkan_model_with_device_selector() {
+    let slots = real_drm_slots();
+    if slots.len() < 2 {
+        return;
+    }
+    let dir = temp_dir("device-pin-vulkan");
+    let llama_stub = llama_stub_link(&dir);
+    let argv_single = dir.join("argv-vk-single.txt");
+    let argv_dual = dir.join("argv-vk-dual.txt");
+    let yaml = format!(
+        "devices:\n  vulkan:\n    0: \"{}\"\n    1: \"{}\"\nmodels:\n  - name: vk-single\n    context_length: 4096\n    cmd: \"{} --port {{port}} --argv-log {}\"\n    max_instances: 1\n    max_concurrent: 1\n    vram: 1000\n    gpus: 1\n    vulkan_devices: [0, 1]\n  - name: vk-dual\n    context_length: 4096\n    cmd: \"{} --port {{port}} --argv-log {}\"\n    max_instances: 1\n    max_concurrent: 1\n    vram: 1000\n    gpus: 2\n    vulkan_devices: [0, 1]\n",
+        slots[0],
+        slots[1],
+        llama_stub.display(),
+        argv_single.display(),
+        llama_stub.display(),
+        argv_dual.display(),
     );
-    assert_eq!(draft_device_value(&argv).as_deref(), Some("none"));
+
+    let srv = boot(&dir, "tester: secret-key\n", &yaml).await;
+    let client = reqwest::Client::new();
+    for model in ["vk-single", "vk-dual"] {
+        let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+            .json(&chat_body(model))
+            .send()
+            .await
+            .unwrap();
+        if resp.status() != 200 {
+            let body = resp.text().await.unwrap_or_default();
+            panic!("{model} must be servable, got body: {body}");
+        }
+    }
+
+    // gpus: 1 — the scheduler picks one pool device; whichever it is, the
+    // post-filter rank is 0, so the pin must be exactly `Vulkan0`.
+    let argv = argv_of(&argv_single);
+    assert_eq!(
+        device_value(&argv).as_deref(),
+        Some("Vulkan0"),
+        "single-GPU Vulkan model must be pinned to its visible rank: {argv:?}"
+    );
+
+    // gpus: 2 — both pool devices are selected (deterministic pool order);
+    // the selector names the post-filter ranks of GGML_VK_VISIBLE_DEVICES=0,1.
+    let argv = argv_of(&argv_dual);
+    assert_eq!(
+        device_value(&argv).as_deref(),
+        Some("Vulkan0,Vulkan1"),
+        "dual-GPU Vulkan model must name both visible ranks: {argv:?}"
+    );
+}
+
+/// A non-empty placement renumbering must surface as post-filter ranks in
+/// the selector: `vulkan_devices: [[1]]` pins host device 1 via
+/// `GGML_VK_VISIBLE_DEVICES=1`, where llama.cpp enumerates it as `Vulkan0`.
+#[tokio::test]
+async fn spawn_device_selector_uses_post_filter_ranks() {
+    let slots = real_drm_slots();
+    if slots.len() < 2 {
+        return;
+    }
+    let dir = temp_dir("device-pin-ranks");
+    let llama_stub = llama_stub_link(&dir);
+    let argv_log = dir.join("argv-ranks.txt");
+    let yaml = format!(
+        "devices:\n  vulkan:\n    0: \"{}\"\n    1: \"{}\"\nmodels:\n  - name: vk-rank\n    context_length: 4096\n    cmd: \"{} --port {{port}} --argv-log {}\"\n    max_instances: 1\n    max_concurrent: 1\n    vram: 1000\n    gpus: 1\n    vulkan_devices: [[1]]\n",
+        slots[0],
+        slots[1],
+        llama_stub.display(),
+        argv_log.display(),
+    );
+
+    let srv = boot(&dir, "tester: secret-key\n", &yaml).await;
+    let client = reqwest::Client::new();
+    let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&chat_body("vk-rank"))
+        .send()
+        .await
+        .unwrap();
+    if resp.status() != 200 {
+        let body = resp.text().await.unwrap_or_default();
+        panic!("vk-rank must be servable, got body: {body}");
+    }
+
+    let argv = argv_of(&argv_log);
+    assert_eq!(
+        device_value(&argv).as_deref(),
+        Some("Vulkan0"),
+        "host device 1 is visible rank 0 after GGML_VK_VISIBLE_DEVICES=1: {argv:?}"
+    );
+}
+
+/// The CUDA namespace gets the same treatment (`--device CUDA0`); this
+/// also guards the pre-existing ROCm/CUDA behavior against regressions.
+#[tokio::test]
+async fn spawn_pins_cuda_model_with_device_selector() {
+    let Some(slot) = real_pci_slot() else { return };
+    let dir = temp_dir("device-pin-cuda");
+    let llama_stub = llama_stub_link(&dir);
+    let argv_log = dir.join("argv-cuda.txt");
+    let yaml = format!(
+        "devices:\n  cuda:\n    0:\n      pci: \"{slot}\"\n      vram_mb: 48000\nmodels:\n  - name: cuda-m\n    context_length: 4096\n    cmd: \"{} --port {{port}} --argv-log {}\"\n    max_instances: 1\n    max_concurrent: 1\n    vram: 1000\n    gpus: 1\n    cuda_devices: [[0]]\n",
+        llama_stub.display(),
+        argv_log.display(),
+    );
+
+    let srv = boot(&dir, "tester: secret-key\n", &yaml).await;
+    let client = reqwest::Client::new();
+    let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&chat_body("cuda-m"))
+        .send()
+        .await
+        .unwrap();
+    if resp.status() != 200 {
+        let body = resp.text().await.unwrap_or_default();
+        panic!("cuda-m must be servable, got body: {body}");
+    }
+
+    let argv = argv_of(&argv_log);
+    assert_eq!(
+        device_value(&argv).as_deref(),
+        Some("CUDA0"),
+        "CUDA model must be pinned by device name, not env alone: {argv:?}"
+    );
 }
