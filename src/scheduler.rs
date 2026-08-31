@@ -4,8 +4,8 @@
 // spawning, slot acquisition, queueing, idle eviction, and shutdown.
 
 use crate::backend::{
-    Backend, DeviceKind, LlamaCppBackend, ReadyOutcome, output_lines, poll_readiness,
-    shutdown_child, spawn_process,
+    Backend, DeviceKind, LlamaCppBackend, StableDiffusionCppBackend, ReadyOutcome,
+    output_lines, poll_readiness, shutdown_child, spawn_process,
 };
 use crate::config::{AliasPolicy, DevicePool, EmaWindow, MakeRoomMode, ModelConfig};
 use crate::gpu::GpuMetrics;
@@ -3189,30 +3189,25 @@ impl InstanceManager {
             _ => None,
         };
 
-        // Device pinning follows the model's namespace: Vulkan models via
-        // GGML_VK_VISIBLE_DEVICES, CUDA models via CUDA_VISIBLE_DEVICES,
-        // and ROCm models via HIP_VISIBLE_DEVICES.  Every kind also gets
-        // an explicit --device <Prefix><rank>,… selector naming the
-        // post-filter visible ranks — without it llama.cpp would use all
-        // devices its build enumerates (including other backends' GPUs)
-        // and row-split the instance across them.  The append is
-        // unconditional: llama.cpp is last-value-wins, so a command that
-        // slipped past config validation can still not escape its
-        // placement.
-        let model_backend = LlamaCppBackend::new(cfg.device_kind());
+        // Select the backend implementation based on the program basename.
+        // sd.cpp models use `StableDiffusionCppBackend` (no --device flag,
+        // only the visibility env var); everything else uses the standard
+        // llama.cpp backend with its --device selector.
+        let prog_basename = prog.rsplit('/').next().unwrap_or(prog);
+        let model_backend: Box<dyn Backend> = if prog_basename.starts_with("sd-server") {
+            Box::new(StableDiffusionCppBackend::new(cfg.device_kind()))
+        } else {
+            Box::new(LlamaCppBackend::new(cfg.device_kind()))
+        };
         let mut args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
         args.extend(model_backend.gpu_args(&gpu_indices));
-        // CPU-only spawn: enforce no GPU offload.  llama.cpp's default is
-        // to offload as many layers as fit, so without this the model
-        // would silently load onto GPU 0.  No-op for non-llama programs
-        // and for commands that already declare the offload count.
+        // CPU-only spawn: enforce no GPU offload for llama.cpp models.
+        // No-op for non-llama programs (basename check inside).
         if gpu_indices.is_empty() {
             LlamaCppBackend::enforce_cpu_offload(prog, &mut args);
         }
         // Speculative decoding: pin the draft model to the same device(s)
-        // the instance is placed on (`--spec-draft-device`).  No-op unless
-        // the command declares a draft model and leaves the draft device
-        // to us.
+        // the instance is placed on.  No-op for non-llama programs.
         LlamaCppBackend::inject_spec_draft_device(prog, &mut args, cfg.device_kind(), &gpu_indices);
         let envs = model_backend.gpu_env(&gpu_indices);
 

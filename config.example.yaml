@@ -60,6 +60,11 @@ server:
 
   # drain_idle_timeout_secs: 3600     # default
 
+  # Default diffusion model for native passthrough endpoints
+  # (`/sdapi/v1/*`, `/sdcpp/v1/*`) which have no `model` field.
+  # When unset, passthrough requests must specify `X-LLM-Model` header.
+  # default_diffusion_model: "flux-1-dev"
+
 # ---------------------------------------------------------------------------
 # API keys
 # ---------------------------------------------------------------------------
@@ -162,6 +167,26 @@ cmd_aliases:
   #     --host 127.0.0.1
   #     --port {port}
   #     --backend vulkan
+
+  # sd-server (stable-diffusion.cpp) — diffusion model server.  One server
+  # process per model.  `{name}` resolves to the model's config name.
+  # `--diffusion-model` points to the actual weights file (safetensors,
+  # ckpt, or gguf) for the selected model.  Use {vulkan} or {cuda} variants
+  # depending on the backend build of sd-server.
+  # sd: |
+  #   sd-server
+  #     --host 127.0.0.1
+  #     --port {port}
+  #     --diffusion-model /models/{name}.safetensors
+  #     --vae /models/vae.safetensors
+  #     --backend vulkan
+  #
+  # sd-cpu: |
+  #   sd-server
+  #     --host 127.0.0.1
+  #     --port {port}
+  #     --diffusion-model /models/{name}.safetensors
+  #     --backend cpu
 
 # ---------------------------------------------------------------------------
 # GPU keep-alive
@@ -402,6 +427,50 @@ models:
   #       --ctx-size 32768
   #       --spec-draft-model /models/qwen3-1.7b-q4_k_m.gguf
   #       --spec-draft-ngl 99   # offload all draft layers
+
+  # --- Example 6: a diffusion model (stable-diffusion.cpp) -------------------
+  # sd-server is an entirely separate binary from llama-server.  Backend
+  # selection is automatic: llm-orch detects `sd-server` in the command
+  # basename and uses `StableDiffusionCppBackend` (no --device flag, only
+  # the visibility env var).  GPU device pools are shared — vulkan_devices,
+  # cuda_devices, and rocm_devices work identically.
+  #
+  # `context_length` is meaningless for diffusion models and should be 0.
+  # `vram` hints the scheduler about VRAM usage (adjust for your model).
+  # - name: "flux-1-dev"
+  #   context_length: 0
+  #   max_instances: 1
+  #   max_concurrent: 1         # sd-server serializes requests internally
+  #   vram: 16000                # FLUX.1-dev (~12-16 GB at FP16)
+  #   idle_ttl: 600
+  #   queue_depth: 5
+  #   vulkan_devices: [0]
+  #   cmd: |
+  #     {sd}
+  #       --diffusion-model /models/flux1-dev.safetensors
+  #       --clip-l /models/clip-l.safetensors
+  #       --t5xxl /models/t5xxl.safetensors
+  #       --vae /models/ae.safetensors
+  #       --diffusion-dtype auto
+  #       --sampling-steps 28
+  #       --w 1024
+  #       --h 1024
+  #
+  # --- Example 7: a video diffusion model (Wan2.1) --------------------------
+  # Video models use the same sd-server binary with different weight files.
+  # The `/v1/video/generations` endpoint polls sd-server's async job API
+  # internally and returns the completed container.
+  # - name: "wan2.1-t2v-1.3b"
+  #   context_length: 0
+  #   max_instances: 1
+  #   max_concurrent: 1
+  #   vram: 12000
+  #   idle_ttl: 900              # keep video models loaded longer
+  #   queue_depth: 3
+  #   vulkan_devices: [0]
+  #   cmd: |
+  #     {sd}
+  #       --diffusion-model /models/Wan2.1-T2V-1.3B-fp16.safetensors
 
 # ---------------------------------------------------------------------------
 # Aliases

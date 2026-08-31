@@ -71,6 +71,19 @@ pub fn build_router(state: AppState) -> Router {
             post(handlers::audio_transcriptions),
         )
         .route("/v1/audio/voices", get(handlers::audio_voices))
+        // OpenAI-compatible image/video endpoints (stable-diffusion.cpp
+        // backends).  These are registered unconditionally — passthrough
+        // routing (sdapi/sdcpp) only activates for operative deployment
+        // configurations, and model-resolution failures surface as 4xx.
+        .route("/v1/images/generations", post(handlers::images_generations))
+        .route("/v1/images/edits", post(handlers::images_edits))
+        .route("/v1/video/generations", post(handlers::video_generations))
+        // Native sd-server API passthrough (WebUI-compatible + sdcpp native).
+        // Path parameters capture the remainder.  GET methods forward
+        // to sd-server too (capabilities, job polling).
+        .route("/sdapi/v1/{*path}", post(handlers::passthrough_sdapi))
+        .route("/sdcpp/v1/{*path}", post(handlers::passthrough_sdcpp))
+        .route("/sdcpp/v1/{*path}", get(handlers::passthrough_sdcpp_get))
         // Admin endpoints.
         .route("/admin/status", get(handlers::admin_status))
         .route("/admin/load", post(handlers::admin_load))

@@ -159,6 +159,7 @@ pub async fn info_endpoint(
             .iter()
             .map(|m| {
                 let mets = metrics_snapshot.get(&m.name);
+                let backend = model_backend_kind(m);
                 ModelInfo {
                     name: m.name.clone(),
                     context_length: m.context_length,
@@ -179,6 +180,7 @@ pub async fn info_endpoint(
                         .get(&m.name)
                         .cloned()
                         .unwrap_or_default(),
+                    backend,
                 }
             })
             .collect();
@@ -2005,6 +2007,679 @@ pub async fn audio_voices(
     .await
 }
 
+// ── /v1/images/*, /v1/video/* — stable-diffusion.cpp backends ──────────────
+//
+// OpenAI-compatible image generation/editing endpoints and a custom video
+// endpoint, all forwarding to sd-server instances.  Native sd-api and
+// sdcpp endpoints are also proxied via passthrough.
+
+/// Everything needed to forward one image/video request to a concrete instance.
+struct DiffusionTarget {
+    model_name: String,
+    request_model: String,
+    port: u16,
+    instance_id: String,
+    /// Keeps the instance slot held for the duration of the request —
+    /// never read directly, but dropping it would free the instance mid-
+    /// request.  Deliberately kept as a value field.
+    #[allow(dead_code)]
+    guard: SlotGuard,
+    total_timeout: std::time::Duration,
+    debug_log_path: Option<std::path::PathBuf>,
+}
+
+/// Resolve a diffusion model name (or alias) and acquire an instance slot.
+///
+/// Works exactly like `acquire_audio_target`: aliases are resolved, the
+/// model is looked up in config, and an instance is spawned on demand.
+async fn acquire_diffusion_target(
+    state: &AppState,
+    request_model: &str,
+    request_id: &str,
+) -> Result<DiffusionTarget, ApiError> {
+    let (candidates, policy, make_room, drain_timeout, total_timeout) = {
+        let cfg = state.config.read().await;
+        let (c, p, mr, dt) = resolve_alias(&cfg.aliases, request_model);
+        if !c.iter().any(|n| cfg.models.iter().any(|m| &m.name == n)) {
+            return Err(ApiError::ModelNotFound(request_model.to_owned()));
+        }
+        (
+            c,
+            p,
+            mr,
+            dt,
+            std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs),
+        )
+    };
+
+    let admission = state
+        .manager
+        .admit(
+            &candidates,
+            policy,
+            make_room,
+            drain_timeout,
+            Some(request_id),
+        )
+        .await
+        .map_err(|e| acquire_error_for_request(&state.manager, request_id, request_model, e))?;
+
+    let (model_name, guard) = match admission {
+        Admission::Assigned(model_name, guard) => (model_name, guard),
+        Admission::Waiting(pending) => {
+            let (model_name, guard) = pending
+                .wait()
+                .await
+                .map_err(|e| acquire_error(request_model, e))?;
+            (model_name, guard)
+        }
+    };
+
+    build_diffusion_target(state, request_model, model_name, guard, total_timeout).await
+}
+
+async fn build_diffusion_target(
+    state: &AppState,
+    request_model: &str,
+    model_name: String,
+    guard: SlotGuard,
+    total_timeout: std::time::Duration,
+) -> Result<DiffusionTarget, ApiError> {
+    let debug_log_path: Option<std::path::PathBuf> = {
+        let cfg = state.config.read().await;
+        cfg.models
+            .iter()
+            .find(|m| m.name == model_name)
+            .and_then(|m| m.debug_log.clone())
+    };
+    let (port, instance_id) = {
+        let inst = guard.handle().inner().lock().unwrap();
+        (inst.port, inst.id.clone())
+    };
+    Ok(DiffusionTarget {
+        model_name,
+        request_model: request_model.to_owned(),
+        port,
+        instance_id,
+        guard,
+        total_timeout,
+        debug_log_path,
+    })
+}
+
+/// Forward a JSON POST to an sd-server backend endpoint.
+///
+/// Sends the request body to `http://127.0.0.1:{port}{path}`, aggregates
+/// the response (bounded by total_timeout), and returns it with the
+/// backend's Content-Type preserved.
+async fn forward_diffusion_json(
+    state: &AppState,
+    target: DiffusionTarget,
+    path: &str,
+    body: Vec<u8>,
+    request_id: &str,
+    _api_user: &str,
+) -> Result<Response, ApiError> {
+    let backend_url = format!("http://127.0.0.1:{}{}", target.port, path);
+
+    // Debug log: request body as JSON
+    if let Some(ref log_path) = target.debug_log_path {
+        let debug_body: Option<serde_json::Value> =
+            serde_json::from_slice(&body).ok();
+        state.debug_loggers.write_line(
+            log_path,
+            &DebugLogEntry {
+                ts: ts_now(),
+                request_id: request_id.to_owned(),
+                model: target.model_name.clone(),
+                alias: Some(target.request_model.clone()),
+                instance_id: Some(target.instance_id.clone()),
+                dir: "request".into(),
+                stream: None,
+                body: debug_body,
+                usage: None,
+                duration_ms: None,
+                error: None,
+            },
+        );
+    }
+
+    let send = state
+        .client
+        .post(&backend_url)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send();
+
+    let resp = if target.total_timeout.is_zero() {
+        send.await
+    } else {
+        match tokio::time::timeout(target.total_timeout, send).await {
+            Ok(r) => r,
+            Err(_) => {
+                warn!(url = %backend_url, "diffusion backend timeout");
+                return Err(ApiError::BackendTimeout(format!(
+                    "backend did not respond within {}s",
+                    target.total_timeout.as_secs()
+                )));
+            }
+        }
+    }
+    .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let bytes = resp.bytes().await.unwrap_or_default();
+
+    // Debug log: response
+    if let Some(ref log_path) = target.debug_log_path {
+        state.debug_loggers.write_line(
+            log_path,
+            &DebugLogEntry {
+                ts: ts_now(),
+                request_id: request_id.to_owned(),
+                model: target.model_name.clone(),
+                alias: Some(target.request_model.clone()),
+                instance_id: Some(target.instance_id.clone()),
+                dir: "response".into(),
+                stream: None,
+                body: Some(serde_json::json!({
+                    "status": status.as_u16(),
+                    "bytes": bytes.len(),
+                    "content_type": &content_type,
+                })),
+                usage: None,
+                duration_ms: None,
+                error: if status.is_success() { None } else { Some(format!("backend {}: {}", status.as_u16(), String::from_utf8_lossy(&bytes))) },
+            },
+        );
+    }
+
+    if !status.is_success() {
+        return Err(ApiError::Internal(format!(
+            "backend returned {}: {}",
+            status,
+            String::from_utf8_lossy(&bytes)
+        )));
+    }
+
+    let mut response = (status, bytes).into_response();
+    if let Ok(ct) = header::HeaderValue::from_str(&content_type) {
+        response.headers_mut().insert(header::CONTENT_TYPE, ct);
+    }
+    Ok(response)
+}
+
+/// `POST /v1/images/generations` — OpenAI-compatible text-to-image.
+///
+/// Accepts an `ImagesGenerationRequest` JSON body.  The `model` field
+/// selects which diffusion backend to use.  Extra fields (lora,
+/// sample_params, negative_prompt, etc.) are passed through verbatim to
+/// sd-server's `/v1/images/generations`.
+pub async fn images_generations(
+    State(state): State<AppState>,
+    key: ApiKey,
+    Json(body): Json<ImagesGenerationRequest>,
+) -> Result<Response, ApiError> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let request_model = body
+        .model
+        .as_deref()
+        .ok_or_else(|| ApiError::BadRequest("missing 'model' field".into()))?
+        .to_owned();
+    let target =
+        acquire_diffusion_target(&state, &request_model, &request_id).await?;
+
+    // Build the body to forward to sd-server.
+    // Start from the known fields, then merge in the extra fields.
+    let mut forward_body = serde_json::json!({
+        "prompt": body.prompt,
+        "n": body.n,
+        "output_format": body.output_format,
+        "output_compression": body.output_compression,
+    });
+    if let Some(size) = &body.size {
+        forward_body["size"] = serde_json::Value::String(size.clone());
+    }
+    // Pass through extra (extension) fields verbatim.
+    for (k, v) in &body.extra {
+        forward_body[k] = v.clone();
+    }
+    // Rewrite `model` to the resolved name for logging/debugging.
+    forward_body["model"] =
+        serde_json::Value::String(target.model_name.clone());
+
+    let bytes = serde_json::to_vec(&forward_body)
+        .map_err(|e| ApiError::BadRequest(format!("serialization error: {}", e)))?;
+
+    forward_diffusion_json(
+        &state,
+        target,
+        "/v1/images/generations",
+        bytes,
+        &request_id,
+        &key.label,
+    )
+    .await
+}
+
+/// `POST /v1/images/edits` — OpenAI-compatible image editing.
+///
+/// sd-server expects multipart/form-data.  The `model` field is read from
+/// the multipart body (or, as a fallback, from a JSON `params` field).
+/// This handler forwards the multipart body to sd-server's `/v1/images/edits`
+/// after (optionally) rewriting the `model` field to the resolved name.
+pub async fn images_edits(
+    State(state): State<AppState>,
+    key: ApiKey,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+
+    // Extract the multipart boundary and the model field.
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let boundary = multipart_boundary(content_type)
+        .ok_or_else(|| ApiError::BadRequest("missing multipart boundary".into()))?;
+    let request_model = extract_multipart_field(&body, &boundary, "model")
+        .or_else(|| {
+            // Fallback: try the inner `params` JSON.
+            extract_multipart_field(&body, &boundary, "params").and_then(|p| {
+                serde_json::from_str::<serde_json::Value>(&p)
+                    .ok()
+                    .and_then(|v| v.get("model").and_then(|m| m.as_str().map(String::from)))
+            })
+        })
+        .ok_or_else(|| ApiError::BadRequest("missing 'model' field in multipart body".into()))?;
+
+    let target =
+        acquire_diffusion_target(&state, &request_model, &request_id).await?;
+
+    // Rewrite the model field in the multipart body to the resolved name.
+    let forwarded_body =
+        rewrite_multipart_field(&body, &boundary, "model", &target.model_name);
+
+    forward_diffusion_post_raw(
+        &state,
+        target,
+        "/v1/images/edits",
+        forwarded_body,
+        content_type,
+        &request_id,
+        &key.label,
+    )
+    .await
+}
+
+/// Forward a raw POST (arbitrary Content-Type) to an sd-server backend.
+///
+/// Like `forward_diffusion_json` but preserves the caller's Content-Type
+/// (needed for multipart uploads).
+async fn forward_diffusion_post_raw(
+    state: &AppState,
+    target: DiffusionTarget,
+    path: &str,
+    body: Vec<u8>,
+    content_type: &str,
+    _request_id: &str,
+    _api_user: &str,
+) -> Result<Response, ApiError> {
+    let backend_url = format!("http://127.0.0.1:{}{}", target.port, path);
+
+    let send = state
+        .client
+        .post(&backend_url)
+        .header(header::CONTENT_TYPE, content_type)
+        .body(body)
+        .send();
+
+    let resp = if target.total_timeout.is_zero() {
+        send.await
+    } else {
+        match tokio::time::timeout(target.total_timeout, send).await {
+            Ok(r) => r,
+            Err(_) => {
+                warn!(url = %backend_url, "diffusion backend (raw) timeout");
+                return Err(ApiError::BackendTimeout(format!(
+                    "backend did not respond within {}s",
+                    target.total_timeout.as_secs()
+                )));
+            }
+        }
+    }
+    .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
+
+    let status = resp.status();
+    let resp_ct = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let bytes = resp.bytes().await.unwrap_or_default();
+
+    if !status.is_success() {
+        return Err(ApiError::Internal(format!(
+            "backend returned {}: {}",
+            status,
+            String::from_utf8_lossy(&bytes)
+        )));
+    }
+
+    let mut response = (status, bytes).into_response();
+    if let Ok(ct) = header::HeaderValue::from_str(&resp_ct) {
+        response.headers_mut().insert(header::CONTENT_TYPE, ct);
+    }
+    Ok(response)
+}
+
+/// `POST /v1/video/generations` — llm-orch custom video generation.
+///
+/// Accepts a `VideoGenerationRequest` JSON body.  Forwards to sd-server's
+/// `/sdcpp/v1/vid_gen` (async), then polls `/sdcpp/v1/jobs/{id}` until
+/// completion.  On success, decodes the base64 container and returns raw
+/// bytes with the correct Content-Type (`video/webm`, `image/webp`, or
+/// `video/x-msvideo`).
+///
+/// The polling interval starts at 500 ms and doubles up to 5 s.
+pub async fn video_generations(
+    State(state): State<AppState>,
+    _key: ApiKey,
+    Json(body): Json<VideoGenerationRequest>,
+) -> Result<Response, ApiError> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let request_model = body
+        .model
+        .as_deref()
+        .ok_or_else(|| ApiError::BadRequest("missing 'model' field".into()))?
+        .to_owned();
+    let target =
+        acquire_diffusion_target(&state, &request_model, &request_id).await?;
+
+    // Build the body for sd-server's /sdcpp/v1/vid_gen.
+    let mut forward_body = serde_json::json!({
+        "prompt": body.prompt,
+        "output_format": body.output_format,
+    });
+    if let Some(v) = body.video_frames {
+        forward_body["video_frames"] = serde_json::json!(v);
+    }
+    if let Some(v) = body.fps {
+        forward_body["fps"] = serde_json::json!(v);
+    }
+    if let Some(v) = body.width {
+        forward_body["width"] = serde_json::json!(v);
+    }
+    if let Some(v) = body.height {
+        forward_body["height"] = serde_json::json!(v);
+    }
+    if let Some(v) = body.seed {
+        forward_body["seed"] = serde_json::json!(v);
+    }
+    // Pass through extra fields.
+    for (k, v) in &body.extra {
+        forward_body[k] = v.clone();
+    }
+
+    let bytes = serde_json::to_vec(&forward_body)
+        .map_err(|e| ApiError::BadRequest(format!("serialization error: {}", e)))?;
+
+    let backend_url =
+        format!("http://127.0.0.1:{}/sdcpp/v1/vid_gen", target.port);
+
+    // Submit the video job.
+    let submit_resp = state
+        .client
+        .post(&backend_url)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(bytes)
+        .send()
+        .await
+        .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
+
+    let submit_status = submit_resp.status();
+    let submit_body: serde_json::Value = submit_resp
+        .json()
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to parse submit response: {}", e)))?;
+
+    if !submit_status.is_success() && submit_status != 202 {
+        return Err(ApiError::Internal(format!(
+            "video job submission failed ({}): {}",
+            submit_status, submit_body
+        )));
+    }
+
+    // Extract the job ID.
+    let job_id = submit_body["id"]
+        .as_str()
+        .map(String::from)
+        .ok_or_else(|| ApiError::Internal("no job id in submit response".into()))?;
+
+    // Poll until completed or timeout.
+    let poll_base = format!("http://127.0.0.1:{}/sdcpp/v1/jobs/{}", target.port, job_id);
+    let deadline = tokio::time::Instant::now() + target.total_timeout;
+    let mut delay = std::time::Duration::from_millis(500);
+
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ApiError::BackendTimeout(format!(
+                "video generation did not complete within {}s",
+                target.total_timeout.as_secs()
+            )));
+        }
+        tokio::time::sleep(delay).await;
+        delay = std::cmp::min(delay * 2, std::time::Duration::from_secs(5));
+
+        let poll_resp = state
+            .client
+            .get(&poll_base)
+            .send()
+            .await
+            .map_err(|e| ApiError::Internal(format!("poll failed: {}", e)))?;
+        let poll_status = poll_resp.status();
+        let poll_body: serde_json::Value = poll_resp
+            .json()
+            .await
+            .map_err(|e| ApiError::Internal(format!("failed to parse poll response: {}", e)))?;
+
+        if poll_status == 404 {
+            return Err(ApiError::Internal("video job not found".into()));
+        }
+
+        let job_status = poll_body["status"]
+            .as_str()
+            .unwrap_or("unknown");
+        match job_status {
+            "completed" => {
+                // Extract the result payload.
+                let result = poll_body["result"]
+                    .as_object()
+                    .ok_or_else(|| ApiError::Internal("missing result in completed job".into()))?;
+                let b64 = result["b64_json"]
+                    .as_str()
+                    .ok_or_else(|| ApiError::Internal("missing b64_json in result".into()))?;
+                let mime_type = result["mime_type"]
+                    .as_str()
+                    .unwrap_or("video/webm")
+                    .to_owned();
+
+                use base64::Engine;
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .map_err(|e| ApiError::Internal(format!("base64 decode error: {}", e)))?;
+
+                let mut response = (decoded).into_response();
+                if let Ok(ct) = header::HeaderValue::from_str(&mime_type) {
+                    response.headers_mut().insert(header::CONTENT_TYPE, ct);
+                }
+                return Ok(response);
+            }
+            "failed" => {
+                let err = poll_body["error"]
+                    .as_object()
+                    .map(|e| format!("{}", serde_json::json!(e)))
+                    .unwrap_or_else(|| "unknown error".into());
+                return Err(ApiError::Internal(format!("video generation failed: {}", err)));
+            }
+            "cancelled" => {
+                return Err(ApiError::Internal("video generation cancelled".into()));
+            }
+            _ => {
+                // queued or generating → continue polling
+            }
+        }
+    }
+}
+
+/// Resolve a target for passthrough requests (sdapi / sdcpp native API).
+///
+/// Passthrough endpoints have no `model` field in their body.  The target
+/// model is determined by (in order):
+/// 1. The `X-LLM-Model` request header (for operator control).
+/// 2. The config's `default_diffusion_model` server setting.
+///
+/// Returns an error if neither is available or the target model is unknown.
+async fn acquire_passthrough_target(
+    state: &AppState,
+    headers: &HeaderMap,
+    request_id: &str,
+) -> Result<DiffusionTarget, ApiError> {
+    let request_model = {
+        // Check for explicit header override.
+        if let Some(h) = headers.get("x-llm-model")
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty())
+        {
+            h.to_owned()
+        } else {
+            // Fall back to the configured default.
+            let cfg = state.config.read().await;
+            cfg.server.default_diffusion_model.clone().ok_or_else(|| {
+                ApiError::BadRequest(
+                    "no model specified for passthrough — set X-LLM-Model header or configure server.default_diffusion_model"
+                        .into(),
+                )
+            })?
+        }
+    };
+
+    acquire_diffusion_target(state, &request_model, request_id).await
+}
+
+/// `POST /sdapi/v1/*path` — passthrough to sd-server's WebUI-compatible API.
+///
+/// Forwards the request verbatim (same path, body, Content-Type) to the
+/// target sd-server instance.  The model is resolved via
+/// [`acquire_passthrough_target`].
+pub async fn passthrough_sdapi(
+    State(state): State<AppState>,
+    key: ApiKey,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let target = acquire_passthrough_target(&state, &headers, &request_id).await?;
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json");
+    let path = format!("/sdapi/v1/{}", path);
+    forward_diffusion_post_raw(
+        &state,
+        target,
+        &path,
+        body.to_vec(),
+        content_type,
+        &request_id,
+        &key.label,
+    )
+    .await
+}
+
+/// `POST /sdcpp/v1/*path` — passthrough to sd-server's native sdcpp API.
+///
+/// Forwards the request verbatim.  The model is resolved via
+/// [`acquire_passthrough_target`].
+pub async fn passthrough_sdcpp(
+    State(state): State<AppState>,
+    key: ApiKey,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let target = acquire_passthrough_target(&state, &headers, &request_id).await?;
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json");
+    let path = format!("/sdcpp/v1/{}", path);
+    forward_diffusion_post_raw(
+        &state,
+        target,
+        &path,
+        body.to_vec(),
+        content_type,
+        &request_id,
+        &key.label,
+    )
+    .await
+}
+
+/// `GET /sdcpp/v1/*path` — passthrough for sdcpp GET endpoints
+/// (e.g. `/sdcpp/v1/jobs/{id}`, `/sdcpp/v1/capabilities`).
+pub async fn passthrough_sdcpp_get(
+    State(state): State<AppState>,
+    _key: ApiKey,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+) -> Result<Response, ApiError> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let target = acquire_passthrough_target(&state, &headers, &request_id).await?;
+    let backend_url =
+        format!("http://127.0.0.1:{}/sdcpp/v1/{}", target.port, path);
+
+    let resp = state
+        .client
+        .get(&backend_url)
+        .send()
+        .await
+        .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let bytes = resp.bytes().await.unwrap_or_default();
+
+    if !status.is_success() {
+        return Err(ApiError::Internal(format!(
+            "backend returned {}: {}",
+            status,
+            String::from_utf8_lossy(&bytes)
+        )));
+    }
+
+    let mut response = (status, bytes).into_response();
+    if let Ok(ct) = header::HeaderValue::from_str(&content_type) {
+        response.headers_mut().insert(header::CONTENT_TYPE, ct);
+    }
+    Ok(response)
+}
+
 // ── Multipart helpers ────────────────────────────────────────────────────────
 
 /// Extract the `boundary` parameter from a `multipart/form-data`
@@ -3208,6 +3883,19 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+/// Determine the backend kind string for a model based on its command
+/// program basename.  Used by the `/v1/info` endpoint.
+fn model_backend_kind(cfg: &crate::config::ModelConfig) -> String {
+    let parts = shlex::split(&cfg.cmd).unwrap_or_default();
+    let prog = parts.first().map(|s| s.as_str()).unwrap_or("");
+    let basename = prog.rsplit('/').next().unwrap_or(prog);
+    if basename.starts_with("sd-server") {
+        "sd.cpp".to_string()
+    } else {
+        "llama.cpp".to_string()
     }
 }
 

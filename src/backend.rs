@@ -313,6 +313,56 @@ impl Backend for LlamaCppBackend {
     }
 }
 
+// ── stable-diffusion.cpp backend ─────────────────────────────────────────────
+
+/// Backend for stable-diffusion.cpp (`sd-server`).
+///
+/// GPU selection uses only the visibility environment variable
+/// (`GGML_VK_VISIBLE_DEVICES` / `CUDA_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES`)
+/// — sd.cpp does **not** have an equivalent of llama.cpp's `--device`
+/// selector, so [`Backend::gpu_args`] returns an empty vector.
+///
+/// The health endpoint is the default `GET /health`.
+pub struct StableDiffusionCppBackend {
+    kind: DeviceKind,
+}
+
+impl StableDiffusionCppBackend {
+    pub fn new(kind: DeviceKind) -> Self {
+        Self { kind }
+    }
+}
+
+impl Backend for StableDiffusionCppBackend {
+    fn gpu_args(&self, _indices: &[usize]) -> Vec<String> {
+        // sd.cpp does not have a `--device`-style selector — only the
+        // visibility env var matters.  No CLI args to inject.
+        Vec::new()
+    }
+
+    fn gpu_env(&self, indices: &[usize]) -> Vec<(String, String)> {
+        if indices.is_empty() {
+            return Vec::new();
+        }
+        // Same env vars as llama.cpp for the same device kinds.
+        let var = match self.kind {
+            DeviceKind::Vulkan => "GGML_VK_VISIBLE_DEVICES",
+            DeviceKind::Cuda => "CUDA_VISIBLE_DEVICES",
+            DeviceKind::Rocm => "HIP_VISIBLE_DEVICES",
+        };
+        let list = indices
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        vec![(var.into(), list)]
+    }
+
+    fn health_url(&self, port: u16) -> String {
+        format!("http://127.0.0.1:{port}/health")
+    }
+}
+
 // ── CPU-offload enforcement (llama.cpp command lines) ──────────────────────
 
 /// The outcome of scanning a resolved llama.cpp command line (program

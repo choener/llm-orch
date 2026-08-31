@@ -77,10 +77,24 @@ impl Config {
                 )));
             }
             if m.context_length == 0 {
-                return Err(ConfigError::Validation(format!(
-                    "model '{}': context_length must be > 0",
-                    m.name
-                )));
+                // Non-LLM backends (sd-server, audiocpp_server, …) have no
+                // meaningful context_length.  Only enforce the > 0 rule for
+                // llama.cpp programs which use it for KV cache sizing and
+                // cmd substitution.
+                let resolved = resolve_model_cmd(&self.cmd_aliases, m, 0);
+                let is_llama = shlex::split(&resolved)
+                    .and_then(|p| p.into_iter().next())
+                    .map(|prog| {
+                        let basename = prog.rsplit('/').next().unwrap_or(&prog);
+                        basename.starts_with("llama-")
+                    })
+                    .unwrap_or(false);
+                if is_llama {
+                    return Err(ConfigError::Validation(format!(
+                        "model '{}': context_length must be > 0 for llama.cpp backends",
+                        m.name
+                    )));
+                }
             }
             if m.cmd.trim().is_empty() {
                 return Err(ConfigError::Validation(format!(
@@ -294,6 +308,16 @@ impl Config {
                     )));
                 }
             }
+        }
+
+        // --- default_diffusion_model ---
+        if let Some(ref default_diff_model) = self.server.default_diffusion_model
+            && !self.models.iter().any(|m| &m.name == default_diff_model)
+        {
+            return Err(ConfigError::Validation(format!(
+                "server.default_diffusion_model: '{}' is not a configured model",
+                default_diff_model
+            )));
         }
 
         // --- keep-alive ---
@@ -575,6 +599,15 @@ pub struct ServerConfig {
     /// Victim ordering policy for make-room migrations.
     #[serde(default)]
     pub eviction_policy: EvictionPolicy,
+
+    /// Default diffusion model for native passthrough endpoints
+    /// (`/sdapi/v1/*`, `/sdcpp/v1/*`) that have no `model` field in their
+    /// request bodies.  When unset, passthrough requests must provide a
+    /// model name via the `X-LLM-Model` request header, otherwise they
+    /// return 400.  The named model must exist and should use a GPU device
+    /// pool (validation checks this but CPU-only is not rejected).
+    #[serde(default)]
+    pub default_diffusion_model: Option<String>,
 }
 
 fn default_listen() -> String {

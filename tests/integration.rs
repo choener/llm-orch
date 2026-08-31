@@ -1567,3 +1567,247 @@ async fn spawn_pins_cuda_model_with_device_selector() {
         "CUDA model must be pinned by device name, not env alone: {argv:?}"
     );
 }
+
+// ── stable-diffusion.cpp integration tests ──────────────────────────────────
+
+/// Build a YAML snippet for a single sd-server model.
+fn sd_models_yaml(idle_ttl: u64) -> String {
+    format!(
+        "models:\n  - name: sd-m\n    context_length: 0\n    cmd: \"{STUB_BIN} --port {{port}} --diffusion-model /models/test.safetensors --backend vulkan\"\n    idle_ttl: {idle_ttl}\n    max_instances: 1\n"
+    )
+}
+
+#[tokio::test]
+async fn sd_image_generation_sync() {
+    let dir = temp_dir("sd-img");
+    let srv = boot(&dir, "tester: secret-key\n", &sd_models_yaml(60)).await;
+    let client = reqwest::Client::new();
+
+    let resp = authed(&client, &format!("{}/v1/images/generations", srv.url))
+        .json(&serde_json::json!({
+            "model": "sd-m",
+            "prompt": "a cat",
+            "n": 1,
+            "size": "512x512",
+            "output_format": "png"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["created"].as_i64().is_some());
+    assert!(body["data"].is_array());
+    assert!(!body["data"].as_array().unwrap().is_empty());
+    assert!(body["data"][0]["b64_json"].as_str().unwrap().len() > 10);
+}
+
+#[tokio::test]
+async fn sd_image_generation_unknown_model_404() {
+    let dir = temp_dir("sd-img-404");
+    let srv = boot(&dir, "tester: secret-key\n", &sd_models_yaml(60)).await;
+    let client = reqwest::Client::new();
+
+    let resp = authed(&client, &format!("{}/v1/images/generations", srv.url))
+        .json(&serde_json::json!({
+            "model": "nonexistent-sd",
+            "prompt": "a cat"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn sd_image_edits_sync() {
+    let dir = temp_dir("sd-edit");
+    let srv = boot(&dir, "tester: secret-key\n", &sd_models_yaml(60)).await;
+    let client = reqwest::Client::new();
+
+    let resp = authed(&client, &format!("{}/v1/images/edits", srv.url))
+        .multipart(
+            reqwest::multipart::Form::new()
+                .text("model", "sd-m")
+                .text("prompt", "make it red")
+                .text("n", "1")
+                .part("image[]", reqwest::multipart::Part::bytes(vec![0u8; 64]).file_name("test.png")),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn sd_video_generation_sync() {
+    let dir = temp_dir("sd-vid");
+    let srv = boot(&dir, "tester: secret-key\n", &sd_models_yaml(60)).await;
+    let client = reqwest::Client::new();
+
+    let resp = authed(&client, &format!("{}/v1/video/generations", srv.url))
+        .json(&serde_json::json!({
+            "model": "sd-m",
+            "prompt": "a cat walking",
+            "video_frames": 33,
+            "fps": 16,
+            "output_format": "webm"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let ct = resp.headers().get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(ct.contains("video/webm"), "expected video/webm content-type, got: {ct}");
+}
+
+#[tokio::test]
+async fn sd_passthrough_sdapi_txt2img() {
+    let dir = temp_dir("sd-sdapi-txt2img");
+    // Boot with default_diffusion_model set.
+    let listen_port = free_port();
+    let models = sd_models_yaml(60);
+    let cfg_yaml = format!(
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\n  default_diffusion_model: \"sd-m\"\napikeys_file: \"apikeys.txt\"\n{models}",
+    );
+    let config_path = dir.join("config.yaml");
+    std::fs::write(&config_path, cfg_yaml).unwrap();
+    let srv = boot_from_config_path(&dir, &config_path, "tester: secret-key\n").await;
+    let client = reqwest::Client::new();
+
+    let resp = authed(&client, &format!("{}/sdapi/v1/txt2img", srv.url))
+        .json(&serde_json::json!({
+            "prompt": "a cat",
+            "steps": 20
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["images"].is_array(), "sdapi txt2img must return images array");
+}
+
+#[tokio::test]
+async fn sd_passthrough_sdcpp_vid_gen() {
+    let dir = temp_dir("sd-sdcpp-vid");
+    let listen_port = free_port();
+    let models = sd_models_yaml(60);
+    let cfg_yaml = format!(
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\n  default_diffusion_model: \"sd-m\"\napikeys_file: \"apikeys.txt\"\n{models}",
+    );
+    let config_path = dir.join("config.yaml");
+    std::fs::write(&config_path, cfg_yaml).unwrap();
+    let srv = boot_from_config_path(&dir, &config_path, "tester: secret-key\n").await;
+    let client = reqwest::Client::new();
+
+    // sdcpp v1 vid_gen returns 202 with async job id
+    let resp = authed(&client, &format!("{}/sdcpp/v1/vid_gen", srv.url))
+        .json(&serde_json::json!({
+            "prompt": "a cat walking",
+            "video_frames": 33
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["id"].as_str().is_some());
+    assert_eq!(body["status"], "queued");
+}
+
+#[tokio::test]
+async fn sd_passthrough_default_diffusion_fallback() {
+    let dir = temp_dir("sd-default-fallback");
+    let listen_port = free_port();
+    let models = sd_models_yaml(60);
+    let cfg_yaml = format!(
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\n  default_diffusion_model: \"sd-m\"\napikeys_file: \"apikeys.txt\"\n{models}",
+    );
+    let config_path = dir.join("config.yaml");
+    std::fs::write(&config_path, cfg_yaml).unwrap();
+    let srv = boot_from_config_path(&dir, &config_path, "tester: secret-key\n").await;
+    let client = reqwest::Client::new();
+
+    // No model field in body — should use default_diffusion_model
+    let resp = authed(&client, &format!("{}/sdapi/v1/txt2img", srv.url))
+        .json(&serde_json::json!({"prompt": "default model test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "must fall back to default_diffusion_model");
+}
+
+#[tokio::test]
+async fn sd_passthrough_x_llm_model_header() {
+    let dir = temp_dir("sd-x-llm-model");
+    let listen_port = free_port();
+    let models = sd_models_yaml(60);
+    let cfg_yaml = format!(
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\napikeys_file: \"apikeys.txt\"\n{models}",
+    );
+    let config_path = dir.join("config.yaml");
+    std::fs::write(&config_path, cfg_yaml).unwrap();
+    let srv = boot_from_config_path(&dir, &config_path, "tester: secret-key\n").await;
+    let client = reqwest::Client::new();
+
+    // No default_diffusion_model, but set X-LLM-Model header.
+    let resp = client
+        .get(format!("{}/sdcpp/v1/capabilities", srv.url))
+        .header("Authorization", "Bearer secret-key")
+        .header("X-LLM-Model", "sd-m")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "X-LLM-Model header must route to configured model");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["supported_modes"].is_array(), "must return capabilities");
+}
+
+#[tokio::test]
+async fn sd_passthrough_missing_model_returns_400() {
+    let dir = temp_dir("sd-missing-model");
+    let listen_port = free_port();
+    let models = sd_models_yaml(60);
+    let cfg_yaml = format!(
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\napikeys_file: \"apikeys.txt\"\n{models}",
+    );
+    let config_path = dir.join("config.yaml");
+    std::fs::write(&config_path, cfg_yaml).unwrap();
+    let srv = boot_from_config_path(&dir, &config_path, "tester: secret-key\n").await;
+    let client = reqwest::Client::new();
+
+    // No default_diffusion_model and no X-LLM-Model → 400.
+    let resp = client
+        .post(format!("{}/sdapi/v1/txt2img", srv.url))
+        .header("Authorization", "Bearer secret-key")
+        .json(&serde_json::json!({"prompt": "test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "no model target must return 400");
+}
+
+#[tokio::test]
+async fn sd_endpoints_require_auth() {
+    let dir = temp_dir("sd-auth");
+    let srv = boot(&dir, "tester: secret-key\n", &sd_models_yaml(60)).await;
+    let client = reqwest::Client::new();
+
+    for path in ["/v1/images/generations", "/v1/images/edits", "/v1/video/generations", "/sdapi/v1/txt2img", "/sdcpp/v1/capabilities"] {
+        let resp = client
+            .post(format!("{}{}", srv.url, path))
+            .json(&serde_json::json!({"model": "sd-m", "prompt": "test"}))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status() == 401 || resp.status() == 403,
+            "endpoint {path} without auth should be denied, got {}",
+            resp.status()
+        );
+    }
+}

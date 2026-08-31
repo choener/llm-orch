@@ -15,7 +15,7 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "compression-gzip", "compression-br", "request-id"] }
 
 # HTTP client (backend forwarding, SSE streaming)
-reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls", "http2", "charset", "gzip", "brotli"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls", "http2", "charset", "gzip", "brotli", "multipart"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

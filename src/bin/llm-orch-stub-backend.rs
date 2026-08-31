@@ -1,8 +1,8 @@
-// ── Stub llama.cpp backend ───────────────────────────────────────────────────
+// ── Stub llama.cpp / sd.cpp backend ─────────────────────────────────────────────
 //
-// A minimal HTTP server that mimics the llama.cpp endpoints llm-orch uses,
-// so integration tests can exercise the full spawn → forward → stream path
-// without a real GPU or model.
+// A minimal HTTP server that mimics the llama.cpp and stable-diffusion.cpp
+// endpoints llm-orch uses, so integration tests can exercise the full spawn
+// → forward → stream path without a real GPU or model.
 //
 // Endpoints:
 //   GET  /health                  → 200 OK (readiness probe)
@@ -13,11 +13,20 @@
 //   POST /v1/audio/speech         → tiny WAV, base64 JSON, or speech SSE
 //   POST /v1/audio/transcriptions → canned transcript (JSON + multipart), SSE optional
 //   GET  /v1/audio/voices         → static voice list
+//   POST /v1/images/generations   → canned base64 image JSON (sd.cpp stub)
+//   POST /v1/images/edits         → canned base64 image JSON
+//   POST /sdcpp/v1/vid_gen        → 202 + job creation (async video)
+//   GET  /sdcpp/v1/jobs/{id}      → completed job (200) or pending (202)
+//   POST /sdcpp/v1/img_gen        → 202 + job creation (async image)
+//   GET  /sdcpp/v1/capabilities   → canned capability JSON
+//   POST /sdapi/v1/txt2img        → canned sdapi image response
+//   POST /sdapi/v1/img2img        → canned sdapi image response
 //
 // Flags control the canned response: number of chunks, per-chunk delay
 // (slow streaming for drain/timeout tests).  audiocpp_server-style flags
 // (--config, --host, --backend, …) are accepted and ignored so the stub
-// can be spawned with an audio-style cmd line.
+// can be spawned with an audio-style cmd line.  sd-server-style flags
+// (--diffusion-model, --vae, --clip-l, --backend, …) are accepted and ignored.
 
 use axum::{
     Json, Router,
@@ -90,6 +99,31 @@ struct Cli {
     ui: bool,
     #[arg(long)]
     log: bool,
+    // ── sd-server (stable-diffusion.cpp) compatibility flags (accepted, ignored) ──
+    #[arg(long)]
+    diffusion_model: Option<String>,
+    #[arg(long)]
+    vae: Option<String>,
+    #[arg(long)]
+    clip_l: Option<String>,
+    #[arg(long)]
+    t5xxl: Option<String>,
+    #[arg(long)]
+    clip_g: Option<String>,
+    #[arg(long)]
+    control_net_dir: Option<String>,
+    #[arg(long)]
+    lora_model_dir: Option<String>,
+    #[arg(long)]
+    hires_upscalers_dir: Option<String>,
+    #[arg(long)]
+    diffusion_dtype: Option<String>,
+    #[arg(long)]
+    sampling_steps: Option<usize>,
+    #[arg(long)]
+    w: Option<u32>,
+    #[arg(long)]
+    h: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -121,6 +155,14 @@ async fn main() {
         .route("/v1/audio/speech", post(audio_speech))
         .route("/v1/audio/transcriptions", post(audio_transcriptions))
         .route("/v1/audio/voices", get(audio_voices))
+        .route("/v1/images/generations", post(images_generations))
+        .route("/v1/images/edits", post(images_edits))
+        .route("/sdcpp/v1/vid_gen", post(sdcpp_vid_gen))
+        .route("/sdcpp/v1/jobs/{id}", get(sdcpp_job_status))
+        .route("/sdcpp/v1/img_gen", post(sdcpp_img_gen))
+        .route("/sdcpp/v1/capabilities", get(sdcpp_capabilities))
+        .route("/sdapi/v1/txt2img", post(sdapi_txt2img))
+        .route("/sdapi/v1/img2img", post(sdapi_img2img))
         .with_state(cfg);
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", cli.port))
@@ -481,5 +523,203 @@ async fn embeddings(Json(body): Json<serde_json::Value>) -> impl IntoResponse {
         "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3]}],
         "model": model,
         "usage": {"prompt_tokens": 3, "total_tokens": 3}
+    }))
+}
+
+// ── sd.cpp stub endpoints ────────────────────────────────────────────────────
+
+/// Canned base64-encoded 1x1 red PNG used by all image generation stubs.
+fn canned_image_b64() -> &'static str {
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+}
+
+/// Canned video container bytes (minimal valid WebM header).
+fn canned_video_b64() -> &'static str {
+    "GkXfo59ChoEBQveBAULygQRC84EIQoKf2VibU92hSUH2AACA3RDaU6CvAACAmGx0Y29kBGZpcnN0AIB0b3VjaARnZW5yAQJ3Y4RlY29kZQ=="
+}
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
+
+/// Shared counter for sdcpp job IDs.
+static SDCPP_JOB_SEQ: AtomicU64 = AtomicU64::new(1);
+
+async fn images_generations(
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let _model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("stub-sd");
+    let n = body.get("n").and_then(|v| v.as_i64()).unwrap_or(1);
+    let output_format = body
+        .get("output_format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("png");
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let mut data = Vec::new();
+    for _ in 0..n {
+        data.push(serde_json::json!({
+            "b64_json": canned_image_b64()
+        }));
+    }
+
+    Json(serde_json::json!({
+        "created": now,
+        "data": data,
+        "output_format": output_format
+    }))
+}
+
+async fn images_edits(
+    _body: axum::body::Bytes,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let resp = serde_json::json!({
+        "created": now,
+        "data": [{"b64_json": canned_image_b64()}],
+        "output_format": "png"
+    });
+    (axum::http::StatusCode::OK, Json(resp))
+}
+
+async fn sdcpp_vid_gen(
+    Json(_body): Json<serde_json::Value>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let id = format!("job_stub_vid_{}", SDCPP_JOB_SEQ.fetch_add(1, Ordering::Relaxed));
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let resp = serde_json::json!({
+        "id": id,
+        "kind": "vid_gen",
+        "status": "queued",
+        "created": now,
+        "poll_url": format!("/sdcpp/v1/jobs/{}", id)
+    });
+    (axum::http::StatusCode::ACCEPTED, Json(resp))
+}
+
+async fn sdcpp_img_gen(
+    Json(_body): Json<serde_json::Value>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let id = format!("job_stub_img_{}", SDCPP_JOB_SEQ.fetch_add(1, Ordering::Relaxed));
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let resp = serde_json::json!({
+        "id": id,
+        "kind": "img_gen",
+        "status": "queued",
+        "created": now,
+        "poll_url": format!("/sdcpp/v1/jobs/{}", id)
+    });
+    (axum::http::StatusCode::ACCEPTED, Json(resp))
+}
+
+async fn sdcpp_job_status(
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let kind = if id.contains("vid") { "vid_gen" } else { "img_gen" };
+    Json(serde_json::json!({
+        "id": id,
+        "kind": kind,
+        "status": "completed",
+        "created": now - 10,
+        "started": now - 8,
+        "completed": now,
+        "queue_position": 0,
+        "result": {
+            "b64_json": if kind == "vid_gen" { canned_video_b64() } else { canned_image_b64() },
+            "output_format": if kind == "vid_gen" { "webm" } else { "png" },
+            "mime_type": if kind == "vid_gen" { "video/webm" } else { "image/png" },
+            "frame_count": if kind == "vid_gen" { serde_json::json!(33) } else { serde_json::Value::Null },
+            "fps": if kind == "vid_gen" { serde_json::json!(16) } else { serde_json::Value::Null },
+            "images": if kind == "img_gen" {
+                serde_json::json!([{"index": 0, "b64_json": canned_image_b64()}])
+            } else {
+                serde_json::Value::Null
+            }
+        },
+        "error": null
+    }))
+}
+
+async fn sdcpp_capabilities() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "supported_modes": ["img_gen", "vid_gen"],
+        "defaults_by_mode": {
+            "img_gen": {
+                "width": 1024,
+                "height": 1024,
+                "sample_params": {
+                    "sample_steps": 28
+                }
+            },
+            "vid_gen": {
+                "width": 832,
+                "height": 480,
+                "video_frames": 33,
+                "fps": 16
+            }
+        },
+        "output_formats_by_mode": {
+            "img_gen": ["png", "jpeg", "webp"],
+            "vid_gen": ["webm", "webp", "avi"]
+        },
+        "features_by_mode": {
+            "img_gen": {
+                "init_image": true,
+                "lora": true,
+                "cache": true
+            },
+            "vid_gen": {
+                "init_image": true,
+                "lora": true
+            }
+        },
+        "samplers": [{"name": "euler_a"}, {"name": "euler"}],
+        "loras": [],
+        "limits": {
+            "min_width": 64,
+            "max_width": 4096,
+            "min_height": 64,
+            "max_height": 4096,
+            "max_batch_count": 8,
+            "max_queue_size": 10
+        }
+    }))
+}
+
+async fn sdapi_txt2img(
+    Json(_body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "images": [canned_image_b64()],
+        "parameters": {},
+        "info": ""
+    }))
+}
+
+async fn sdapi_img2img(
+    Json(_body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "images": [canned_image_b64()],
+        "parameters": {},
+        "info": ""
     }))
 }

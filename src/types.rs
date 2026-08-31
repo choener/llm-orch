@@ -224,6 +224,8 @@ pub struct ModelInfo {
     /// Last N completion records (ring buffer, newest first).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recent_completions: Vec<CompletionRecord>,
+    /// Backend kind: "llama.cpp" or "sd.cpp" (determined by program basename).
+    pub backend: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -458,6 +460,213 @@ pub struct RerankRequest {
     pub return_documents: Option<bool>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+// ── Image generation types (stable-diffusion.cpp) ────────────────────────────
+
+/// Request body for `POST /v1/images/generations` (OpenAI-compatible).
+///
+/// Known OpenAI fields are modelled explicitly; extension fields (lora,
+/// sample_params, vae_tiling_params, cache_mode, etc.) are passed through
+/// verbatim via `extra` — sd-server accepts them as native sdcpp fields.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ImagesGenerationRequest {
+    pub prompt: String,
+    /// Model name (or alias).  Required for llm-orch routing.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Number of images to generate (sd-server: batch_count).
+    #[serde(default = "default_one")]
+    pub n: u32,
+    /// Image size in `WIDTHxHEIGHT` format, e.g. "1024x1024".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// Output image format: png, jpeg, or webp.
+    #[serde(default = "default_output_format")]
+    pub output_format: String,
+    /// Output compression level (0–100).
+    #[serde(default = "default_max_compression")]
+    pub output_compression: u32,
+    /// Any additional fields (negative_prompt, lora, sample_params, seed,
+    /// width, height, cfg_scale, sd_cpp_extra_args in prompt, …) are passed
+    /// through verbatim to sd-server.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+fn default_one() -> u32 { 1 }
+fn default_output_format() -> String { "png".into() }
+fn default_max_compression() -> u32 { 100 }
+
+/// Response body for `POST /v1/images/generations`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImagesGenerationResponse {
+    pub created: i64,
+    pub data: Vec<ImageObject>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<String>,
+}
+
+/// A single generated image (OpenAI-compatible).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageObject {
+    /// Base64-encoded image bytes.
+    #[serde(rename = "b64_json")]
+    pub b64_json: String,
+}
+
+/// Multipart form fields for `POST /v1/images/edits`.
+///
+/// sd-server expects multipart/form-data with `prompt`, `image[]`, `mask`,
+/// `n`, `size`, `output_format`, `output_compression` fields plus an
+/// optional `model` field (for llm-orch routing).
+///
+/// Additional sdcpp-native fields can be embedded as `sd_cpp_extra_args`
+/// inside `prompt` or passed as a separate `params` JSON field.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ImagesEditRequest {
+    pub prompt: String,
+    /// Model name (or alias) for llm-orch routing.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Number of images to generate.
+    #[serde(default = "default_one")]
+    pub n: u32,
+    /// Image size in `WIDTHxHEIGHT` format.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// Output format: png or jpeg.
+    #[serde(default = "default_output_format")]
+    pub output_format: String,
+    /// Output compression level.
+    #[serde(default = "default_max_compression")]
+    pub output_compression: u32,
+    /// Optional JSON params object for sdcpp-native extension fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<Map<String, Value>>,
+}
+
+// ── Video generation types (stable-diffusion.cpp) ────────────────────────────
+
+/// Request body for `POST /v1/video/generations`.
+///
+/// This is a new llm-orch endpoint (not standard OpenAI).  The request is
+/// forwarded to sd-server's `/sdcpp/v1/vid_gen`; llm-orch polls the async
+/// job and returns the completed video as raw bytes.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VideoGenerationRequest {
+    pub prompt: String,
+    /// Model name (or alias) for llm-orch routing.
+    pub model: Option<String>,
+    /// Number of video frames (default varies by model, sd-server sets it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_frames: Option<u32>,
+    /// Target frames-per-second.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fps: Option<u32>,
+    /// Video width.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    /// Video height.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    /// Seed (-1 = random).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
+    /// Output container format: webm, webp, or avi.
+    #[serde(default = "default_video_output_format")]
+    pub output_format: String,
+    /// Extension fields passed verbatim to sd-server.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+fn default_video_output_format() -> String { "webm".into() }
+
+/// Response body for `POST /v1/video/generations` (llm-orch internal).
+/// The handler decodes the base64 container and returns raw bytes instead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoGenerationResponse {
+    pub created: i64,
+    pub data: Vec<VideoObject>,
+}
+
+/// A single generated video (llm-orch internal).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoObject {
+    /// Base64-encoded container bytes.
+    #[serde(rename = "b64_json")]
+    pub b64_json: String,
+    /// MIME type of the container (video/webm, image/webp, video/x-msvideo).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// Effective playback FPS.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fps: Option<u32>,
+    /// Actual decoded frame count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_count: Option<u32>,
+    /// Selected output container format.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<String>,
+}
+
+/// sdcpp-native async job status (parsed from sd-server's GET /sdcpp/v1/jobs/{id}).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SdcppJobStatus {
+    pub id: String,
+    pub kind: String,
+    pub status: String,
+    #[serde(default)]
+    pub created: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed: Option<i64>,
+    #[serde(default)]
+    pub queue_position: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<SdcppJobResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<SdcppJobError>,
+}
+
+/// Result of a completed sdcpp job.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SdcppJobResult {
+    /// Base64-encoded output (image or video container).
+    #[serde(rename = "b64_json")]
+    pub b64_json: Option<String>,
+    /// Output format.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<String>,
+    /// MIME type for video results.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// FPS for video results.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fps: Option<u32>,
+    /// Frame count for video results.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_count: Option<u32>,
+    /// Individual images (for img_gen).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<SdcppJobImage>,
+}
+
+/// A single image in a completed sdcpp job result.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SdcppJobImage {
+    pub index: u32,
+    #[serde(rename = "b64_json")]
+    pub b64_json: String,
+}
+
+/// Error details for a failed sdcpp job.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SdcppJobError {
+    pub code: String,
+    pub message: String,
 }
 
 // ── Admin actions ────────────────────────────────────────────────────────────
