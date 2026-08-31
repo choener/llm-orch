@@ -1,276 +1,72 @@
-# Better queuing and spawning
+# Better queuing and spawning — plan
 
-## Problem description
+## Goal
 
-I have:
+Make queue depth drive instance spawning: fix EMA recording on queue entry/assignment, and redefine autoscale thresholds as explicit integral counts of active requests (`in_flight + queued`) compared against a configurable EMA window, so bursts absorbed by `queue_depth` trigger a second instance when the queue stays deep.
 
-- `--parallel 1` on the llama.cpp command line — the backend processes one
-  request at a time, which keeps pp and tg throughput stable.
-- `max_concurrent: 4` on the model — accepts up to 4 concurrent in-flight
-  requests onto one instance, **but** llama.cpp processes them one-at-a-time
-  via its internal queue, so 3 of them sit in llama.cpp's own slot, not the
-  orchestrator's queue.
-- `queue_depth: 10` — I want to enqueue up to 10 additional requests while
-  waiting for a slot, sending SSE heartbeats so the frontend doesn't time out.
+## Current behavior (verified against code, Nov 2025)
 
-What actually happens: the first 4 requests get a slot immediately (the
-orchestrator hands them off to llama.cpp, which internally queues them).
-Requests 5+ go into the orchestrator's logical queue.  Because `max_concurrent`
-is generous (4), the orchestrator never feels pressure to spawn a second
-instance — the 5th request only reaches the orchestrator's queue once all
-4 slots are claimed, and by then the autoscaler is behind.
+- `max_concurrent` = per-instance slot cap on *orchestrator-accepted* requests (`instance.rs` `has_capacity` / `try_acquire`; enforced in `acquire_ready_slot`, `wake_one`, rebinding). Also substituted as `{max_concurrent}` into `cmd` (conventionally `--parallel {max_concurrent}`). Feeds autoscale capacity math. `in_flight` includes requests sitting in llama.cpp's own queue.
+- `queue_depth` = per-model cap on the orchestrator FIFO of requests that couldn't grab any slot (429 at cap; `0` = no-queue special mode that starts a spawn demand, blocks until it finishes, then 429s). Heartbeats every `queue_heartbeat_secs` while parked. Deadline via `queue_wait_timeout_secs`.
+- EMA (`ModelMetrics::tick`, tickless, 60/300/900s windows for m1/m5/m15) over `active = in_flight + queued` — correct formula, but only updated on slot acquire/release, NOT on queue entry or wake assignment (bugs below).
+- Autoscale today: fractions. `should_spawn` (request path): `load_m5 > scale_up_at × max_concurrent × n`. `evaluate_autoscale` (30s tick): up `load_m5 > scale_up_at × max_concurrent × n`, down `load_m15 < scale_down_at × max_concurrent × (n−1)`.
 
-Because `queue_depth` only counts requests that couldn't grab a **slot** at
-all, it doesn't participate much in the scaling decision.
+### Bugs / issues found
 
-The goal: let `queue_depth` absorb bursts (with heartbeats), use
-`max_concurrent` as a tighter cap to match `--parallel`, and let the
-autoscaler react to queue buildup to spawn another instance when needed.
+1. `register_pending` (scheduler.rs:2686) never calls `record_metrics_event` after pushing a queue entry — queued requests are invisible to the EMA until the next release event or the 30s autoscaler tick.
+2. `wake_one` (scheduler.rs:2917) never calls `record_metrics_event` on successful queue→slot assignment — EMA under-reports during queue drain.
+3. `acquire_ready_slot` (scheduler.rs:2489) does call it (`record_metrics_event(model_name, 0)`) — inconsistent signal depending on admission path.
+4. Autoscale thresholds are fractions of `max_concurrent × n`; queue depth only enters via the EMA, which has both the recording bugs and minutes of convergence lag (300s window) for bursts.
+5. `queue_depth: 0` has split semantics (no-queue mode + test reliance at tests/integration.rs:7651) — **out of scope, leave untouched**.
+6. `max_instances` defaults to 1 — autoscale enabled without raising it silently never scales up.
 
-## What I want
+## Agreed design (decisions from discussion)
 
-- `--parallel 1` — llama.cpp deals with one request at a time
-- `max_concurrent: 2` — one active processing, one in llama.cpp's own queue
-- `queue_depth: 10` — ten more requests wait in the orchestrator's queue,
-  receiving SSE heartbeats so the frontend doesn't disconnect; no 429s
-  unless the queue overflows
-- **Autoscale**: when sustained load exceeds a threshold *and free VRAM
-  exists*, spawn another instance — the queue depth should drive this,
-  not just `max_concurrent × num_instances`
+- `max_concurrent` stays "requests committed to the backend pipeline" (backend free to use `--parallel -1`, `--parallel {max_concurrent}`, or `--parallel 1`).
+- `queue_depth` stays "requests llm-orch is willing to park with heartbeats".
+- EMA = EMA over `active = in_flight + queued` (formula unchanged).
+- **Scale-up rule**: `EMA(scale_up_value) > U_n` where `U_n = scale_up_at + (n−1) × max_concurrent`. At full saturation this is "spawn when queue-EMA > `scale_up_at − max_concurrent`" — the queue depth drives spawning, uniformly at any n.
+- **Scale-down rule**: `EMA(scale_down_value) < D_n` where `D_n = scale_down_at + (n−2) × max_concurrent` (n ≥ 2). With `scale_down_at = max_concurrent` (safe value): "drop only when the remaining instances stay strictly below 100%".
+- **`scale_up_at` / `scale_down_at` become integral counts** (`usize`), required in the autoscale block (no f64 defaults).
+- **Two global (server-level) options**: `scale_up_value: m1|m5|m15`, `scale_down_value: m1|m5|m15`, both default `m1`. Fast reaction for bursty workloads; qwen-27b-style ~10s cold starts make quick down/up cycles cheap; freeing VRAM for other models quickly is worth more than hysteresis.
+- **Config validation** (errors): `scale_up_at > max_concurrent`, `scale_down_at >= max_concurrent`, `scale_down_at < scale_up_at` (strict — guarantees a non-empty hysteresis band, prevents up/down overlap).
+- **Config validation** (warnings): `autoscale.enabled && max_instances <= 1` (scale-up physically impossible); `autoscale.enabled && queue_depth == 0` (queue never fills ⇒ up-rule can never fire: `active ≤ n × max_concurrent < U_n`). New `Config::warnings()` mechanism surfaced in `--check-config` output and startup log.
 
-## What's wrong today
+## Tasks
 
-### Bug 1: Queue entries don't update the EMA
+### 1. Metric recording fixes (prerequisites)
+- [x] `register_pending`: call `self.record_metrics_event(&model_name, 0)` after the queue push (after the inner lock scope closes)
+- [x] `wake_one`: call `self.record_metrics_event(&logical_model, 0)` after a successful assignment transfer
+- [x] Add scheduler unit tests: EMA/`load_m1` rises on enqueue; stays honest on wake assignment
 
-When `admit()` runs out of slots and calls `register_pending()`, the queue
-entry is added but `record_metrics_event` is **never called**.  The EMA
-(`load_m5`, `load_m15`) stays at whatever `in_flight` was before queuing.
-Queued requests are invisible to autoscale until:
+### 2. Config: integral thresholds + EMA windows
+- [x] Add `EmaWindow` enum (`M1 | M5 | M15`, serde lowercase `m1|m5|m15`)
+- [x] ServerConfig: `scale_up_value: EmaWindow`, `scale_down_value: EmaWindow` (defaults `M1`), in `src/config.rs` next to the other queue/autoscale server fields
+- [x] `AutoscaleConfig`: `scale_up_at`/`scale_down_at` `f64` → `usize`, required (remove `default_autoscale_up`/`default_autoscale_down`); update doc comments with the new formulas
+- [x] `validate()`: add the three error checks; add `Config::warnings() -> Vec<String>` with the two warnings
+- [x] Wire warnings into `main.rs`: print in `--check-config` OK output and `warn!` at startup after config load
+- [x] Update config unit tests: remove 0.7/0.4 default assertions, add validation error/warning tests
 
-- A **release** event (the active request finishes → the background release
-  task calls `record_metrics_event(&model_name, 1)`)
-- The **autoscaler tick** runs and calls `force_refresh` — but that only
-  happens every 30 seconds.
+### 3. Scheduler: new threshold semantics
+- [x] InstanceManager: add `RwLock<EmaWindow>` copies `scale_up_value`/`scale_down_value` (pattern of `queue_wait_timeout_secs`: init in `new()`, refresh in the reload path ~line 4328)
+- [x] `should_spawn` (request-path gate): replace `load_m5 > scale_up_at × max_concurrent × num_existing` with `EMA(scale_up_value) > scale_up_at + (num_existing−1) × max_concurrent`; cold-start (`num_existing == 0`) and autoscale-disabled paths unchanged
+- [x] `evaluate_autoscale`: scale-up uses `U_n` + `scale_up_value` EMA; scale-down uses `D_n = scale_down_at + (n−2) × max_concurrent` + `scale_down_value` EMA; keep cooldown, `spawns_in_flight` dedup, `max_instances` gate, final idle despawn, and the no-autoscale surplus eviction unchanged
+- [x] Update scheduler autoscale unit tests to the new semantics (despawn/keep-alive tests at ~5308–5355, 5576, 7516 — unchanged, they test the no-autoscale despawn paths); add unit tests for U_n/D_n math and the should_spawn gate
+- [x] Update integration tests that reference autoscale (2 mentions) if needed; run full `cargo test`
 
-If the active request(s) are long-running, the autoscaler sits on stale
-data for up to 30 seconds and never sees the 5 queued requests piling up.
+### 4. Docs
+- [x] `config.example.yaml`: new autoscale block with integral values + `scale_up_value`/`scale_down_value` server options, explained
+- [x] README "Autoscaling" section: new formulas, validation rules, warnings, worked example (max_concurrent 2 / queue_depth 10 / scale_up_at 4 → spawn when queue-EMA > 2)
 
-The code path:
+## Notes
 
-```
-register_pending (line ~2686)
-  ↓ queue.push_back(entry)
-  ↓ scheduler_metrics.queue_enqueued_total.fetch_add(…)
-  ↓ wake_one(&model_name)   // tries to assign immediately, but all slots busy
-  // NO record_metrics_event call
-```
-
-The release processing in `main.rs`:
-
-```rust
-while let Some(model_name) = rx.recv().await {
-    mgr.record_metrics_event(&model_name, 1);  // only on slot release
-    mgr.wake_one(&model_name);
-}
-```
-
-Only updates the EMA on slot release, not on queue entry.
-
-### Bug 2: `wake_one` also skips `record_metrics_event`
-
-When `wake_one` pops a queued request and successfully calls `try_acquire`,
-`in_flight` goes up by 1 and `queued` goes down by 1 — but the EMA isn't
-updated to reflect the transition:
-
-```rust
-// wake_one — line ~2917
-match guard {
-    Some(g) => match entry.assignment.send(Ok((logical_model, g))) {
-        Ok(()) => {
-            // ← record_metrics_event NOT called
-            return;
-        },
-```
-
-The EMA only catches up when the **response finishes** (guard drops →
-release_tx → release task).  So after a batch wake-up, the EMA
-under-reports load until each request completes.
-
-### Bug 3: `record_metrics_event` isn't called from `acquire_ready_slot` either
-
-Actually, it *is* — but only for the immediate-slot path (no queue):
-
-```rust
-// acquire_ready_slot — line ~2489
-fn acquire_ready_slot(...) -> Option<SlotGuard> {
-    let guard = handle.try_acquire(max_concurrent)?;
-    self.record_metrics_event(model_name, 0);  // ← called here
-    Some(guard)
-}
-```
-
-But when a request goes through the queue and later gets assigned via
-`wake_one`, `record_metrics_event` is **not called**.  So the EMA
-measurement depends on *which code path* admitted the request, producing
-an inconsistent signal.
-
-### Design issue 4: Autoscale thresholds use `max_concurrent`, ignoring queue depth
-
-```rust
-// should_spawn — line ~1687
-let cap = (max_concurrent * num_existing) as f64;
-let threshold = a.scale_up_at * cap;
-```
-
-```rust
-// evaluate_autoscale — line ~4717
-let capacity = (cfg.max_concurrent * num_instances) as f64;
-if m.load_m5 > a.scale_up_at * capacity { ... }
-```
-
-With `max_concurrent: 2` and `num_instances = 1`:
-
-- `capacity = 2.0`
-- `threshold = 0.7 × 2.0 = 1.4`
-
-`load_m5` converges toward `in_flight + queued`.  If both slots are full
-(2 in-flight, 10 queued), `load_m5 → 12.0`, which trivially exceeds the
-threshold.  **But** with Bug 1, queued requests never push the EMA up,
-so the autoscaler never reaches this conclusion.
-
-Additionally: `max_instances` defaults to **1**.  Even with correct EMAs,
-the autoscaler's cap check blocks every scale-up:
-
-```rust
-if num_instances < cfg.max_instances {  // fails when max_instances=1
-    ...
-```
-
-### Design issue 5: `queue_depth: 0` bypass works but is inelegant
-
-`queue_depth: 0` is documented as "reject all queuing".  But it also has
-a special-case fast-path that triggers an immediate spawn attempt before
-returning NoCapacity:
-
-```rust
-// admit — line ~1620
-if queue_cfg.queue_depth == 0 {
-    if let Some(demand) = demand {
-        match demand {
-            AdmissionDemand::Spawn { model_name, cfg } => {
-                let mut rx = self.ensure_spawn(&model_name, &cfg);
-                let budget = self.spawn_timeout + SPAWN_SERIAL_WINDOW + Duration::from_secs(30);
-                let _ = tokio::time::timeout(budget, rx.changed()).await;
-            }
-            ...
-        }
-    }
-    return Err(AcquireError::NoCapacity);
-}
-```
-
-This is used in the "no queue, just spawn" pattern.  But the test at
-`tests/integration.rs:7651` uses `queue_depth: 0` for the dense model in
-make-room scenarios — it treats depth-0 as "never enqueue, let the
-fallback candidate serve instead".  Not directly a bug, but worth noting
-that `queue_depth: 0` has split semantics.
-
-### Design issue 6: `record_metrics_event` mixes `in_flight + queued` into the EMA, but queued isn't always visible
-
-```rust
-// record_metrics_event — line ~4428
-let in_flight: usize = self.instances.read().unwrap().get(model_name)
-    .map(|list| list.iter().map(|h| h.inner().lock().unwrap().in_flight).sum())
-    .unwrap_or(0);
-let queued = self.queue_depth(model_name);
-let active = in_flight + queued;
-```
-
-This _would_ see queued requests correctly — if only `record_metrics_event`
-were called when queuing happens.  The formula itself is fine; the problem
-is entirely about **when** it's called.
-
-## Proposed fixes
-
-### Fix 1: Record metrics on queue entry
-
-In `register_pending`, after pushing the entry (and after the inner scope
-closes), add:
-
-```rust
-queue.push_back(entry);
-} // close inner scope
-
-self.record_metrics_event(&model_name, 0);  // ADD
-self.scheduler_metrics.queue_enqueued_total.fetch_add(1, Ordering::Relaxed);
-```
-
-This makes the EMA immediately reflect queued load.  The autoscaler can
-see `active = in_flight + queued` at the next tick or force-refresh.
-
-### Fix 2: Record metrics on wake assignment
-
-In `wake_one`, after a successful transfer:
-
-```rust
-Ok(()) => {
-    self.scheduler_metrics.queue_assigned_total.fetch_add(1, Ordering::Relaxed);
-    self.record_metrics_event(&logical_model, 0);  // ADD
-    return;
-}
-```
-
-This keeps the EMA accurate when a request transitions from queue to
-in-flight.
-
-### Fix 3: Reconsider autoscale to use queue-depth‑aware thresholds (optional)
-
-The current autoscaler threshold formula `scale_up_at × max_concurrent ×
-num_instances` works reasonably well *with* Fix 1+2, because the EMA
-includes queued load.  A queue of 10 behind 2 in-flight slots gives
-`load_m5 ≈ 12`, which beats `0.7 × 2 = 1.4`.
-
-But an alternative formulation could be:
-
-```
-trigger when  queue_depth(model) >= min(config.queue_depth, autoscale.queue_up_threshold)
-```
-
-This would scale up not based on the EMA at all, but on raw queue fill.
-That's simpler to reason about and removes the EMA convergence delay.
-Pushing this too far would give the decision to the config author rather
-than the smoothed signal — but it could be an additive second trigger
-("scale up if EMA says so **or** queue is more than `queue_up_at: 5` deep").
-
-### Fix 4: `max_instances` must be > 1 for autoscaling to work (documentation)
-
-It's already documented in the YAML defaults (default is 1).  But it's an
-easy trap: you enable autoscale, set `max_concurrent: 2`, `queue_depth: 10`,
-and forget to set `max_instances: 4` (or whatever your VRAM budget allows).
-The autoscaler then faithfully checks `num_instances < cfg.max_instances`
-and skips the scale-up every time.  The model seems broken: 429s despite
-free VRAM.
-
-## How the corrected system would behave
-
-With `max_concurrent: 2`, `queue_depth: 10`, `max_instances: 4`,
-`autoscale.enabled: true`, `autoscale.scale_up_at: 0.7`, and `--parallel 1`:
-
-1. **Request 1** → `acquire_ready_slot`: `in_flight=1`, EMA `active=1`, OK
-2. **Request 2** → `acquire_ready_slot`: `in_flight=2`, EMA `active=2`, OK
-3. **Request 3** → all slots busy → `register_pending`.  EMA `active=2+1=3`.
-   Autoscaler next tick sees `load_m5 > 0.7 × 2 = 1.4` → **spawn instance 2**.
-4. **Requests 4–12** → fill queue to depth 10.  Request 13 gets 429.
-   EMA keeps rising (`active = 2 in-flight + 10 queued = 12`).
-5. **Instance 2 becomes Ready** → `wake_one` assigns queued requests.
-   `record_metrics_event` keeps EMA honest during the transition.
-6. If `load_m5` stays high → **spawn instance 3**, etc.
-7. As queue drains and `load_m15` drops below `scale_down_at × (instances−1) × max_concurrent`
-   → scale back down.
-
-The queen's gambit: with `--parallel 1` and `max_concurrent: 2`, the
-second in-flight slot is always "waiting at llama.cpp's door".  This is
-fine: llama.cpp will pick it up as soon as the previous one finishes,
-keeping utilization high.  The orchestrator queue absorbs bursts, and
-the autoscaler uses the combined `in_flight + queued` signal to decide
-when another instance is worth the VRAM.
+- `queue_depth: 0` semantics intentionally untouched (design issue 5) — separate concern; the new warning covers the autoscale interplay.
+- `max_instances` default stays 1; the new warning makes the "autoscale enabled but never scales" trap unmissable.
+- EMA windows are cheap: `tick` already computes m1/m5/m15 unconditionally; the config just picks which one is compared.
+- `load_m1/m5/m15` already exposed in `/v1/info` — no API change.
+- Behavior after the change (max_concurrent 2, queue_depth 10, max_instances 4, scale_up_at 4, scale_down_at 2, m1/m1):
+  1. Requests 1–2: slots, EMA ≈ 2.
+  2. Request 3+: queue fills; with Fix 1 the EMA rises immediately; when queue-EMA > 2 (active-EMA > 4 = U_1), the next request's `should_spawn` gate triggers `ensure_spawn` → instance 2.
+  3. If no further requests arrive, the 30s tick fires the same rule.
+  4. Instance 2 ready → `wake_one` drains the queue; Fix 2 keeps the EMA honest during the transition.
+  5. Burst ends; queue drains; m1 decays below D_2 = 2 within ~1–2 min → scale down, VRAM freed for other models.

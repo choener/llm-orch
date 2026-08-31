@@ -51,6 +51,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cfg.aliases.len(),
                     cfg.cmd_aliases.len(),
                 );
+                for w in cfg.warnings() {
+                    println!("WARNING: {w}");
+                }
                 std::process::exit(0);
             }
             Err(e) => {
@@ -69,6 +72,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.models.len(),
         cfg.aliases.len()
     );
+    for w in cfg.warnings() {
+        warn!("{w}");
+    }
 
     // 2. Load API keys from the path specified in the config.
     //    If the file doesn't exist, continue with an empty store (fail-closed).

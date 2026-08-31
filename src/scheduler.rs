@@ -7,7 +7,7 @@ use crate::backend::{
     Backend, DeviceKind, LlamaCppBackend, ReadyOutcome, output_lines, poll_readiness,
     shutdown_child, spawn_process,
 };
-use crate::config::{AliasPolicy, DevicePool, MakeRoomMode, ModelConfig};
+use crate::config::{AliasPolicy, DevicePool, EmaWindow, MakeRoomMode, ModelConfig};
 use crate::gpu::GpuMetrics;
 use crate::http_client;
 use crate::instance::{Instance, InstanceHandle, InstanceLoadPurpose, InstanceState, SlotGuard};
@@ -1061,6 +1061,14 @@ pub struct InstanceManager {
     /// deadline.  Backend timeouts begin only after assignment.
     queue_wait_timeout_secs: RwLock<u64>,
 
+    /// EMA window used for autoscale scale-up decisions (server-global,
+    /// hot-reloaded).  `m1` reacts to bursts within a minute.
+    scale_up_value: RwLock<EmaWindow>,
+
+    /// EMA window used for autoscale scale-down decisions (server-global,
+    /// hot-reloaded).
+    scale_down_value: RwLock<EmaWindow>,
+
     /// Maximum migration transition duration; zero means no transition
     /// deadline.  Queue wait deadlines remain separate.
     migration_timeout_secs: RwLock<u64>,
@@ -1195,6 +1203,8 @@ impl InstanceManager {
             spawn_timeout: Duration::from_secs(120),
             drain_idle_timeout_secs: RwLock::new(config.server.drain_idle_timeout_secs),
             queue_wait_timeout_secs: RwLock::new(config.server.queue_wait_timeout_secs),
+            scale_up_value: RwLock::new(config.server.scale_up_value),
+            scale_down_value: RwLock::new(config.server.scale_down_value),
             migration_timeout_secs: RwLock::new(config.server.migration_timeout_secs),
             model_metrics: RwLock::new(HashMap::new()),
             request_statuses: std::sync::RwLock::new(HashMap::new()),
@@ -1679,9 +1689,14 @@ impl InstanceManager {
         }
     }
 
-    /// Autoscale spawn gate: only spawn if sustained load exceeds the
-    /// threshold (always true for cold-start — zero existing instances —
-    /// and when autoscale is disabled or absent).
+    /// Autoscale spawn gate: only spawn if the load EMA exceeds the
+    /// scale-up threshold (always true for cold-start — zero existing
+    /// instances — and when autoscale is disabled or absent).
+    ///
+    /// Threshold: `scale_up_at + (n−1) × max_concurrent` for n existing
+    /// instances.  Since `in_flight ≤ n × max_concurrent`, the rule can
+    /// only fire with a non-empty queue — "spawn when the queue EMA
+    /// exceeds `scale_up_at − max_concurrent`".
     fn should_spawn(&self, model_name: &str, cfg: &ModelConfig) -> bool {
         let max_concurrent = cfg.max_concurrent;
         if let Some(ref a) = cfg.autoscale {
@@ -1707,19 +1722,13 @@ impl InstanceManager {
                 if num_existing == 0 {
                     true // cold start — always spawn immediately
                 } else {
-                    let load_m5 = self
-                        .model_metrics
-                        .read()
-                        .unwrap()
-                        .get(model_name)
-                        .map(|m| m.load_m5)
-                        .unwrap_or(0.0);
-                    let cap = (max_concurrent * num_existing) as f64;
-                    let threshold = a.scale_up_at * cap;
-                    if load_m5 <= threshold {
+                    let load =
+                        self.load_for_window(model_name, *self.scale_up_value.read().unwrap());
+                    let threshold = (a.scale_up_at + max_concurrent * (num_existing - 1)) as f64;
+                    if load <= threshold {
                         debug!(
                             model = %model_name,
-                            load_m5 = %load_m5,
+                            load = %load,
                             threshold = %threshold,
                             "autoscale gate: load too low, queuing"
                         );
@@ -1731,6 +1740,21 @@ impl InstanceManager {
             }
         } else {
             true // no autoscale config — spawn immediately
+        }
+    }
+
+    /// Current load-EMA value for the given window (load = `in_flight` +
+    /// queued requests).  `0.0` when the model has no metrics entry yet.
+    fn load_for_window(&self, model_name: &str, window: EmaWindow) -> f64 {
+        let metrics = self.model_metrics.read().unwrap();
+        let m = match metrics.get(model_name) {
+            Some(m) => m,
+            None => return 0.0,
+        };
+        match window {
+            EmaWindow::M1 => m.load_m1,
+            EmaWindow::M5 => m.load_m5,
+            EmaWindow::M15 => m.load_m15,
         }
     }
 
@@ -2753,6 +2777,12 @@ impl InstanceManager {
             .queue_enqueued_total
             .fetch_add(1, Ordering::Relaxed);
 
+        // Make the queue entry visible to the load EMA immediately: the
+        // autoscaler's scale-up rules are driven by `in_flight + queued`,
+        // so a burst parked in the queue must move the EMA now, not at the
+        // next release event or the next 30s autoscaler tick.
+        self.record_metrics_event(&model_name, 0);
+
         // Close the lost-wakeup race: a slot may have been released between
         // the capacity check and our queue push, with wake_one finding an
         // empty queue.  Re-signal now that we are parked.
@@ -2965,11 +2995,14 @@ impl InstanceManager {
                 .find_ready_instance(&logical_model, max_concurrent)
                 .and_then(|h| h.try_acquire(max_concurrent));
             match guard {
-                Some(g) => match entry.assignment.send(Ok((logical_model, g))) {
+                Some(g) => match entry.assignment.send(Ok((logical_model.clone(), g))) {
                     Ok(()) => {
                         self.scheduler_metrics
                             .queue_assigned_total
                             .fetch_add(1, Ordering::Relaxed);
+                        // The request transitioned queue → in-flight; keep
+                        // the load EMA honest during the queue drain.
+                        self.record_metrics_event(&logical_model, 0);
                         return;
                     }
                     // Waiter vanished (cancellation racing the wake) — the
@@ -4327,6 +4360,8 @@ impl InstanceManager {
             .unwrap_or_default();
         *self.drain_idle_timeout_secs.write().unwrap() = config.server.drain_idle_timeout_secs;
         *self.queue_wait_timeout_secs.write().unwrap() = config.server.queue_wait_timeout_secs;
+        *self.scale_up_value.write().unwrap() = config.server.scale_up_value;
+        *self.scale_down_value.write().unwrap() = config.server.scale_down_value;
         *self.migration_timeout_secs.write().unwrap() = config.server.migration_timeout_secs;
         self.ports
             .lock()
@@ -4629,10 +4664,9 @@ impl InstanceManager {
                 continue;
             }
 
-            let m = match metrics.get(model_name) {
-                Some(m) => m,
-                None => continue,
-            };
+            if !metrics.contains_key(model_name) {
+                continue;
+            }
 
             // ── Final despawn (n → 0): global idle reap on the last
             //    instance ────────────────────────────────────────────────
@@ -4710,11 +4744,16 @@ impl InstanceManager {
             }
 
             // ── Scale-up (n → n+1) ─────────────────────────────
-            // Proactive: spawn when sustained load exceeds threshold,
-            // even if no incoming request triggers the request-path gate.
+            // Proactive: spawn when the load EMA exceeds the scale-up
+            // threshold, even if no incoming request triggers the
+            // request-path gate.  Threshold `U_n = scale_up_at +
+            // (n−1) × max_concurrent` — can only fire with a non-empty
+            // queue (see `should_spawn` docs).
             if num_instances < cfg.max_instances {
-                let capacity = (cfg.max_concurrent * num_instances) as f64;
-                if m.load_m5 > a.scale_up_at * capacity {
+                let up_window = *self.scale_up_value.read().unwrap();
+                let load = self.load_for_window(model_name, up_window);
+                let threshold = (a.scale_up_at + cfg.max_concurrent * (num_instances - 1)) as f64;
+                if load > threshold {
                     // A request-driven spawn may already be in flight —
                     // don't double-spawn past the cap.
                     if self
@@ -4731,8 +4770,9 @@ impl InstanceManager {
                     }
                     info!(
                         model = %model_name,
-                        load_m5 = %m.load_m5,
-                        threshold = %(a.scale_up_at * capacity),
+                        up_window = ?up_window,
+                        load = %load,
+                        threshold = %threshold,
                         "autoscale: scaling up"
                     );
                     // Fire-and-forget: the spawn runs in a detached task
@@ -4749,8 +4789,13 @@ impl InstanceManager {
 
             // ── Scale-down (n → n−1) ─────────────────────────────
             if num_instances > 1 {
-                let reduced_cap = (cfg.max_concurrent * (num_instances - 1)) as f64;
-                if m.load_m15 < a.scale_down_at * reduced_cap {
+                let down_window = *self.scale_down_value.read().unwrap();
+                let load = self.load_for_window(model_name, down_window);
+                // Threshold `D_n = scale_down_at + (n−2) × max_concurrent`:
+                // with `scale_down_at = max_concurrent` the remaining
+                // (n−1) instances stay strictly below 100% utilization.
+                let threshold = (a.scale_down_at + cfg.max_concurrent * (num_instances - 2)) as f64;
+                if load < threshold {
                     // Prefer the least-loaded instance, but skip busy ones
                     // entirely — in-flight requests must never be
                     // interrupted.  remove_instance is atomic with respect
@@ -4759,8 +4804,9 @@ impl InstanceManager {
                         if self.remove_instance(model_name, &handle).await {
                             info!(
                                 model = %model_name,
-                                load_m15 = %m.load_m15,
-                                threshold = %(a.scale_down_at * reduced_cap),
+                                down_window = ?down_window,
+                                load = %load,
+                                threshold = %threshold,
                                 "autoscale: scaled down"
                             );
                             self.last_scale_action
@@ -4967,6 +5013,46 @@ models:
         let gpu_snapshot = Arc::new(tokio::sync::RwLock::new(Vec::new()));
         let (mgr, _release_rx, _crash_rx) = InstanceManager::new(&config, gpu_snapshot, None);
         mgr
+    }
+
+    /// Manager for a model with autoscale enabled under the integral
+    /// semantics: max_concurrent 2, scale_up_at 4, scale_down_at 2,
+    /// max_instances 4 (so scale-up is possible), m1/m1 EMA windows.
+    const AUTOSCALE_CONFIG_YAML: &str = r#"
+server:
+  drain_idle_timeout_secs: 60
+apikeys_file: apikeys.txt
+models:
+  - name: m
+    context_length: 4096
+    cmd: "sleep 3600"
+    idle_ttl: 60
+    max_instances: 4
+    max_concurrent: 2
+    queue_depth: 10
+    autoscale:
+      enabled: true
+      scale_up_at: 4
+      scale_down_at: 2
+      cooldown_secs: 120
+"#;
+
+    fn autoscale_manager() -> InstanceManager {
+        let config: crate::config::Config = serde_yaml_ng::from_str(AUTOSCALE_CONFIG_YAML).unwrap();
+        let gpu_snapshot = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+        let (mgr, _release_rx, _crash_rx) = InstanceManager::new(&config, gpu_snapshot, None);
+        mgr
+    }
+
+    /// Seed the m1 load EMA for model "m" (used to drive autoscale
+    /// decisions deterministically without real-time sleeps).
+    fn seed_load_m1(mgr: &InstanceManager, load_m1: f64) {
+        let mut metrics = mgr.model_metrics.write().unwrap();
+        let m = metrics.entry("m".to_owned()).or_default();
+        m.load_m1 = load_m1;
+        // Decay toward a high baseline so a non-zero dt in later ticks
+        // can never pull the EMA below the seeded value.
+        m.last_active = 10;
     }
 
     type TestQueueReceiver = oneshot::Receiver<Result<(String, SlotGuard), QueueTerminalError>>;
@@ -5369,6 +5455,100 @@ models:
     }
 
     #[tokio::test]
+    async fn should_spawn_gate_tracks_integral_scale_up_threshold() {
+        // The request-path spawn gate must use U_n = scale_up_at +
+        // (n−1) × max_concurrent with the configured EMA window: with one
+        // instance (max_concurrent 2, scale_up_at 4) the boundary is 4,
+        // with two instances it is 6 — a deeper queue is required before
+        // a third instance is worth the VRAM.
+        let mgr = autoscale_manager();
+        let cfg = mgr.model_configs.read().unwrap().get("m").cloned().unwrap();
+        assert!(cfg.autoscale.as_ref().unwrap().enabled);
+        let handle = make_handle(InstanceState::Ready, 2, Duration::ZERO);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle);
+
+        // n=1: threshold = 4 + 2×0 = 4.
+        seed_load_m1(&mgr, 3.5);
+        assert!(
+            !mgr.should_spawn("m", &cfg),
+            "load below U_1 must not spawn"
+        );
+        seed_load_m1(&mgr, 4.5);
+        assert!(mgr.should_spawn("m", &cfg), "load above U_1 must spawn");
+
+        // n=2: threshold = 4 + 2×1 = 6.  A queue that justified the second
+        // instance (load 5) must not yet justify a third.
+        let handle2 = make_handle(InstanceState::Ready, 2, Duration::ZERO);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle2);
+        seed_load_m1(&mgr, 5.5);
+        assert!(
+            !mgr.should_spawn("m", &cfg),
+            "load below U_2 must not spawn"
+        );
+        seed_load_m1(&mgr, 6.5);
+        assert!(mgr.should_spawn("m", &cfg), "load above U_2 must spawn");
+    }
+
+    #[tokio::test]
+    async fn autoscale_scales_up_when_queue_drives_load_above_u_n() {
+        // Tick-driven scale-up: one saturated instance (2 in-flight) with
+        // a queue deep enough that the active EMA exceeds U_1 = 4 must
+        // trigger ensure_spawn — no request path involved.
+        let mgr = Arc::new(autoscale_manager());
+        let handle = make_handle(InstanceState::Ready, 2, Duration::ZERO);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle);
+        seed_load_m1(&mgr, 4.5);
+
+        mgr.evaluate_autoscale().await;
+
+        assert!(
+            mgr.spawns_in_flight.read().unwrap().contains_key("m"),
+            "scale-up must fire when the load EMA exceeds U_1"
+        );
+    }
+
+    #[tokio::test]
+    async fn autoscale_scales_down_when_load_fits_remaining_capacity() {
+        // Two idle instances, load EMA below D_2 = scale_down_at + 0 = 2:
+        // one instance (capacity 2) comfortably carries the load, so the
+        // autoscaler must shed one and free its VRAM.
+        let mgr = Arc::new(autoscale_manager());
+        for _ in 0..2 {
+            let handle = make_handle(InstanceState::Ready, 0, Duration::ZERO);
+            mgr.instances
+                .write()
+                .unwrap()
+                .entry("m".to_owned())
+                .or_default()
+                .push(handle);
+        }
+        seed_load_m1(&mgr, 1.0);
+
+        mgr.evaluate_autoscale().await;
+
+        assert_eq!(
+            instance_count(&mgr),
+            1,
+            "load below D_2 must scale down to a single instance"
+        );
+    }
+
+    #[tokio::test]
     async fn enqueue_refused_when_no_instances_exist() {
         // Spawn failure with zero instances registered must not park the
         // request forever: nothing would ever wake the waiter.
@@ -5672,6 +5852,125 @@ models:
         let guard = mgr.enqueue(test_queue_route(&mgr), 8).await;
         assert!(guard.is_ok(), "waiter must be served by the post-push wake");
         assert_eq!(handle.inner().lock().unwrap().in_flight, 1);
+    }
+
+    #[tokio::test]
+    async fn enqueue_records_metrics_event() {
+        // Regression test: queue entries must be visible to the load EMA
+        // the moment they are parked, otherwise the autoscaler sits on
+        // stale data (up to 30s) and never sees a burst building up.
+        let mgr = Arc::new(test_manager());
+        mgr.register_request("req-metrics", "m");
+        // Instance at capacity: in_flight == max_concurrent == 4.
+        let handle = make_handle(InstanceState::Ready, 4, Duration::ZERO);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle);
+        // Seed metrics as if the last tick was 60s ago with zero load.
+        {
+            let mut metrics = mgr.model_metrics.write().unwrap();
+            metrics.insert(
+                "m".to_owned(),
+                ModelMetrics {
+                    last_update: Instant::now() - Duration::from_secs(60),
+                    last_active: 0,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let admission = mgr
+            .admit(
+                &cands(&["m"]),
+                AliasPolicy::PreferLoaded,
+                MakeRoomMode::None,
+                0,
+                Some("req-metrics"),
+            )
+            .await
+            .unwrap();
+        let pending = match admission {
+            Admission::Waiting(pending) => pending,
+            Admission::Assigned(_, _) => panic!("full instance must queue"),
+        };
+        assert_eq!(mgr.queue_depth("m"), 1);
+
+        // The enqueue must have recorded a metrics event: active =
+        // 4 in-flight + 1 queued.  `last_active` is the snapshot the next
+        // EMA tick decays toward, so it proves the event fired.
+        let m = mgr.model_metrics.read().unwrap().get("m").cloned().unwrap();
+        assert_eq!(
+            m.last_active, 5,
+            "queue entry must be recorded in the metrics snapshot"
+        );
+
+        // And the next tick must move the m1 EMA toward the queued load
+        // (dt ≈ 60s ⇒ alpha ≈ 0.63, so load_m1 jumps to ≈ 3.2).  The
+        // enqueue's own tick already consumed the 60s seed above, so
+        // rewind the clock to simulate the next tick a minute later.
+        {
+            let mut metrics = mgr.model_metrics.write().unwrap();
+            metrics.get_mut("m").unwrap().last_update = Instant::now() - Duration::from_secs(60);
+        }
+        mgr.force_refresh();
+        let m = mgr.model_metrics.read().unwrap().get("m").cloned().unwrap();
+        assert!(
+            m.load_m1 > 2.0,
+            "m1 EMA must reflect queued load (got {})",
+            m.load_m1
+        );
+        drop(pending);
+    }
+
+    #[tokio::test]
+    async fn wake_one_records_metrics_event_on_assignment() {
+        // Regression test: a queue → in-flight transition must update the
+        // load EMA, otherwise the EMA under-reports during a queue drain
+        // (the old value lingers until each response completes).
+        let mgr = test_manager();
+        let handle = make_handle(InstanceState::Ready, 1, Duration::ZERO);
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle.clone());
+        {
+            let mut metrics = mgr.model_metrics.write().unwrap();
+            metrics.insert(
+                "m".to_owned(),
+                ModelMetrics {
+                    last_update: Instant::now() - Duration::from_secs(60),
+                    last_active: 1,
+                    ..Default::default()
+                },
+            );
+        }
+        let (entry, rx) = test_queue_entry(&mgr, 0);
+        mgr.queues
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push_back(entry);
+
+        mgr.wake_one("m");
+
+        let guard = rx
+            .await
+            .expect("waiter must receive an assignment")
+            .expect("assignment must succeed");
+        assert_eq!(handle.inner().lock().unwrap().in_flight, 2);
+        // active transitioned 1 in-flight + 1 queued → 2 in-flight + 0 queued.
+        let m = mgr.model_metrics.read().unwrap().get("m").cloned().unwrap();
+        assert_eq!(
+            m.last_active, 2,
+            "assignment must record the active transition"
+        );
+        drop(guard);
     }
 
     #[tokio::test]

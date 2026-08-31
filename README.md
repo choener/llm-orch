@@ -78,14 +78,19 @@ model to sustained demand. It complements the default lifecycle (spawn on first
 request, unload after idle) and is configured per model:
 
 ```yaml
+server:
+  scale_up_value: m1        # EMA window for scale-up (m1 | m5 | m15)
+  scale_down_value: m1      # EMA window for scale-down (m1 | m5 | m15)
+
 models:
   - name: "qwen3-32b"
     max_instances: 2        # hard cap on parallel instances
-    max_concurrent: 4       # slots per instance - the capacity denominator
+    max_concurrent: 4       # slots per instance (match --parallel in cmd)
+    queue_depth: 20         # how many requests may park while waiting
     autoscale:
       enabled: true
-      scale_up_at: 0.7
-      scale_down_at: 0.4
+      scale_up_at: 7        # spawn when the active-EMA exceeds 7
+      scale_down_at: 4      # despawn when the active-EMA drops below 4
       cooldown_secs: 120
 ```
 
@@ -93,40 +98,58 @@ The `autoscale` block is optional. Omit it (or set `enabled: false`) and the
 model follows the plain lifecycle: spawned on demand, surplus idle instances
 evicted past the global drain timeout, and no proactive scale-up.
 
-**How it works.** The scheduler tracks Unix-style load averages per model -
-exponentially weighted moving averages of *concurrent in-flight requests*
-(`load_m1` / `load_m5` / `load_m15`), updated on every slot acquire/release
-(event-driven, no polling). A background task re-evaluates every model every
-30 seconds:
+**What the EMA measures.** The scheduler tracks Unix-style load averages per
+model - exponentially weighted moving averages of *active requests* =
+`in_flight + queued` (`load_m1` / `load_m5` / `load_m15`), updated on every
+slot acquire, queue entry, queue assignment, and release (event-driven, no
+polling). A request parked in the queue is therefore visible to the
+autoscaler the moment it parks. A background task re-evaluates every model
+every 30 seconds:
 
-- **Scale up (n -> n+1):** when `load_m5 > scale_up_at * max_concurrent * n`
-  (and `n < max_instances` and a GPU with enough free VRAM exists), a new
-  instance is spawned. The same gate applies on the request path: a request
-  that finds no free slot only triggers a spawn when the gate passes, and
-  otherwise queues. Cold start (zero instances) always spawns immediately.
-- **Scale down (n -> n-1):** when `load_m15 < scale_down_at *
-  max_concurrent * (n - 1)`, the least-loaded *idle* instance is despawned.
-  In-flight requests are never interrupted; busy instances are skipped.
+- **Scale up (n -> n+1):** when `EMA(scale_up_value) > scale_up_at +
+  (n-1) * max_concurrent` (and `n < max_instances` and a GPU with enough
+  free VRAM exists), a new instance is spawned. Since `in_flight` is capped
+  at `n * max_concurrent`, this rule can only fire with a non-empty queue:
+  at full saturation it means "spawn when the queue EMA exceeds
+  `scale_up_at - max_concurrent`". The same gate applies on the request
+  path: a request that finds no free slot triggers a spawn when the gate
+  passes, and otherwise parks in the queue. Cold start (zero instances)
+  always spawns immediately.
+- **Scale down (n -> n-1):** when `EMA(scale_down_value) < scale_down_at +
+  (n-2) * max_concurrent`, the least-loaded *idle* instance is despawned.
+  With `scale_down_at = max_concurrent` (the safe setting) this means the
+  remaining instances stay strictly below 100% utilization. In-flight
+  requests are never interrupted; busy instances are skipped.
 - **Unload (n -> 0):** autoscaling never removes the last instance - that
   happens after `server.drain_idle_timeout_secs` without requests (default
   3600 s), the same path used when autoscaling is disabled.
 
-The hysteresis - scale-up on the fast 5-minute EMA and the higher threshold,
-scale-down on the slow 15-minute EMA and the lower threshold - plus the
-per-model `cooldown_secs` are what keep the instance count from flapping on
-bursts.
+The hysteresis - a non-empty band `scale_down_at < scale_up_at`, validated
+at config load - plus the per-model `cooldown_secs` are what keep the
+instance count from flapping on bursts.
+
+**Validation.** `scale_up_at` must be `> max_concurrent` (otherwise a full
+instance with an empty queue would trigger scale-up), `scale_down_at` must
+be `>= max_concurrent` (the remaining instances must not be left saturated),
+and `scale_down_at` must be `< scale_up_at`. Violations are rejected at
+config load. Two combinations that make autoscaling *inert* only produce
+warnings (visible in `--check-config` and at startup): `autoscale.enabled`
+with `max_instances: 1` (scale-up is impossible), and with `queue_depth: 0`
+(requests never park, so the scale-up rule can never fire).
 
 **Parameters to watch.**
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `autoscale.enabled` | - | Master switch for load-based scaling. |
-| `autoscale.scale_up_at` | `0.7` | Spawn when `load_m5` exceeds this fraction of `max_concurrent * instances`. |
-| `autoscale.scale_down_at` | `0.4` | Despawn when `load_m15` drops below this fraction of `max_concurrent * (instances - 1)`. |
+| `autoscale.scale_up_at` | - (required) | Spawn when the active-EMA exceeds `scale_up_at + (n-1) * max_concurrent` - i.e. when the queue EMA exceeds `scale_up_at - max_concurrent`. Must be `> max_concurrent`. |
+| `autoscale.scale_down_at` | - (required) | Despawn when the active-EMA drops below `scale_down_at + (n-2) * max_concurrent`. Must be `>= max_concurrent` and `< scale_up_at`. |
 | `autoscale.cooldown_secs` | `120` | Minimum seconds between any two scale actions for the model. |
+| `server.scale_up_value` | `m1` | EMA window for the scale-up comparison (`m1` · `m5` · `m15`). |
+| `server.scale_down_value` | `m1` | EMA window for the scale-down comparison (`m1` · `m5` · `m15`). |
 | `max_instances` | `1` | Hard cap on scale-up (VRAM permitting). |
-| `max_concurrent` | `4` | Slots per instance - **the denominator of every threshold**. |
-| `queue_depth` | `10` | Where excess requests go while the gate refuses to spawn; 429 when full. |
+| `max_concurrent` | `4` | Slots per instance - the per-instance cap on requests committed to the backend. |
+| `queue_depth` | `10` | How many requests may park with heartbeats while waiting; 429 when full. |
 | `server.queue_wait_timeout_secs` | `3600` | Maximum accepted scheduler wait in seconds; `0` means no scheduler deadline. |
 | `server.queue_heartbeat_secs` | `10` | Pre-assignment SSE comment cadence; must be greater than zero. |
 | `server.migration_timeout_secs` | `0` | Migration transition deadline; `0` means no transition deadline. |

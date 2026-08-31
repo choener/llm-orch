@@ -437,7 +437,61 @@ impl Config {
             }
         }
 
+        // --- autoscale ---
+        // Thresholds are explicit integral counts of active requests
+        // (in_flight + queued).  The first two checks keep the rules
+        // semantically sound (see AutoscaleConfig docs); the third keeps
+        // the hysteresis band non-empty so the up and down rules can
+        // never both be satisfiable at the same load.
+        for m in &self.models {
+            if let Some(ref a) = m.autoscale {
+                if a.scale_up_at <= m.max_concurrent {
+                    return Err(ConfigError::Validation(format!(
+                        "model '{}': autoscale.scale_up_at ({}) must be > max_concurrent ({}) — otherwise a full instance with an empty queue would trigger scale-up",
+                        m.name, a.scale_up_at, m.max_concurrent
+                    )));
+                }
+                if a.scale_down_at < m.max_concurrent {
+                    return Err(ConfigError::Validation(format!(
+                        "model '{}': autoscale.scale_down_at ({}) must be >= max_concurrent ({}) — scale-down could leave the remaining instance(s) saturated",
+                        m.name, a.scale_down_at, m.max_concurrent
+                    )));
+                }
+                if a.scale_down_at >= a.scale_up_at {
+                    return Err(ConfigError::Validation(format!(
+                        "model '{}': autoscale.scale_down_at ({}) must be < scale_up_at ({}) — the hysteresis band must be non-empty",
+                        m.name, a.scale_down_at, a.scale_up_at
+                    )));
+                }
+            }
+        }
+
         Ok(())
+    }
+
+    /// Non-fatal configuration concerns: the config is valid and loadable,
+    /// but these combinations behave unexpectedly.  Surfaced in
+    /// `--check-config` output and at startup.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        for m in &self.models {
+            if !m.autoscale.as_ref().is_some_and(|a| a.enabled) {
+                continue;
+            }
+            if m.max_instances <= 1 {
+                warnings.push(format!(
+                    "model '{}': autoscale is enabled but max_instances is {} — scale-up can never happen (raise max_instances or disable autoscale)",
+                    m.name, m.max_instances
+                ));
+            }
+            if m.queue_depth == 0 {
+                warnings.push(format!(
+                    "model '{}': autoscale is enabled but queue_depth is 0 — requests never park, so the scale-up rule (active > scale_up_at) can never fire",
+                    m.name
+                ));
+            }
+        }
+        warnings
     }
 }
 
@@ -504,6 +558,15 @@ pub struct ServerConfig {
     #[serde(default = "default_queue_heartbeat")]
     pub queue_heartbeat_secs: u64,
 
+    /// EMA window used for autoscale scale-up decisions (all models).
+    /// `m1` reacts to bursts within a minute; `m5`/`m15` smooth them out.
+    #[serde(default = "default_scale_up_value")]
+    pub scale_up_value: EmaWindow,
+
+    /// EMA window used for autoscale scale-down decisions (all models).
+    #[serde(default = "default_scale_down_value")]
+    pub scale_down_value: EmaWindow,
+
     /// Maximum duration of a migration transition.  `0` means no transition
     /// deadline; active requests are never terminated by this setting.
     #[serde(default)]
@@ -534,6 +597,12 @@ fn default_queue_wait_timeout() -> u64 {
 }
 fn default_queue_heartbeat() -> u64 {
     10
+}
+fn default_scale_up_value() -> EmaWindow {
+    EmaWindow::M1
+}
+fn default_scale_down_value() -> EmaWindow {
+    EmaWindow::M1
 }
 
 /// Port allocation strategy for backend instances.
@@ -912,40 +981,57 @@ fn default_queue_depth() -> usize {
 
 // ── Autoscale configuration ──────────────────────────────────────────────────
 
+/// EMA window used for a scale decision.  `load_m1/m5/m15` are all
+/// computed unconditionally by the metrics ticker; this only picks which
+/// one the scale-up / scale-down comparison reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EmaWindow {
+    M1,
+    M5,
+    M15,
+}
+
 /// Load-based autoscaling for a model.
 ///
 /// When enabled, instance spawn/despawn decisions use hysteresis on the
-/// per-model load EMA metrics (`load_m5` for scale-up, `load_m15` for
-/// scale-down) instead of purely instantaneous saturation + fixed idle TTL.
+/// per-model load EMA metrics — the EMA of `active = in_flight + queued`
+/// requests — instead of purely instantaneous saturation + fixed idle TTL.
+///
+/// Thresholds are **explicit integral counts** of active requests, not
+/// fractions:
+///
+/// - Scale up when `EMA(scale_up_value) > scale_up_at + (n−1) × max_concurrent`
+///   (n = current instance count).  Since `in_flight ≤ n × max_concurrent`,
+///   the validation `scale_up_at > max_concurrent` guarantees the rule can
+///   only fire with a non-empty queue: at full saturation it means "spawn
+///   when the queue EMA exceeds `scale_up_at − max_concurrent`".
+/// - Scale down when `EMA(scale_down_value) < scale_down_at + (n−2) × max_concurrent`
+///   (n ≥ 2).  With `scale_down_at = max_concurrent` (the safe setting)
+///   this means "drop only when the remaining instances stay strictly
+///   below 100% utilization".
 #[derive(Debug, Clone, Deserialize)]
 pub struct AutoscaleConfig {
     /// Enable load-based autoscaling for this model.
     pub enabled: bool,
 
-    /// Fraction of `max_concurrent × current_instances` above which a new
-    /// instance is spawned.  Uses `load_m5` (5-minute EMA).
-    /// Example: 0.7 means spawn when sustained load exceeds 70% of capacity.
-    #[serde(default = "default_autoscale_up")]
-    pub scale_up_at: f64,
+    /// Absolute count of active requests (`in_flight + queued`) above
+    /// which another instance is spawned (EMA window: server-level
+    /// `scale_up_value`).  Must be `> max_concurrent` — otherwise the
+    /// rule could fire on a full instance with an empty queue.
+    pub scale_up_at: usize,
 
-    /// Fraction of `max_concurrent × (current_instances − 1)` below which
-    /// an instance is despawned.  Uses `load_m15` (15-minute EMA).
-    /// Example: 0.4 means despawn when the reduced instance count could
-    /// handle the load at under 40% of their capacity.
-    #[serde(default = "default_autoscale_down")]
-    pub scale_down_at: f64,
+    /// Absolute count of active requests below which an instance is
+    /// despawned (EMA window: server-level `scale_down_value`).  Must be
+    /// `>= max_concurrent` and `< scale_up_at` (non-empty hysteresis
+    /// band).
+    pub scale_down_at: usize,
 
     /// Minimum seconds between any scale action (up or down).
     #[serde(default = "default_autoscale_cooldown")]
     pub cooldown_secs: u64,
 }
 
-fn default_autoscale_up() -> f64 {
-    0.7
-}
-fn default_autoscale_down() -> f64 {
-    0.4
-}
 fn default_autoscale_cooldown() -> u64 {
     120
 }
@@ -1222,6 +1308,101 @@ models:
             "cmd: \"sleep 3600\"\n    max_concurrent: 0",
         );
         expect_validation_error(&yaml, "max_concurrent must be > 0");
+    }
+
+    // ── Autoscale integral semantics ────────────────────────────────────
+
+    /// BASE + a model whose autoscale block is valid under the integral
+    /// rules (max_concurrent 2, scale_up_at 4 > 2, scale_down_at 2 >= 2).
+    fn autoscale_yaml(extra: &str) -> String {
+        BASE.replace(
+            "cmd: \"sleep 3600\"",
+            &format!(
+                "cmd: \"sleep 3600\"\n    max_concurrent: 2\n    queue_depth: 10\n    autoscale:\n      enabled: true\n      scale_up_at: 4\n      scale_down_at: 2\n{}",
+                extra
+            ),
+        )
+    }
+
+    #[test]
+    fn autoscale_integral_thresholds_and_ema_window_defaults() {
+        let cfg = parse(&autoscale_yaml("")).unwrap();
+        let a = cfg.models[0].autoscale.as_ref().unwrap();
+        assert_eq!(a.scale_up_at, 4);
+        assert_eq!(a.scale_down_at, 2);
+        // Server-global EMA windows default to m1/m1.
+        assert_eq!(cfg.server.scale_up_value, EmaWindow::M1);
+        assert_eq!(cfg.server.scale_down_value, EmaWindow::M1);
+    }
+
+    #[test]
+    fn autoscale_ema_windows_parse() {
+        let yaml = autoscale_yaml("").replace(
+            "server: {}",
+            "server:\n  scale_up_value: m5\n  scale_down_value: m15",
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.server.scale_up_value, EmaWindow::M5);
+        assert_eq!(cfg.server.scale_down_value, EmaWindow::M15);
+    }
+
+    #[test]
+    fn rejects_unknown_ema_window() {
+        let yaml = BASE.replace("server: {}", "server:\n  scale_up_value: m2");
+        let err = serde_yaml_ng::from_str::<Config>(&yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("m2"),
+            "unknown EMA window must be rejected at parse time: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_scale_up_at_not_above_max_concurrent() {
+        let yaml = autoscale_yaml("").replace("scale_up_at: 4", "scale_up_at: 2");
+        expect_validation_error(&yaml, "scale_up_at (2) must be > max_concurrent (2)");
+    }
+
+    #[test]
+    fn rejects_scale_down_at_below_max_concurrent() {
+        let yaml = autoscale_yaml("").replace("scale_down_at: 2", "scale_down_at: 1");
+        expect_validation_error(&yaml, "scale_down_at (1) must be >= max_concurrent (2)");
+    }
+
+    #[test]
+    fn rejects_overlapping_hysteresis_band() {
+        let yaml = autoscale_yaml("").replace("scale_down_at: 2", "scale_down_at: 4");
+        expect_validation_error(&yaml, "must be < scale_up_at");
+    }
+
+    #[test]
+    fn warnings_for_inert_autoscale_combinations() {
+        // max_instances defaults to 1 → scale-up physically impossible.
+        let cfg = parse(&autoscale_yaml("")).unwrap();
+        let warnings = cfg.warnings();
+        assert_eq!(warnings.len(), 1, "max_instances=1 warning: {warnings:?}");
+        assert!(warnings[0].contains("max_instances is 1"));
+
+        // queue_depth 0 → queue never fills, scale-up rule can never fire.
+        let yaml = autoscale_yaml("").replace("queue_depth: 10", "queue_depth: 0");
+        let cfg = parse(&yaml).unwrap();
+        let warnings = cfg.warnings();
+        assert_eq!(warnings.len(), 2, "both warnings: {warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("queue_depth is 0")));
+
+        // Disabled autoscale → no warnings.
+        let yaml = autoscale_yaml("").replace("enabled: true", "enabled: false");
+        let cfg = parse(&yaml).unwrap();
+        assert!(cfg.warnings().is_empty());
+    }
+
+    #[test]
+    fn autoscale_thresholds_validated_even_when_disabled() {
+        // Threshold invariants hold regardless of `enabled`: hot-reload
+        // toggling the flag must never produce an invalid-but-loadable
+        // config.
+        let yaml = autoscale_yaml("").replace("enabled: true", "enabled: false");
+        let cfg = parse(&yaml).unwrap();
+        assert!(!cfg.models[0].autoscale.as_ref().unwrap().enabled);
     }
 
     #[test]
