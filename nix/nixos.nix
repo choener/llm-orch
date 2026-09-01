@@ -10,7 +10,7 @@ let
 in
 {
   options.services.llm-orch = {
-    enable = lib.mkEnableOption "llm-orch — single-host LLM orchestrator for llama.cpp backends";
+    enable = lib.mkEnableOption "llm-orch — single-host LLM/prompt orchestrator for llama.cpp and stable-diffusion.cpp backends";
 
     package = lib.mkOption {
       type = lib.types.package;
@@ -71,6 +71,19 @@ in
       '';
     };
 
+    stableDiffusionCppPackage = lib.mkOption {
+      type = lib.types.nullOr lib.types.package;
+      default = null;
+      defaultText = lib.literalExpression "pkgs.stable-diffusion-cpp";
+      example = lib.literalExpression "pkgs.stable-diffusion-cpp";
+      description = ''
+        stable-diffusion.cpp package providing `sd-server`, added to the
+        service's PATH so diffusion model `cmd` definitions can invoke it
+        by name. Set to `null` (the default) if you don't use diffusion
+        models.
+      '';
+    };
+
     nvidiaPackage = lib.mkOption {
       type = lib.types.nullOr lib.types.package;
       default =
@@ -125,6 +138,8 @@ in
       path =
         [ pkgs.runtimeShellPackage pkgs.coreutils ]
         ++ lib.optional (cfg.llamaPackage != null) cfg.llamaPackage
+        # stable-diffusion.cpp (sd-server) for diffusion model backends.
+        ++ lib.optional (cfg.stableDiffusionCppPackage != null) cfg.stableDiffusionCppPackage
         # nvidia-smi (live VRAM metrics on CUDA hosts): the driver bin
         # output is only on PATH when NVIDIA was detected on the host.
         ++ lib.optional (cfg.nvidiaPackage != null) cfg.nvidiaPackage
