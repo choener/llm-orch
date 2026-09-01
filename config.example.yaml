@@ -456,21 +456,44 @@ models:
   #       --w 1024
   #       --h 1024
   #
-  # --- Example 7: a video diffusion model (Wan2.1) --------------------------
-  # Video models use the same sd-server binary with different weight files.
-  # The `/v1/video/generations` endpoint polls sd-server's async job API
-  # internally and returns the completed container.
-  # - name: "wan2.1-t2v-1.3b"
+  # --- Example 7: MiniMax-H3 video generation ------------------------------
+  # MiniMax-H3 jointly generates video and stereo audio.  The model needs
+  # four component files: the diffusion transformer, video VAE, audio VAE,
+  # and the Qwen3-VL-32B text encoder (truncated to 50 language layers).
+  #
+  # With 2× AMD R9700 32 GB this fits on one GPU at FP8 DiT + NVFP4 AWQ
+  # text encoder (~25 GB total).  The `vram` value covers all four components.
+  #
+  # sd-server does not use llama.cpp's `--device` selector, only the
+  # visibility env var (GGML_VK_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES).
+  # The existing `vulkan_devices` / `rocm_devices` pools work unchanged.
+  #
+  # Use `/v1/video/generations` (JSON) to generate or `/sdcpp/v1/vid_gen`
+  # (passthrough, 202 + job id) for native async control.
+  #
+  # See also: scripts/generate-video.sh for a CLI wrapper.
+  # - name: "minimax-h3"
   #   context_length: 0
   #   max_instances: 1
-  #   max_concurrent: 1
-  #   vram: 12000
-  #   idle_ttl: 900              # keep video models loaded longer
+  #   max_concurrent: 1           # sd-server serialises requests internally
+  #   vram: 28000                 # DiT (~14 GB) + text encoder (~10 GB)
+  #                               # + VAEs (~3 GB) + working memory
+  #   idle_ttl: 900               # keep loaded between prompts
   #   queue_depth: 3
-  #   vulkan_devices: [0]
+  #   vulkan_devices: [0]         # or rocm_devices; both GPUs available
   #   cmd: |
-  #     {sd}
-  #       --diffusion-model /models/Wan2.1-T2V-1.3B-fp16.safetensors
+  #     sd-server
+  #       --host 127.0.0.1
+  #       --port {port}
+  #       --diffusion-model /data/llama/stable-diffusion/MiniMax-H3/minimax_h3_fl2va_pruned_fp8_scaled.safetensors
+  #       --vae /data/llama/stable-diffusion/MiniMax-H3/minimax_h3_video_vae_fp16.safetensors
+  #       --audio-vae /data/llama/stable-diffusion/MiniMax-H3/minimax_h3_audio_vae_fp32.safetensors
+  #       --llm /data/llama/stable-diffusion/Qwen3-VL-32B/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
+  #       --backend vulkan
+  #       --diffusion-fa           # flash attention
+  #       --cfg-scale 1.0
+  #       --rng cpu
+  #       --fps 24
 
 # ---------------------------------------------------------------------------
 # Aliases
