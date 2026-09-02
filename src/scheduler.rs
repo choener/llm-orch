@@ -972,9 +972,6 @@ pub struct InstanceManager {
     /// Shared HTTP client for health checks and request forwarding.
     client: Client,
 
-    /// Backend type (currently always llama.cpp).
-    backend: LlamaCppBackend,
-
     /// Port allocator.
     ports: Mutex<PortAllocator>,
 
@@ -1180,7 +1177,6 @@ impl InstanceManager {
 
         let mgr = Self {
             client: http_client::build(),
-            backend: LlamaCppBackend::default(),
             ports: Mutex::new(PortAllocator::new(config.server.port_range.clone())),
             model_configs: RwLock::new(model_configs),
             cmd_aliases: RwLock::new(config.cmd_aliases.clone()),
@@ -3304,16 +3300,17 @@ impl InstanceManager {
         // Phase 1 (serialized): process start + initial load — fast
         // backends become ready here, dead-on-arrival ones are detected
         // here too.
+        let model_timeout = Duration::from_secs(cfg.spawn_timeout_secs.unwrap_or(120));
         let phase1 =
-            poll_readiness(&handle, &self.client, &self.backend, SPAWN_SERIAL_WINDOW).await;
+            poll_readiness(&handle, &self.client, &*model_backend, SPAWN_SERIAL_WINDOW).await;
         // Release the global spawn lock before the long tail so a slow
         // model can't head-of-line block spawns of every other model.
         drop(_permit);
         // Phase 2 (unserialized): wait out the remaining timeout.
         let outcome = match phase1 {
             ReadyOutcome::TimedOut => {
-                let remaining = self.spawn_timeout.saturating_sub(SPAWN_SERIAL_WINDOW);
-                poll_readiness(&handle, &self.client, &self.backend, remaining).await
+                let remaining = model_timeout.saturating_sub(SPAWN_SERIAL_WINDOW);
+                poll_readiness(&handle, &self.client, &*model_backend, remaining).await
             }
             other => other,
         };

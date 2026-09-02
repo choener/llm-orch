@@ -880,6 +880,13 @@ pub struct ModelConfig {
     /// load EMA metrics instead of purely instantaneous saturation.
     #[serde(default)]
     pub autoscale: Option<AutoscaleConfig>,
+
+    /// Per-model spawn readiness timeout in seconds.
+    /// Overrides the global default (120 s) for models that take longer
+    /// to load, e.g. large diffusion / video models with 50+ GB weights.
+    /// Must be at least 15 s (the serialized first-poll window).
+    #[serde(default)]
+    pub spawn_timeout_secs: Option<u64>,
 }
 
 impl ModelConfig {

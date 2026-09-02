@@ -358,8 +358,10 @@ impl Backend for StableDiffusionCppBackend {
         vec![(var.into(), list)]
     }
 
+    /// sd-server has no `/health` endpoint — use `GET /` which returns 200
+    /// once the server is ready.
     fn health_url(&self, port: u16) -> String {
-        format!("http://127.0.0.1:{port}/health")
+        format!("http://127.0.0.1:{port}/")
     }
 }
 
