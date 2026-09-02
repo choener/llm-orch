@@ -7,6 +7,8 @@
 # Options:
 #   -p PROMPT          Prompt text (inline; overrides -f).
 #   -f PROMPT_FILE     Read prompt from file (use "-" for stdin).
+#   -i IMAGE           Optional init image (first frame). Base64-encoded and
+#                      sent as init_image for image-to-video generation.
 #   -m MODEL           Model name (default: minimax-h3).
 #   -W WIDTH           Video width  (default: 864).
 #   -H HEIGHT          Video height (default: 480).
@@ -24,8 +26,9 @@
 # Examples:
 #   export APIKEY_LLM_ORCH=sk-...
 #   scripts/generate-video.sh -p "A cat surfing on a tropical wave"
-#   echo "A cat surfing" | scripts/generate-video.sh -p -
+#   echo "A cat surfing" | scripts/generate-video.sh -f -
 #   scripts/generate-video.sh -p "A cat surfing" -o /tmp/vids -W 1280 -H 720 --video-frames 65
+#   scripts/generate-video.sh -p "An agentic city at dusk" -i ./agentic-city.png
 set -euo pipefail
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -41,6 +44,7 @@ SEED=-1
 CFG_SCALE=1.0
 OUTDIR="./videos"
 QUIET=false
+INIT_IMAGE=""
 
 # ── Parse arguments ──────────────────────────────────────────────────────────
 PROMPT=""
@@ -58,6 +62,7 @@ while [ $# -gt 0 ]; do
         --seed) shift; SEED="$1" ;;
         --cfg-scale) shift; CFG_SCALE="$1" ;;
         -o) shift; OUTDIR="$1" ;;
+        -i) shift; INIT_IMAGE="$1" ;;
         -q) QUIET=true ;;
         -h|--help)
             sed -n '/^# Usage:/,/^set -euo pipefail/p' "$0" \
@@ -88,31 +93,77 @@ mkdir -p "$OUTDIR"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 OUTFILE="${OUTDIR}/llm-orch-video-${TIMESTAMP}.webm"
 
+# ── Resolve init image ──────────────────────────────────────────────────────
+INIT_IMAGE_B64=""
+if [ -n "$INIT_IMAGE" ]; then
+    if [ ! -f "$INIT_IMAGE" ]; then
+        echo "error: init image not found: ${INIT_IMAGE}" >&2
+        exit 1
+    fi
+    INIT_IMAGE_B64=$(base64 -w0 "$INIT_IMAGE")
+    if [ -z "$INIT_IMAGE_B64" ]; then
+        echo "error: failed to encode init image" >&2
+        exit 1
+    fi
+    if ! $QUIET; then
+        echo "  init image: ${INIT_IMAGE} ($(wc -c < "$INIT_IMAGE") bytes)" >&2
+    fi
+fi
+
 # ── Build JSON payload ───────────────────────────────────────────────────────
-PAYLOAD=$(jq -nc \
-    --arg model "$MODEL" \
-    --arg prompt "$PROMPT" \
-    --argjson width "$WIDTH" \
-    --argjson height "$HEIGHT" \
-    --argjson video_frames "$VIDEO_FRAMES" \
-    --argjson fps "$FPS" \
-    --argjson seed "$SEED" \
-    --argjson cfg_scale "$CFG_SCALE" \
-    '{
-        model: $model,
-        prompt: $prompt,
-        width: $width,
-        height: $height,
-        video_frames: $video_frames,
-        fps: $fps,
-        seed: $seed,
-        output_format: "webm",
-        sample_params: {
-            guidance: {
-                txt_cfg: $cfg_scale
+if [ -n "$INIT_IMAGE_B64" ]; then
+    PAYLOAD=$(jq -nc \
+        --arg model "$MODEL" \
+        --arg prompt "$PROMPT" \
+        --arg init_image "$INIT_IMAGE_B64" \
+        --argjson width "$WIDTH" \
+        --argjson height "$HEIGHT" \
+        --argjson video_frames "$VIDEO_FRAMES" \
+        --argjson fps "$FPS" \
+        --argjson seed "$SEED" \
+        --argjson cfg_scale "$CFG_SCALE" \
+        '{
+            model: $model,
+            prompt: $prompt,
+            init_image: $init_image,
+            width: $width,
+            height: $height,
+            video_frames: $video_frames,
+            fps: $fps,
+            seed: $seed,
+            output_format: "webm",
+            sample_params: {
+                guidance: {
+                    txt_cfg: $cfg_scale
+                }
             }
-        }
-    }')
+        }')
+else
+    PAYLOAD=$(jq -nc \
+        --arg model "$MODEL" \
+        --arg prompt "$PROMPT" \
+        --argjson width "$WIDTH" \
+        --argjson height "$HEIGHT" \
+        --argjson video_frames "$VIDEO_FRAMES" \
+        --argjson fps "$FPS" \
+        --argjson seed "$SEED" \
+        --argjson cfg_scale "$CFG_SCALE" \
+        '{
+            model: $model,
+            prompt: $prompt,
+            width: $width,
+            height: $height,
+            video_frames: $video_frames,
+            fps: $fps,
+            seed: $seed,
+            output_format: "webm",
+            sample_params: {
+                guidance: {
+                    txt_cfg: $cfg_scale
+                }
+            }
+        }')
+fi
 
 # ── Submit ───────────────────────────────────────────────────────────────────
 if ! $QUIET; then
