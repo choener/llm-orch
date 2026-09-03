@@ -4,10 +4,11 @@
 // spawning, slot acquisition, queueing, idle eviction, and shutdown.
 
 use crate::backend::{
-    Backend, DeviceKind, LlamaCppBackend, StableDiffusionCppBackend, ReadyOutcome,
-    output_lines, poll_readiness, shutdown_child, spawn_process,
+    Backend, ContainerBackend, DeviceKind, LlamaCppBackend, StableDiffusionCppBackend,
+    ReadyOutcome, inject_container_args, output_lines, poll_readiness, shutdown_child,
+    shutdown_container, spawn_process,
 };
-use crate::config::{AliasPolicy, DevicePool, EmaWindow, MakeRoomMode, ModelConfig};
+use crate::config::{AliasPolicy, DevicePool, EmaWindow, MakeRoomMode, ModelConfig, Runner};
 use crate::gpu::GpuMetrics;
 use crate::http_client;
 use crate::instance::{Instance, InstanceHandle, InstanceLoadPurpose, InstanceState, SlotGuard};
@@ -3187,24 +3188,40 @@ impl InstanceManager {
 
         // Select the backend implementation based on the program basename.
         // sd.cpp models use `StableDiffusionCppBackend` (no --device flag,
-        // only the visibility env var); everything else uses the standard
-        // llama.cpp backend with its --device selector.
+        // only the visibility env var); containers use `ContainerBackend`
+        // (GPU passthrough via --device flags, no env-var / selector
+        // injection); everything else uses the standard llama.cpp backend.
         let prog_basename = prog.rsplit('/').next().unwrap_or(prog);
-        let model_backend: Box<dyn Backend> = if prog_basename.starts_with("sd-server") {
+        let is_container = cfg.runner(&self.cmd_aliases.read().unwrap()) == Runner::Container;
+        let model_backend: Box<dyn Backend> = if is_container {
+            Box::new(ContainerBackend)
+        } else if prog_basename.starts_with("sd-server") {
             Box::new(StableDiffusionCppBackend::new(cfg.device_kind()))
         } else {
             Box::new(LlamaCppBackend::new(cfg.device_kind()))
         };
         let mut args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
-        args.extend(model_backend.gpu_args(&gpu_indices));
-        // CPU-only spawn: enforce no GPU offload for llama.cpp models.
-        // No-op for non-llama programs (basename check inside).
-        if gpu_indices.is_empty() {
-            LlamaCppBackend::enforce_cpu_offload(prog, &mut args);
+        let mut container_name: Option<String> = None;
+        if is_container {
+            // Container: inject --name <unique> and --rm after "podman run".
+            // GPU arg/env injection is skipped — the container manages its
+            // own device selection via --device /dev/dri etc.
+            let cname = format!("llm-orch-{model_name}-{port}");
+            inject_container_args(&mut args, &cname);
+            container_name = Some(cname);
+        } else {
+            args.extend(model_backend.gpu_args(&gpu_indices));
+            // CPU-only spawn: enforce no GPU offload for llama.cpp models.
+            // No-op for non-llama programs (basename check inside).
+            if gpu_indices.is_empty() {
+                LlamaCppBackend::enforce_cpu_offload(prog, &mut args);
+            }
+            // Speculative decoding: pin the draft model to the same device(s)
+            // the instance is placed on.  No-op for non-llama programs.
+            LlamaCppBackend::inject_spec_draft_device(
+                prog, &mut args, cfg.device_kind(), &gpu_indices,
+            );
         }
-        // Speculative decoding: pin the draft model to the same device(s)
-        // the instance is placed on.  No-op for non-llama programs.
-        LlamaCppBackend::inject_spec_draft_device(prog, &mut args, cfg.device_kind(), &gpu_indices);
         let envs = model_backend.gpu_env(&gpu_indices);
 
         // Spawn.
@@ -3239,6 +3256,7 @@ impl InstanceManager {
             self.instance_seq.fetch_add(1, Ordering::Relaxed)
         );
         inst.child = Some(child);
+        inst.container_name = container_name;
         inst.output = Some(output);
         let handle = InstanceHandle::new(inst);
 
@@ -3320,11 +3338,14 @@ impl InstanceManager {
             let child_exited = outcome == ReadyOutcome::ChildExited;
             warn!(model = %model_name, port = port, exited = child_exited, "instance did not become ready — shutting down");
             self.dump_recent_output(&handle);
-            let mut child_to_kill = {
+            let (mut child_to_kill, cname) = {
                 let mut inst_lock = handle.inner().lock().unwrap();
                 inst_lock.mark_failed();
-                inst_lock.child.take()
+                (inst_lock.child.take(), inst_lock.container_name.clone())
             };
+            if let Some(ref cname) = cname {
+                shutdown_container(cname, Duration::from_secs(5)).await;
+            }
             if let Some(ref mut child) = child_to_kill {
                 shutdown_child(child, Duration::from_secs(5)).await;
             }
@@ -3355,11 +3376,14 @@ impl InstanceManager {
                 port = port,
                 "config changed during spawn — discarding fresh instance"
             );
-            let mut child = {
+            let (mut child, cname) = {
                 let mut inst = handle.inner().lock().unwrap();
                 inst.mark_failed();
-                inst.child.take()
+                (inst.child.take(), inst.container_name.clone())
             };
+            if let Some(ref cname) = cname {
+                shutdown_container(cname, Duration::from_secs(5)).await;
+            }
             if let Some(ref mut c) = child {
                 shutdown_child(c, Duration::from_secs(5)).await;
             }
@@ -3908,9 +3932,9 @@ impl InstanceManager {
         handle: &InstanceHandle,
         mode: RemovalMode,
     ) -> bool {
-        let gpu_indices: Vec<usize> = {
+        let (gpu_indices, cname) = {
             let inst = handle.inner().lock().unwrap();
-            inst.gpu_indices.clone()
+            (inst.gpu_indices.clone(), inst.container_name.clone())
         };
 
         let mut child = {
@@ -3938,6 +3962,12 @@ impl InstanceManager {
             inst.mark_failed();
             inst.child.take()
         };
+        // Container shutdown: stop the container first, then reap the
+        // podman client process.  For native subprocesses, SIGTERM
+        // on the child PID is sufficient.
+        if let Some(ref cname) = cname {
+            shutdown_container(cname, Duration::from_secs(5)).await;
+        }
         if let Some(ref mut c) = child {
             shutdown_child(c, Duration::from_secs(5)).await;
         }
@@ -4070,7 +4100,7 @@ impl InstanceManager {
     /// not count — the model has proven functional and is respawned on
     /// demand (plan §Backends).
     pub async fn handle_crash(&self, handle: InstanceHandle) {
-        let (model_name, was_ready, gpu_indices, migration_id) = {
+        let (model_name, was_ready, gpu_indices, migration_id, cname) = {
             let mut inst = handle.inner().lock().unwrap();
             if matches!(inst.state, InstanceState::Failed | InstanceState::Retired) {
                 // Already handled by a managed removal path (admin unload,
@@ -4079,6 +4109,7 @@ impl InstanceManager {
             }
             let was_ready = matches!(inst.state, InstanceState::Ready | InstanceState::Draining);
             let migration_id = inst.migration_id;
+            let cname = inst.container_name.clone();
             inst.mark_failed();
             // The monitor already reaped the process via try_wait.
             let _ = inst.child.take();
@@ -4087,6 +4118,7 @@ impl InstanceManager {
                 was_ready,
                 inst.gpu_indices.clone(),
                 migration_id,
+                cname,
             )
         };
         let (id, port) = {
@@ -4101,6 +4133,12 @@ impl InstanceManager {
             "backend instance exited unexpectedly"
         );
         self.dump_recent_output(&handle);
+
+        // Ensure the container is stopped even if the podman client
+        // exited (container may still be running).
+        if let Some(ref cname) = cname {
+            shutdown_container(cname, Duration::from_secs(5)).await;
+        }
 
         self.unregister_instance(&model_name, &handle, &gpu_indices)
             .await;
@@ -4618,6 +4656,11 @@ impl InstanceManager {
             // instances can't hold slots, so `last_active` ≈ registration
             // time; a legitimately loading instance never exceeds
             // `spawn_timeout` plus the serialized window by a wide margin.
+            // Use the same per-model override as the spawn path so slow
+            // loaders (e.g. vLLM with CUDA graph capture, minutes) are not
+            // reaped mid-load by the smaller global default.
+            let model_spawn_timeout =
+                Duration::from_secs(cfg.spawn_timeout_secs.unwrap_or(120));
             let stranded: Vec<InstanceHandle> = {
                 let instances = self.instances.read().unwrap();
                 instances
@@ -4628,7 +4671,7 @@ impl InstanceManager {
                                 let inst = h.inner().lock().unwrap();
                                 inst.state == InstanceState::Loading
                                     && inst.migration_id.is_none()
-                                    && inst.last_active.elapsed() > self.spawn_timeout * 2
+                                    && inst.last_active.elapsed() > model_spawn_timeout * 2
                             })
                             .cloned()
                             .collect()
@@ -7824,6 +7867,47 @@ models:
             instance_count(&mgr),
             0,
             "instance stranded in Loading must be reaped"
+        );
+    }
+
+    #[tokio::test]
+    async fn autoscale_does_not_reap_loading_within_per_model_spawn_timeout() {
+        // A model with a large `spawn_timeout_secs` (e.g. vLLM doing CUDA
+        // graph capture over several minutes) must not be reaped by the
+        // stranded-in-Loading safety net while it is still within its own
+        // spawn window — the reaper must use the per-model timeout, not the
+        // smaller global default.
+        let yaml = r#"
+server:
+  drain_idle_timeout_secs: 60
+apikeys_file: apikeys.txt
+models:
+  - name: m
+    context_length: 4096
+    cmd: "sleep 3600"
+    idle_ttl: 60
+    spawn_timeout_secs: 600
+"#;
+        let config: crate::config::Config = serde_yaml_ng::from_str(yaml).unwrap();
+        let gpu_snapshot = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+        let (mgr, _release_rx, _crash_rx) = InstanceManager::new(&config, gpu_snapshot, None);
+        let mgr = Arc::new(mgr);
+        // Loading for 240 s: beyond the global default (120*2=240 boundary
+        // would reap it) but well within 600*2 for this model.
+        let handle = make_handle(InstanceState::Loading, 0, Duration::from_secs(240));
+        mgr.instances
+            .write()
+            .unwrap()
+            .entry("m".to_owned())
+            .or_default()
+            .push(handle);
+
+        mgr.evaluate_autoscale().await;
+
+        assert_eq!(
+            instance_count(&mgr),
+            1,
+            "instance within its per-model spawn timeout must not be reaped"
         );
     }
 

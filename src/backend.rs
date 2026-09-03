@@ -365,6 +365,39 @@ impl Backend for StableDiffusionCppBackend {
     }
 }
 
+// ── Container backend (podman) ─────────────────────────────────────────────
+
+/// Backend for models running inside a container.
+///
+/// Container backends manage their own GPU selection through `--device`
+/// flags in the podman command (e.g. `--device /dev/dri --device /dev/kfd`)
+/// — no visibility env vars or device-selector flags are injected.  The
+/// health check uses the default `GET /health` endpoint (vLLM, TGI, and
+/// most inference servers serve this).
+///
+/// Container lifecycle uses `podman stop` for graceful shutdown rather
+/// than POSIX signals on the podman client process (which would orphan
+/// the container if the client exits first).
+pub struct ContainerBackend;
+
+impl Backend for ContainerBackend {
+    fn gpu_args(&self, _indices: &[usize]) -> Vec<String> {
+        // Container manages GPU access via `--device /dev/dri` etc. in
+        // the podman command — no CLI selector is injected.
+        Vec::new()
+    }
+
+    fn gpu_env(&self, _indices: &[usize]) -> Vec<(String, String)> {
+        // Container discovers GPUs through the mounted device nodes;
+        // visibility env vars would have no effect.
+        Vec::new()
+    }
+
+    fn health_url(&self, port: u16) -> String {
+        format!("http://127.0.0.1:{port}/health")
+    }
+}
+
 // ── CPU-offload enforcement (llama.cpp command lines) ──────────────────────
 
 /// The outcome of scanning a resolved llama.cpp command line (program
@@ -605,6 +638,72 @@ pub async fn shutdown_child(child: &mut tokio::process::Child, drain_timeout: Du
         }
     }
 }
+
+/// Gracefully shut down a podman container by name.
+///
+/// Runs `podman stop --time <timeout_secs> <container_name>` to give the
+/// container a chance to drain in-flight requests.  If `podman stop` fails
+/// (container already gone, podman not available), the error is logged at
+/// debug level — the container may already have been cleaned up.
+///
+/// After this call the podman *client* process still needs to be reaped
+/// via `shutdown_child`, but the container itself is gone.
+pub async fn shutdown_container(container_name: &str, drain_timeout: Duration) {
+    let timeout_secs = drain_timeout.as_secs().max(1);
+    let status = tokio::process::Command::new("podman")
+        .args(["stop", "--time", &timeout_secs.to_string(), container_name])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+    match status {
+        Ok(s) if s.success() => {
+            tracing::debug!(%container_name, timeout_secs, "container stopped");
+        }
+        Ok(s) => {
+            tracing::debug!(
+                %container_name,
+                code = s.code(),
+                "podman stop returned non-zero — container may already be gone"
+            );
+        }
+        Err(e) => {
+            tracing::debug!(
+                %container_name,
+                error = %e,
+                "podman stop failed — container may already be gone or podman not available"
+            );
+        }
+    }
+}
+
+/// Inject auto-generated podman arguments into a container command.
+///
+/// Appends `--name <name>` (unique per instance) and `--rm` (auto-cleanup)
+/// right after `podman run` in the argument list.  `--rm` is only injected
+/// when not already present.
+///
+/// Returns the container name for storage on the `Instance`.
+pub fn inject_container_args(args: &mut Vec<String>, name: &str) {
+    // Find the index of "run" (the subcommand) — insert after it.
+    // `podman run [--flags] image [args]`
+    if let Some(run_pos) = args.iter().position(|a| a == "run") {
+        // Inject --rm if not already present between "run" and the image.
+        if !args.iter().any(|a| a == "--rm") {
+            args.insert(run_pos + 1, "--rm".to_string());
+        }
+        // Inject --name after --rm (or after "run" if --rm was already there).
+        let insert_at = if args.get(run_pos + 1).map(|s| s.as_str()) == Some("--rm") {
+            run_pos + 2
+        } else {
+            run_pos + 1
+        };
+        args.insert(insert_at, "--name".to_string());
+        args.insert(insert_at + 1, name.to_string());
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1027,5 +1126,52 @@ mod tests {
 
         let outcome = poll_readiness(&handle, &client, &backend, Duration::from_millis(600)).await;
         assert_eq!(outcome, ReadyOutcome::TimedOut);
+    }
+
+    // ── Container backend tests ─────────────────────────────────────
+
+    #[test]
+    fn container_backend_returns_empty_args_and_env() {
+        let backend = ContainerBackend;
+        assert!(backend.gpu_args(&[]).is_empty());
+        assert!(backend.gpu_args(&[0, 1]).is_empty());
+        assert!(backend.gpu_env(&[]).is_empty());
+        assert!(backend.gpu_env(&[0, 1]).is_empty());
+    }
+
+    #[test]
+    fn container_backend_health_url() {
+        let backend = ContainerBackend;
+        assert_eq!(backend.health_url(8080), "http://127.0.0.1:8080/health");
+    }
+
+    // ── inject_container_args tests ─────────────────────────────────
+
+    #[test]
+    fn inject_container_args_adds_name_and_rm() {
+        let mut args = s(&["run", "some-image", "--arg1"]);
+        inject_container_args(&mut args, "my-container");
+        assert_eq!(
+            args,
+            s(&["run", "--rm", "--name", "my-container", "some-image", "--arg1"])
+        );
+    }
+
+    #[test]
+    fn inject_container_args_skips_rm_when_already_present() {
+        let mut args = s(&["run", "--rm", "some-image"]);
+        inject_container_args(&mut args, "my-container");
+        assert_eq!(
+            args,
+            s(&["run", "--rm", "--name", "my-container", "some-image"])
+        );
+    }
+
+    #[test]
+    fn inject_container_args_handles_no_run_subcommand() {
+        let mut args = s(&["info"]);
+        inject_container_args(&mut args, "my-container");
+        // No "run" subcommand → no injection.
+        assert_eq!(args, s(&["info"]));
     }
 }

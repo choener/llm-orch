@@ -366,6 +366,46 @@ The module automatically uses the flake's own build of llm-orch; override with `
 | `user` / `group` | `"llm-orch"` | Account to run under. The default is created as a system user with `video`/`render` group membership for GPU access. Set to your own user if your model files are owned by it. |
 | `llamaPackage` | `pkgs.llama-cpp` | Provides `llama-server` on the service PATH. Set to `null` to opt out. |
 | `extraPackages` | `[]` | Additional packages on the service PATH (available to model `cmd`s and keep-alive hooks). |
+| `enableContainerSupport` | `false` | Enable rootless Podman backends; supplies Podman, the NixOS mapping wrappers, required service hardening, subordinate IDs, and a lingered user session. |
+| `containerImages` | `[]` | Images to load from local `podman save` tar archives before starting llm-orch. |
+
+### Container backends (rootless Podman)
+
+Enable container support when a model command begins with `podman run`; llm-orch
+then manages the container's lifecycle. The module runs Podman rootlessly as the
+configured service user, gives that user subordinate UID/GID ranges, exposes
+NixOS's setuid `newuidmap`/`newgidmap` wrappers on the service PATH, and enables
+that user's lingering systemd session. To map the subordinate range into
+Podman's child namespace, the service explicitly runs with `PrivateUsers=false`
+and `NoNewPrivileges=false`. Container mode deliberately leaves
+`CapabilityBoundingSet` unset and sets `RestrictSUIDSGID=false`: rootless Podman
+needs its normal nested-user-namespace capabilities and must preserve ordinary
+image-layer SUID/SGID metadata (for example `/usr/bin/chage`) while unpacking.
+The service itself remains the configured non-root user; rootless Podman is the
+container isolation boundary. The service waits for `linger-users.service`,
+delegates its cgroup subtree to Podman, and runs `podman system migrate` before
+it examines or loads images. The migration keeps existing rootless storage
+compatible when mappings are added or changed.
+
+```nix
+services.llm-orch = {
+  enable = true;
+  enableContainerSupport = true;
+  containerImages = [
+    {
+      image = "vllm-radiance:0.11.0";
+      path = "/data/vllm/container/vllm-radiance.tar";
+    }
+  ];
+};
+```
+
+Create an archive with `podman save IMAGE -o archive.tar`; `containerImages`
+loads it only when the named image is absent from the service user's storage. A
+load failure referring to insufficient UIDs/GIDs while unpacking a container
+path such as `/etc/gshadow` signals a rootless user-namespace mapping problem,
+not an unsupported image format. This module's container-support setup handles
+those mappings and performs the required storage migration before the load.
 
 ### File ownership and permissions
 
@@ -378,7 +418,7 @@ The service reads its files directly (hot-reload requires this), so ownership ma
 
 ### Hardening notes
 
-The unit runs with `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp`, `NoNewPrivileges`, no capabilities, and cgroup-level device filtering (`DevicePolicy=closed` with `DeviceAllow` for the `char-drm` (Vulkan/ROCm), `char-kfd` (ROCm/HIP), and `char-nvidia*` (CUDA) device groups; unresolvable groups are skipped on hosts without the matching hardware). `MemoryDenyWriteExecute=false` is set because GPU runtimes JIT-compile at runtime. Model files under `/home` remain readable; tighten permissions yourself if they must stay private.
+By default the unit runs with `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp`, `NoNewPrivileges`, an empty capability bound, and cgroup-level device filtering (`DevicePolicy=closed` with `DeviceAllow` for the `char-drm` (Vulkan/ROCm), `char-kfd` (ROCm/HIP), and `char-nvidia*` (CUDA) device groups; unresolvable groups are skipped on hosts without the matching hardware). Container mode switches to a rootless-Podman compatibility profile: `NoNewPrivileges=false`, `PrivateUsers=false`, `RestrictSUIDSGID=false`, cgroup delegation, and no unit-level `CapabilityBoundingSet`. These relaxations are necessary for rootless namespace setup and normal image-layer extraction; Podman still runs as the configured non-root service user and supplies the container boundary. `MemoryDenyWriteExecute=false` is set because GPU runtimes JIT-compile at runtime. Model files under `/home` remain readable; tighten permissions yourself if they must stay private.
 
 ## 🛠 Development
 

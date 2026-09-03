@@ -948,8 +948,13 @@ pub fn resolve_model_cmd(
 /// `--spec-draft-ngl 0`, not a device flag.
 ///
 /// Non-llama.cpp programs (e.g. `audiocpp_server`) select their compute
-/// device through their own interface and are not checked.
+/// device through their own interface and are not checked.  Container
+/// models (runner `Container`) also manage device selection internally
+/// via `--device /dev/dri` / `--device /dev/kfd` and must not be checked.
 fn cmd_device_flag_decl(cmd_aliases: &HashMap<String, String>, m: &ModelConfig) -> Option<String> {
+    if m.runner(cmd_aliases) == Runner::Container {
+        return None;
+    }
     let resolved = resolve_model_cmd(cmd_aliases, m, 0);
     let parts = shlex::split(&resolved)?;
     let program = parts.first()?;
@@ -981,8 +986,12 @@ fn cmd_device_flag_decl(cmd_aliases: &HashMap<String, String>, m: &ModelConfig) 
 ///
 /// Non-llama.cpp programs (e.g. `audiocpp_server`) select their compute
 /// device through their own interface (`server.json`'s `backend` field)
-/// and are not checked.
+/// and are not checked.  Container models are also skipped — they manage
+/// GPU offload inside the container.
 fn cpu_cmd_offload_decl(cmd_aliases: &HashMap<String, String>, m: &ModelConfig) -> Option<String> {
+    if m.runner(cmd_aliases) == Runner::Container {
+        return None;
+    }
     let resolved = resolve_model_cmd(cmd_aliases, m, 0);
     let parts = shlex::split(&resolved)?;
     let program = parts.first()?;
@@ -1017,6 +1026,39 @@ fn default_idle_ttl() -> u64 {
 }
 fn default_queue_depth() -> usize {
     10
+}
+
+// ── Runner detection ────────────────────────────────────────────────────────
+
+/// How a model's backend process is launched.
+///
+/// Detected automatically from the resolved `cmd` prefix — no config field
+/// needed.  When the resolved command starts with `podman` (or a path whose
+/// basename is `podman`), the scheduler uses the container lifecycle path
+/// instead of native subprocess management.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Runner {
+    /// Native subprocess (SIGTERM/SIGKILL lifecycle).
+    Process,
+    /// Podman container (`podman run --rm …` lifecycle).
+    Container,
+}
+
+impl ModelConfig {
+    /// Detect the runner from the resolved `cmd` prefix (after alias
+    /// substitution but before port/max-concurrent placeholders — the
+    /// binary name is unaffected by those).
+    pub fn runner(&self, cmd_aliases: &HashMap<String, String>) -> Runner {
+        // Use a marker port — the binary name never depends on the port.
+        let resolved = resolve_model_cmd(cmd_aliases, self, 0);
+        let prog = resolved.split_whitespace().next().unwrap_or("");
+        let basename = prog.rsplit('/').next().unwrap_or(prog);
+        if basename == "podman" {
+            Runner::Container
+        } else {
+            Runner::Process
+        }
+    }
 }
 
 // ── Autoscale configuration ──────────────────────────────────────────────────
@@ -2174,5 +2216,143 @@ models:
     fn drain_idle_timeout_defaults_to_3600() {
         let cfg = parse(BASE).unwrap();
         assert_eq!(cfg.server.drain_idle_timeout_secs, 3600);
+    }
+
+    // ── Runner detection ─────────────────────────────────────────────
+
+    #[test]
+    fn runner_detects_podman() {
+        let cfg = ModelConfig {
+            name: "test".into(),
+            cmd: "podman run --rm some-image".into(),
+            ..ModelConfig::default_for_tests()
+        };
+        assert_eq!(
+            cfg.runner(&HashMap::new()),
+            Runner::Container
+        );
+    }
+
+    #[test]
+    fn runner_detects_podman_with_full_path() {
+        let cfg = ModelConfig {
+            name: "test".into(),
+            cmd: "/usr/bin/podman run --rm some-image".into(),
+            ..ModelConfig::default_for_tests()
+        };
+        assert_eq!(
+            cfg.runner(&HashMap::new()),
+            Runner::Container
+        );
+    }
+
+    #[test]
+    fn runner_defaults_to_process() {
+        let cfg = ModelConfig {
+            name: "test".into(),
+            cmd: "llama-server --model m.gguf".into(),
+            ..ModelConfig::default_for_tests()
+        };
+        assert_eq!(
+            cfg.runner(&HashMap::new()),
+            Runner::Process
+        );
+    }
+
+    #[test]
+    fn runner_detects_podman_through_cmd_aliases() {
+        let cfg = ModelConfig {
+            name: "test".into(),
+            cmd: "{podman} run some-image".into(),
+            ..ModelConfig::default_for_tests()
+        };
+        let mut aliases = HashMap::new();
+        aliases.insert("podman".into(), "podman".into());
+        assert_eq!(
+            cfg.runner(&aliases),
+            Runner::Container
+        );
+    }
+
+    // ── Container model validation ────────────────────────────────────
+
+    #[test]
+    fn container_model_skips_device_flag_rejection() {
+        // A podman command with --device should NOT be rejected — the
+        // container uses --device /dev/dri for GPU passthrough, which
+        // is different from llama.cpp's --device selector.
+        let yaml = r#"
+server: {}
+apikeys_file: apikeys.txt
+models:
+  - name: m
+    context_length: 4096
+    vulkan_devices: [0]
+    cmd: "podman run --device /dev/dri some-image"
+"#;
+        parse(yaml).unwrap();
+    }
+
+    #[test]
+    fn container_model_skips_cpu_offload_rejection() {
+        // A container model with no device pool should NOT be rejected
+        // for having GPU offload flags — it manages its own offload.
+        let yaml = r#"
+server: {}
+apikeys_file: apikeys.txt
+models:
+  - name: m
+    context_length: 4096
+    cmd: "podman run --n-gpu-layers 99 some-image"
+"#;
+        parse(yaml).unwrap();
+    }
+
+    #[test]
+    fn container_model_allows_gpu_pool_for_vram_accounting() {
+        // Container models can still declare a device pool for VRAM
+        // accounting — the pool is used for scheduler placement even
+        // though no GPU env vars are injected.
+        let yaml = r#"
+server: {}
+apikeys_file: apikeys.txt
+models:
+  - name: m
+    context_length: 4096
+    vram: 24000
+    vulkan_devices: [0]
+    cmd: "podman run --device /dev/dri some-image"
+"#;
+        let cfg = parse(yaml).unwrap();
+        assert_eq!(cfg.models[0].vram, 24000);
+        assert!(!cfg.models[0].vulkan_devices.is_empty());
+    }
+
+    // ── Helper for tests ─────────────────────────────────────────────
+
+    /// Minimal `ModelConfig` with sensible defaults for unit tests that
+    /// don't go through YAML parsing.
+    impl ModelConfig {
+        fn default_for_tests() -> Self {
+            Self {
+                name: String::new(),
+                context_length: 4096,
+                max_instances: 1,
+                max_concurrent: 4,
+                priority: 0,
+                vram: 0,
+                ram: 0,
+                idle_ttl: 300,
+                queue_depth: 10,
+                cmd: String::new(),
+                vulkan_devices: DevicePool::default(),
+                cuda_devices: DevicePool::default(),
+                rocm_devices: DevicePool::default(),
+                gpus: 1,
+                debug_log: None,
+                autoscale: None,
+                spawn_timeout_secs: None,
+            }
+        }
     }
 }

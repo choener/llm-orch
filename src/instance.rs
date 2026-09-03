@@ -81,6 +81,11 @@ pub struct Instance {
     /// Subprocess handle (`None` before spawn, or after the process exits).
     pub child: Option<Child>,
 
+    /// Podman container name, when the backend runs inside a container.
+    /// `None` for native process backends.  Set at spawn time; used during
+    /// shutdown to call `podman stop <name>` before killing the child.
+    pub container_name: Option<String>,
+
     /// Ring buffer of the backend's recent stdout/stderr lines.  Set by
     /// the manager at spawn time; dumped at `warn!` level when the
     /// instance fails readiness or crashes.
@@ -147,6 +152,7 @@ impl Instance {
             generation: 0,
             migration_id: None,
             child: None,
+            container_name: None,
             output: None,
             in_flight: 0,
             last_active: now,

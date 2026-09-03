@@ -2,7 +2,12 @@
 #
 # The flake wires `services.llm-orch.package` to the flake's own build;
 # when using this module standalone, set it yourself.
-{ config, lib, pkgs, ... }:
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
 
 let
   cfg = config.services.llm-orch;
@@ -11,6 +16,83 @@ in
 {
   options.services.llm-orch = {
     enable = lib.mkEnableOption "llm-orch — single-host LLM/prompt orchestrator for llama.cpp and stable-diffusion.cpp backends";
+
+    enableContainerSupport = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Enable podman container support.  When enabled, llm-orch can manage
+        container-based backends (vLLM, TGI, etc.) via `podman run --rm` in
+        addition to native subprocess backends.
+
+        This option configures:
+        - podman and NixOS's `newuidmap`/`newgidmap` wrappers on the service
+          PATH
+        - Rootless Podman compatibility settings: `NoNewPrivileges=false`,
+          `PrivateUsers=false`, `RestrictSUIDSGID=false`, `AF_NETLINK`, and
+          cgroup delegation. The unit-level capability bound is intentionally
+          unset so Podman can set up nested namespaces and unpack normal image
+          metadata.
+        - Subordinate UID/GID mappings and a persistent systemd user session
+          (linger) for the configured llm-orch service user
+        - `HOME` set to the service state directory so podman's storage
+          (`~/.local/share/containers`) lives under `/var/lib/llm-orch`
+        - `podman system migrate` before every service start, so persisted
+          rootless storage uses the configured subordinate-ID mappings
+        - Optional one-time image loading from tar archives (see
+          {option}`services.llm-orch.containerImages`)
+
+        The configured service user must be able to pull images (`podman
+        login` if needed).
+      '';
+    };
+
+    containerImages = lib.mkOption {
+      type = lib.types.listOf (
+        lib.types.submodule {
+          options = {
+            image = lib.mkOption {
+              type = lib.types.str;
+              example = "vllm-radiance:0.11.0";
+              description = ''
+                Container image name as it will appear in `podman images`
+                after loading (e.g. `vllm-radiance:0.11.0`).
+              '';
+            };
+            path = lib.mkOption {
+              type = lib.types.str;
+              example = "/data/vllm/container/vllm-radiance.tar";
+              description = ''
+                Absolute path to the tar archive (created with `podman
+                save`) that contains the image.  Must be readable by the
+                service user.
+              '';
+            };
+          };
+        }
+      );
+      default = [ ];
+      example = lib.literalExpression ''
+        [
+          { image = "vllm-radiance:0.11.0"; path = "/data/vllm/container/vllm-radiance.tar"; }
+        ]
+      '';
+      description = ''
+        Pre-built container images to load before starting the service.
+        Each tar archive is loaded with `podman load -i` only if the
+        named image is not already present in podman storage.  Images
+        are loaded on every start (the check is fast — `podman image
+        exists` queries the local database — and loading is skipped
+        when the image is found, making subsequent starts cheap).
+
+        Tar archives must be created with `podman save IMAGE -o
+        OUTPUT.tar` on the host that built the container. If loading a valid
+        archive reports insufficient UIDs/GIDs while unpacking a path such as
+        `/etc/gshadow`, that is a rootless user-namespace mapping problem,
+        not an archive-format problem. Enabling container support configures
+        the mapping and migrates this service's Podman storage before loading.
+      '';
+    };
 
     package = lib.mkOption {
       type = lib.types.package;
@@ -87,9 +169,10 @@ in
     nvidiaPackage = lib.mkOption {
       type = lib.types.nullOr lib.types.package;
       default =
-        if lib.any (d: lib.hasPrefix "nvidia" d) config.services.xserver.videoDrivers
-        then config.hardware.nvidia.package.bin
-        else null;
+        if lib.any (d: lib.hasPrefix "nvidia" d) config.services.xserver.videoDrivers then
+          config.hardware.nvidia.package.bin
+        else
+          null;
       defaultText = lib.literalExpression ''
         if NVIDIA is in services.xserver.videoDrivers:
           config.hardware.nvidia.package.bin
@@ -116,34 +199,79 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    users.users.${cfg.user} = lib.mkIf (cfg.user == defaultUserGroup) {
-      isSystemUser = true;
-      group = cfg.group;
-      extraGroups = [ "video" "render" ];
-      description = "llm-orch service user";
-    };
+    # Keep all attributes for the dynamic service-user key in one definition:
+    # Nix does not merge separate dynamic attribute paths for the same user.
+    users.users.${cfg.user} =
+      lib.optionalAttrs (cfg.user == defaultUserGroup) {
+        isSystemUser = true;
+        group = cfg.group;
+        extraGroups = [
+          "video"
+          "render"
+        ];
+        description = "llm-orch service user";
+      }
+      // lib.optionalAttrs cfg.enableContainerSupport {
+        # Rootless podman needs subordinate UID/GID mappings for user
+        # namespace creation. These must follow `cfg.user`, including when
+        # the service runs as an existing account. Allocate 65536 subordinate
+        # IDs starting at a high offset to avoid collisions with real users.
+        subUidRanges = [
+          {
+            startUid = 200000;
+            count = 65536;
+          }
+        ];
+        subGidRanges = [
+          {
+            startGid = 200000;
+            count = 65536;
+          }
+        ];
+        # Keep the user's systemd manager available for Podman's systemd
+        # cgroup manager even though llm-orch itself is a system service.
+        linger = true;
+      };
 
     users.groups.${cfg.group} = lib.mkIf (cfg.group == defaultUserGroup) { };
 
     systemd.services.llm-orch = {
       description = "llm-orch — single-host LLM orchestrator";
       wantedBy = [ "multi-user.target" ];
-      after = [ "network.target" ];
+      wants = lib.optional cfg.enableContainerSupport "linger-users.service";
+      after = [ "network.target" ] ++ lib.optional cfg.enableContainerSupport "linger-users.service";
+
+      # Crash-loop protection: llm-orch exits immediately on e.g. a broken
+      # config, so without a limit systemd would restart it forever in a
+      # tight loop. 3 failed starts within 5 minutes mark the unit failed
+      # (`start-limit-hit`); recover with `systemctl reset-failed llm-orch`
+      # followed by `systemctl start llm-orch`. mkDefault so host configs
+      # can override without mkForce.
+      unitConfig = {
+        StartLimitBurst = lib.mkDefault 3;
+        StartLimitIntervalSec = lib.mkDefault 300;
+      };
 
       # bash provides `sh` and coreutils `cat` — both are required by the
       # keep-alive mechanism (`sh -c <cmd>`, default cmd reads
       # gpu_busy_percent via cat). Without them on PATH the keep-alive
       # spawn fails with ENOENT: NixOS replaces the unit PATH entirely once
       # `path` is non-empty, and llama-cpp's bin dir has no shell.
-      path =
-        [ pkgs.runtimeShellPackage pkgs.coreutils ]
-        ++ lib.optional (cfg.llamaPackage != null) cfg.llamaPackage
-        # stable-diffusion.cpp (sd-server) for diffusion model backends.
-        ++ lib.optional (cfg.stableDiffusionCppPackage != null) cfg.stableDiffusionCppPackage
-        # nvidia-smi (live VRAM metrics on CUDA hosts): the driver bin
-        # output is only on PATH when NVIDIA was detected on the host.
-        ++ lib.optional (cfg.nvidiaPackage != null) cfg.nvidiaPackage
-        ++ cfg.extraPackages;
+      path = [
+        pkgs.runtimeShellPackage
+        pkgs.coreutils
+      ]
+      # Rootless Podman must find NixOS's setuid newuidmap/newgidmap
+      # wrappers, which live at /run/wrappers/bin.
+      ++ lib.optional cfg.enableContainerSupport "/run/wrappers"
+      ++ lib.optional cfg.enableContainerSupport pkgs.podman
+      ++ lib.optional (cfg.llamaPackage != null) cfg.llamaPackage
+      # stable-diffusion.cpp (sd-server) for diffusion model backends.
+      ++ lib.optional (cfg.stableDiffusionCppPackage != null) cfg.stableDiffusionCppPackage
+      # nvidia-smi (live VRAM metrics on CUDA hosts): the driver bin
+      # output is only on PATH when NVIDIA was detected on the host.
+      ++ lib.optional (cfg.nvidiaPackage != null) cfg.nvidiaPackage
+      ++ cfg.extraPackages;
 
       serviceConfig = {
         User = cfg.user;
@@ -158,10 +286,30 @@ in
         WorkingDirectory = "/var/lib/llm-orch";
 
         # ── Hardening ─────────────────────────────────────────────────
-        # Constrained so that spawning llama.cpp backends and accessing
-        # GPUs (Vulkan/ROCm via /dev/dri and /dev/kfd, CUDA via
-        # /dev/nvidia*) keeps working.
+        # Native backends get the hardened service profile.  Container mode
+        # instead relies on rootless Podman as the isolation boundary and
+        # drops the systemd sandbox: a container engine cannot run under
+        # filesystem/namespace/device sandboxing, and punching holes one
+        # knob at a time only produces a sequence of runtime failures.
+        # llm-orch still runs as the unprivileged configured user in both
+        # modes — containers are isolated by Podman's user namespace, not
+        # by host root.
+      } // (if cfg.enableContainerSupport then {
+        # Rootless-Podman compatibility profile: keep only delegation,
+        # writable state, and a predictable umask.  Everything a container
+        # engine needs (nested user namespaces, SUID helpers, /dev/net/tun,
+        # writing runroot under XDG_RUNTIME_DIR, mounting overlayfs) is
+        # incompatible with the sandbox knobs below, so they stay at
+        # systemd defaults (all permissive).
+        Delegate = true; # let Podman manage container cgroups below this service
+        UMask = "0077";
+        # Optional (`-` prefix): written by preStart, carrying the
+        # runtime-resolved XDG_RUNTIME_DIR for the main process.
+        EnvironmentFile = [ "-/var/lib/llm-orch/runtime.env" ];
+      } else {
+        # Hardened profile for native-only backends.
         NoNewPrivileges = true;
+        CapabilityBoundingSet = "";
         ProtectSystem = "strict";
         ProtectHome = "read-only";
         PrivateTmp = true;
@@ -177,26 +325,84 @@ in
         PrivateDevices = false;
         DevicePolicy = "closed";
         DeviceAllow = [
-          "char-drm rw"      # Vulkan/ROCm: /dev/dri/* (AMD/Intel; NVIDIA with nvidia-drm)
-          "char-kfd rw"      # ROCm/HIP: /dev/kfd
-          "char-nvidia* rw"  # CUDA: /dev/nvidia*, /dev/nvidia-uvm*, /dev/nvidia-caps/*
+          "char-drm rw" # Vulkan/ROCm: /dev/dri/* (AMD/Intel; NVIDIA with nvidia-drm)
+          "char-kfd rw" # ROCm/HIP: /dev/kfd
+          "char-nvidia* rw" # CUDA: /dev/nvidia*, /dev/nvidia-uvm*, /dev/nvidia-caps/*
         ];
         ProtectKernelTunables = true;
         ProtectKernelModules = true;
         ProtectControlGroups = true;
         RestrictSUIDSGID = true;
         RestrictAddressFamilies = [
-          "AF_UNIX"   # journald, local IPC
-          "AF_INET"   # HTTP listener + loopback backends
+          "AF_UNIX" # journald, local IPC
+          "AF_INET" # HTTP listener + loopback backends
           "AF_INET6"
         ];
         RestrictRealtime = true;
         LockPersonality = true;
         # Vulkan/CUDA JIT-compile shaders/kernels at runtime.
         MemoryDenyWriteExecute = false;
-        CapabilityBoundingSet = "";
         UMask = "0077";
+      });
+    }
+    // lib.optionalAttrs cfg.enableContainerSupport {
+      # Rootless podman needs writable HOME, a real XDG_RUNTIME_DIR, and a
+      # storage.conf + policy.json — a system user has none of these
+      # by default and /tmp is read-only under ProtectSystem=strict.
+      # XDG_RUNTIME_DIR must be the user's actual runtime dir: podman
+      # detects the systemd user session via $XDG_RUNTIME_DIR/bus and
+      # silently falls back to --cgroup-manager=cgroupfs otherwise.
+      # The service user's uid is auto-assigned (null at eval time) and
+      # systemd's %U specifier resolves to root in system units, so the
+      # path is resolved at runtime: preStart (which runs as the service
+      # user) writes it into an environment file the unit loads.
+      environment = {
+        HOME = "/var/lib/llm-orch";
+        TMPDIR = "/var/lib/llm-orch/tmp";
+        CONTAINERS_STORAGE_CONF = "/var/lib/llm-orch/storage.conf";
       };
+
+      preStart = ''
+            # Resolve the service user's runtime dir at start time (the uid
+            # is auto-assigned, so it cannot be hard-coded at eval time).
+            # Linger keeps /run/user/<uid> present; export it for the podman
+            # commands below and persist it for the main process, which reads
+            # it via EnvironmentFile.
+            export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+            printf 'XDG_RUNTIME_DIR=%s\n' "$XDG_RUNTIME_DIR" > /var/lib/llm-orch/runtime.env
+
+            mkdir -p /var/lib/llm-orch/tmp \
+                     /var/lib/llm-orch/storage/graphroot \
+                     /var/lib/llm-orch/storage/runroot \
+                     /var/lib/llm-orch/.config/containers
+
+            cat > /var/lib/llm-orch/storage.conf <<'STORAGE_EOF'
+        [storage]
+        driver = "overlay"
+        graphroot = "/var/lib/llm-orch/storage/graphroot"
+        runroot = "/var/lib/llm-orch/storage/runroot"
+        STORAGE_EOF
+
+            cat > /var/lib/llm-orch/.config/containers/policy.json <<'POLICY_EOF'
+        {"default":[{"type":"insecureAcceptAnything"}]}
+        POLICY_EOF
+
+            # Reconcile any persisted rootless storage with the configured
+            # subordinate UID/GID mappings before inspecting or loading images.
+            podman system migrate
+      ''
+      + lib.optionalString (cfg.containerImages != [ ]) (
+        lib.concatMapStringsSep "\n" (img: ''
+          if podman image exists ${lib.escapeShellArg img.image}; then
+            echo "llm-orch: container image ${img.image} already loaded"
+          elif [ -f ${lib.escapeShellArg img.path} ]; then
+            echo "llm-orch: loading container image from ${img.path} ..."
+            podman load -i ${lib.escapeShellArg img.path}
+          else
+            echo "llm-orch: WARNING - tar file ${img.path} not found, skipping image ${img.image}" >&2
+          fi
+        '') cfg.containerImages
+      );
     };
   };
 }
