@@ -3226,13 +3226,22 @@ struct WaitingSseContext {
 }
 
 /// State for the pre-assignment SSE response.  The assignment future remains
-/// alive between comment heartbeats; once it resolves, the state becomes the
-/// ordinary backend stream.
+/// alive between comment heartbeats; once it resolves the stream transitions
+/// through a connecting phase that keeps emitting heartbeats while the backend
+/// HTTP connection is established — this prevents client timeouts during the
+/// gap between the last queue heartbeat and the first backend SSE chunk.
 enum WaitingSseState {
     Waiting {
         assignment: AssignmentFuture,
         context: Box<WaitingSseContext>,
         heartbeat: Pin<Box<tokio::time::Sleep>>,
+    },
+    Connecting {
+        connect: Pin<Box<dyn Future<Output = EventStream> + Send>>,
+        request_id: String,
+        requested_model: String,
+        heartbeat: Pin<Box<tokio::time::Sleep>>,
+        heartbeat_secs: u64,
     },
     Forward(EventStream),
 }
@@ -3243,9 +3252,11 @@ enum WaitingSseState {
 fn waiting_sse_stream(pending: PendingAssignment, context: WaitingSseContext) -> EventStream {
     let heartbeat_secs = context.heartbeat_secs.max(1);
     let assignment: AssignmentFuture = Box::pin(pending.wait());
-    let heartbeat = Box::pin(tokio::time::sleep(std::time::Duration::from_secs(
-        heartbeat_secs,
-    )));
+    // Start with a zero-duration sleep so the first keep-alive comment
+    // is emitted immediately — the client already received HTTP headers
+    // and should not see an unnecessary silent gap before learning it is
+    // queued.
+    let heartbeat = Box::pin(tokio::time::sleep(std::time::Duration::ZERO));
     Box::pin(stream::unfold(
         WaitingSseState::Waiting {
             assignment,
@@ -3261,9 +3272,34 @@ fn waiting_sse_stream(pending: PendingAssignment, context: WaitingSseContext) ->
                 } => {
                     tokio::select! {
                         result = assignment.as_mut() => {
-                            let next = match result {
+                            match result {
                                 Ok((model_name, guard)) => {
-                                    build_assigned_sse_stream(*context, model_name, guard).await
+                                    // Capture these before context is moved into the
+                                    // connect future — the Connecting heartbeat still
+                                    // needs them.
+                                    let request_id = context.request_id.clone();
+                                    let requested_model = context.requested_model.clone();
+                                    let connect = Box::pin(build_assigned_sse_stream(
+                                        *context, model_name, guard,
+                                    ));
+                                    let heartbeat: Pin<Box<tokio::time::Sleep>> = Box::pin(
+                                        tokio::time::sleep(std::time::Duration::from_secs(
+                                            heartbeat_secs,
+                                        )),
+                                    );
+                                    Some((
+                                        Ok(Event::default().comment(format!(
+                                            "llm-orch slot assigned; request={}; model={}",
+                                            request_id, requested_model,
+                                        ))),
+                                        WaitingSseState::Connecting {
+                                            connect,
+                                            request_id,
+                                            requested_model,
+                                            heartbeat,
+                                            heartbeat_secs,
+                                        },
+                                    ))
                                 }
                                 Err(error) => {
                                     let state = if matches!(error, AcquireError::QueueTimeout) {
@@ -3277,15 +3313,16 @@ fn waiting_sse_stream(pending: PendingAssignment, context: WaitingSseContext) ->
                                         None,
                                         Some("queued request could not be assigned"),
                                     );
-                                    Box::pin(stream::once(async move {
-                                        Ok(queue_wait_error_event(error))
-                                    })) as EventStream
+                                    let error_stream =
+                                        Box::pin(stream::once(async move {
+                                            Ok(queue_wait_error_event(error))
+                                        })) as EventStream;
+                                    let mut next = error_stream;
+                                    next.next()
+                                        .await
+                                        .map(|item| (item, WaitingSseState::Forward(next)))
                                 }
-                            };
-                            let mut next = next;
-                            next.next()
-                                .await
-                                .map(|item| (item, WaitingSseState::Forward(next)))
+                            }
                         }
                         _ = heartbeat.as_mut() => {
                             let event = if context.status_events {
@@ -3315,6 +3352,42 @@ fn waiting_sse_stream(pending: PendingAssignment, context: WaitingSseContext) ->
                                     assignment,
                                     context,
                                     heartbeat,
+                                },
+                            ))
+                        }
+                    }
+                }
+                WaitingSseState::Connecting {
+                    mut connect,
+                    request_id,
+                    requested_model,
+                    mut heartbeat,
+                    heartbeat_secs,
+                } => {
+                    tokio::select! {
+                        next_stream = connect.as_mut() => {
+                            let mut next = next_stream;
+                            next.next()
+                                .await
+                                .map(|item| (item, WaitingSseState::Forward(next)))
+                        }
+                        _ = heartbeat.as_mut() => {
+                            let comment = format!(
+                                "llm-orch connecting; request={}; model={}",
+                                request_id, requested_model
+                            );
+                            heartbeat.as_mut().reset(
+                                tokio::time::Instant::now()
+                                    + std::time::Duration::from_secs(heartbeat_secs),
+                            );
+                            Some((
+                                Ok(Event::default().comment(comment)),
+                                WaitingSseState::Connecting {
+                                    connect,
+                                    request_id,
+                                    requested_model,
+                                    heartbeat,
+                                    heartbeat_secs,
                                 },
                             ))
                         }
