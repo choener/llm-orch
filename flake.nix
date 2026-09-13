@@ -11,7 +11,14 @@
       pkgs = nixpkgs.legacyPackages.${system};
     in
     {
-      packages.${system}.default = pkgs.rustPlatform.buildRustPackage {
+      # ROCm overlays: rocmPackages_10_0 (TheRock prebuilt binaries).
+      # See nix/rocm.nix. Apply via nixpkgs.overlays or use directly:
+      #   (self.overlays.rocm null nixpkgs.legacyPackages.x86_64-linux)
+      overlays.rocm = import ./nix/rocm.nix;
+      overlays.default = self.overlays.rocm;
+
+      packages.${system} = {
+        default = pkgs.rustPlatform.buildRustPackage {
         pname = "llm-orch";
         version = "0.1.0";
 
@@ -25,6 +32,19 @@
           mainProgram = "llm-orch";
           platforms = platforms.linux;
         };
+      };
+
+        # Compile+run a HIP kernel against the TheRock binary ROCm to prove
+        # the toolchain works on the current machine (needs a gfx1201 GPU):
+        #   nix run .#hip-smoke
+        hip-smoke =
+          (import nixpkgs {
+            inherit system;
+            # TheRock is AMD's redistributable binary dist; consumers apply
+            # overlays.rocm to their own (unfree-enabled) package set.
+            config = { allowUnfreePredicate = p: pkgs.lib.elem (pkgs.lib.getName p) [ "rocm-core-bin-gfx120x" ]; };
+            overlays = [ self.overlays.rocm ];
+          }).rocmPackages_10_0.hip-smoke;
       };
 
       nixosModules.llm-orch = { pkgs, lib, ... }: {
