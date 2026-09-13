@@ -11,8 +11,9 @@
       pkgs = nixpkgs.legacyPackages.${system};
     in
     {
-      # ROCm overlays: rocmPackages_10_0 (TheRock prebuilt binaries).
-      # See nix/rocm.nix. Apply via nixpkgs.overlays or use directly:
+      # ROCm overlays: rocmPackages_10_0 (TheRock prebuilt binaries) and
+      # rocmPackages_7_14 (AMD prebuilt pip SDK wheels). See nix/rocm.nix.
+      # Apply via nixpkgs.overlays or use directly:
       #   (self.overlays.rocm null nixpkgs.legacyPackages.x86_64-linux)
       overlays.rocm = import ./nix/rocm.nix;
       overlays.default = self.overlays.rocm;
@@ -34,17 +35,24 @@
         };
       };
 
-        # Compile+run a HIP kernel against the TheRock binary ROCm to prove
+        # Compile+run a HIP kernel against the binary ROCm trees to prove
         # the toolchain works on the current machine (needs a gfx1201 GPU):
-        #   nix run .#hip-smoke
+        #   nix run .#hip-smoke          # TheRock 10.0
+        #   nix run .#hip-smoke-7_14     # ROCm 7.14.1 (pip SDK wheels)
         hip-smoke =
           (import nixpkgs {
             inherit system;
-            # TheRock is AMD's redistributable binary dist; consumers apply
-            # overlays.rocm to their own (unfree-enabled) package set.
-            config = { allowUnfreePredicate = p: pkgs.lib.elem (pkgs.lib.getName p) [ "rocm-core-bin-gfx120x" ]; };
+            # TheRock/pip-SDK are AMD's redistributable binaries; consumers
+            # apply overlays.rocm to their own (unfree-enabled) package set.
+            config = { allowUnfreePredicate = p: pkgs.lib.elem (pkgs.lib.getName p) [ "rocm-core-bin-gfx120x" "rocm-sdk-gfx1201" ]; };
             overlays = [ self.overlays.rocm ];
           }).rocmPackages_10_0.hip-smoke;
+        hip-smoke-7_14 =
+          (import nixpkgs {
+            inherit system;
+            config = { allowUnfreePredicate = p: pkgs.lib.elem (pkgs.lib.getName p) [ "rocm-core-bin-gfx120x" "rocm-sdk-gfx1201" ]; };
+            overlays = [ self.overlays.rocm ];
+          }).rocmPackages_7_14.hip-smoke;
       };
 
       nixosModules.llm-orch = { pkgs, lib, ... }: {

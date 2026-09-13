@@ -420,6 +420,30 @@ The service reads its files directly (hot-reload requires this), so ownership ma
 
 By default the unit runs with `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp`, `NoNewPrivileges`, an empty capability bound, and cgroup-level device filtering (`DevicePolicy=closed` with `DeviceAllow` for the `char-drm` (Vulkan/ROCm), `char-kfd` (ROCm/HIP), and `char-nvidia*` (CUDA) device groups; unresolvable groups are skipped on hosts without the matching hardware). Container mode switches to a rootless-Podman compatibility profile: `NoNewPrivileges=false`, `PrivateUsers=false`, `RestrictSUIDSGID=false`, cgroup delegation, and no unit-level `CapabilityBoundingSet`. These relaxations are necessary for rootless namespace setup and normal image-layer extraction; Podman still runs as the configured non-root service user and supplies the container boundary. `MemoryDenyWriteExecute=false` is set because GPU runtimes JIT-compile at runtime. Model files under `/home` remain readable; tighten permissions yourself if they must stay private.
 
+## 🧩 ROCm Toolchain Overlays
+
+This flake exposes `overlays.rocm` providing modern ROCm for consumers on
+NixOS — entirely from AMD's prebuilt binaries, zero compilation:
+
+| attr | source | ISAs |
+|---|---|---|
+| `pkgs.rocmPackages_10_0` | TheRock 10.0 dist (stable.repo.amd.com) | `gfx120x`, `gfx110x` (`passthru.forIsa`) |
+| `pkgs.rocmPackages_7_14` | AMD's official pip SDK wheels (rocm_sdk_core + devel + device, 7.14.1) | `gfx1201` today (`passthru.forGfx`; other gfxes need url+hash added) |
+
+Both expose `rocm-core` (the raw tree), `hipcc` (NixOS-wrapped driver: host
+headers/crt flags, gcc-13 libstdc++ for clang-HIP), and `hip-smoke`.
+Verify on a machine with a matching GPU:
+
+```bash
+nix run .#hip-smoke        # TheRock 10.0
+nix run .#hip-smoke-7_14   # ROCm 7.14.1
+# -> kernel result 1+2=3 | GPU: AMD Radeon RX 9070 (gfx1201, 16304 MB)
+```
+
+See `docs/004-native-vllm-radiance.md` for the full story: building and
+running vLLM-radiance (vLLM + gfx1201 kernels) natively on NixOS without
+containers.
+
 ## 🛠 Development
 
 - **Tests**: Run `cargo test` to execute integration tests.
