@@ -37,6 +37,9 @@ in
           (linger) for the configured llm-orch service user
         - `HOME` set to the service state directory so podman's storage
           (`~/.local/share/containers`) lives under `/var/lib/llm-orch`
+        - Podman runtime state (`runroot` and the engine `tmp_dir`) on
+          tmpfs under `/run/llm-orch`, so a stale boot ID cannot survive a
+          reboot; image layers stay in the state directory
         - `podman system migrate` before every service start, so persisted
           rootless storage uses the configured subordinate-ID mappings
         - Optional one-time image loading from tar archives (see
@@ -303,6 +306,14 @@ in
         # systemd defaults (all permissive).
         Delegate = true; # let Podman manage container cgroups below this service
         UMask = "0077";
+        # Volatile runtime tree for Podman.  Podman records the host boot
+        # ID in `$tmp_dir/alive` and refuses to start when it differs from
+        # the running boot ID ("an unhandled reboot has occurred") until
+        # that state is deleted.  On tmpfs it is discarded every boot, so
+        # stale boot IDs can no longer accumulate in the persistent state
+        # directory.  Created by systemd, owned by the service user, and
+        # removed with the unit.
+        RuntimeDirectory = "llm-orch";
         # Optional (`-` prefix): written by preStart, carrying the
         # runtime-resolved XDG_RUNTIME_DIR for the main process.
         EnvironmentFile = [ "-/var/lib/llm-orch/runtime.env" ];
@@ -358,6 +369,9 @@ in
       # user) writes it into an environment file the unit loads.
       environment = {
         HOME = "/var/lib/llm-orch";
+        # General scratch (which can be large, e.g. image tars) stays on
+        # disk; only Podman's engine tmp_dir — the one that holds the boot
+        # ID — is redirected to tmpfs via containers.conf below.
         TMPDIR = "/var/lib/llm-orch/tmp";
         CONTAINERS_STORAGE_CONF = "/var/lib/llm-orch/storage.conf";
       };
@@ -373,15 +387,33 @@ in
 
             mkdir -p /var/lib/llm-orch/tmp \
                      /var/lib/llm-orch/storage/graphroot \
-                     /var/lib/llm-orch/storage/runroot \
+                     /run/llm-orch/tmp \
+                     /run/llm-orch/storage/runroot \
                      /var/lib/llm-orch/.config/containers
 
+            # Remove runroot/tmp_dir left by older revisions that kept them
+            # under the persistent state directory; a stale boot ID there
+            # would otherwise be picked up again.  Image layers (graphroot)
+            # are untouched.
+            rm -rf /var/lib/llm-orch/storage/runroot \
+                   /var/lib/llm-orch/runtime/libpod
+
+            # runroot and the engine tmp_dir hold only per-boot runtime
+            # state (lock files, the boot-ID `alive` file) and belong on
+            # tmpfs.  Podman compares the recorded boot ID against the
+            # running one on every start and aborts if an unclean reboot
+            # left them behind; tmpfs discards them at boot.
             cat > /var/lib/llm-orch/storage.conf <<'STORAGE_EOF'
         [storage]
         driver = "overlay"
         graphroot = "/var/lib/llm-orch/storage/graphroot"
-        runroot = "/var/lib/llm-orch/storage/runroot"
+        runroot = "/run/llm-orch/storage/runroot"
         STORAGE_EOF
+
+            cat > /var/lib/llm-orch/.config/containers/containers.conf <<'CONTAINERS_EOF'
+        [engine]
+        tmp_dir = "/run/llm-orch/tmp"
+        CONTAINERS_EOF
 
             cat > /var/lib/llm-orch/.config/containers/policy.json <<'POLICY_EOF'
         {"default":[{"type":"insecureAcceptAnything"}]}
