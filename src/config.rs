@@ -50,6 +50,10 @@ pub struct Config {
     /// GPU keep-alive configuration to prevent driver autosuspend.
     #[serde(default)]
     pub keep_alive: Option<KeepAliveConfig>,
+
+    /// Token / model statistics (opt-in).  Absent = disabled.
+    #[serde(default)]
+    pub stats: Option<StatsConfig>,
 }
 
 impl Config {
@@ -62,6 +66,13 @@ impl Config {
             && let Some(parent) = path.parent()
         {
             config.apikeys_file = parent.join(&config.apikeys_file);
+        }
+        // Resolve a relative stats file the same way.
+        if let Some(stats) = &mut config.stats
+            && stats.file.is_relative()
+            && let Some(parent) = path.parent()
+        {
+            stats.file = parent.join(&stats.file);
         }
         config.validate()?;
         Ok(config)
@@ -414,6 +425,32 @@ impl Config {
                 return Err(ConfigError::Validation(
                     "keep_alive.amd.cmd must not be empty".into(),
                 ));
+            }
+        }
+
+        // --- stats ---
+        if let Some(ref stats) = self.stats {
+            if stats.file.as_os_str().is_empty() {
+                return Err(ConfigError::Validation(
+                    "stats.file must not be empty".into(),
+                ));
+            }
+            // The JSON file is rewritten via a temp file + rename in the
+            // file's own directory, so that directory must exist.
+            match stats.file.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => {
+                    if !parent.is_dir() {
+                        return Err(ConfigError::Validation(format!(
+                            "stats.file: parent directory does not exist: {}",
+                            parent.display()
+                        )));
+                    }
+                }
+                _ => {
+                    return Err(ConfigError::Validation(
+                        "stats.file: bare file name without a directory is not supported".into(),
+                    ));
+                }
             }
         }
 
@@ -1362,6 +1399,20 @@ fn pci_slot_exists(slot: &str) -> bool {
 /// When at least one model instance is running on a GPU, the configured
 /// command is invoked periodically to prevent the kernel driver from
 /// auto-suspending the device.
+/// Token / model statistics configuration.
+///
+/// When present, per-model counters (prompt / cached / completion
+/// tokens, request and TTFT statistics) are kept in `total` (persisted
+/// across restarts) and `boot` (since this process started) sets, and
+/// the JSON file is atomically rewritten after every served request.
+/// Exposed on the auth-gated `GET /v1/stats` endpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StatsConfig {
+    /// Path of the JSON counter file, updated on every served request
+    /// (atomic temp + rename, so readers never see partial files).
+    pub file: PathBuf,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct KeepAliveConfig {
     /// AMD (amdgpu) keep-alive.

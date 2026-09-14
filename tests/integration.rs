@@ -4,7 +4,7 @@
 // the stub llama.cpp backend binary — no GPU or model required.
 
 use futures_util::StreamExt;
-use llm_orch::{apikeys, config, debug_log, gpu, reload, scheduler, server};
+use llm_orch::{apikeys, config, debug_log, gpu, reload, scheduler, server, stats};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,6 +52,7 @@ struct TestServer {
     manager: Arc<scheduler::InstanceManager>,
     config: Arc<RwLock<config::Config>>,
     apikeys: Arc<RwLock<apikeys::ApikeysStore>>,
+    stats: Arc<stats::StatsStore>,
     _shutdown: oneshot::Sender<()>,
     _dir: PathBuf,
 }
@@ -107,6 +108,9 @@ async fn boot_from_config_path(
 
     let shared_cfg = Arc::new(RwLock::new(cfg));
     let shared_keys = Arc::new(RwLock::new(keys));
+    let stats_store = Arc::new(stats::StatsStore::new(
+        shared_cfg.read().await.stats.as_ref().map(|s| &s.file),
+    ));
     let state = server::AppState {
         config: Arc::clone(&shared_cfg),
         apikeys: Arc::clone(&shared_keys),
@@ -114,6 +118,7 @@ async fn boot_from_config_path(
         client: manager.client().clone(),
         gpu: gpu_snapshot,
         debug_loggers: Arc::new(debug_log::DebugLoggers::new()),
+        stats: Arc::clone(&stats_store),
     };
     let (tx, rx) = oneshot::channel();
     let server_task = tokio::spawn(server::serve(state, rx));
@@ -128,6 +133,7 @@ async fn boot_from_config_path(
         url: format!("http://{listen}"),
         manager,
         config: shared_cfg,
+        stats: stats_store,
         apikeys: shared_keys,
         _shutdown: tx,
         _dir: dir.to_path_buf(),
@@ -215,6 +221,7 @@ async fn queued_stream_emits_sse_comment_before_assignment() {
         client: manager.client().clone(),
         gpu: gpu_snapshot,
         debug_loggers: Arc::new(debug_log::DebugLoggers::new()),
+        stats: Arc::new(stats::StatsStore::default()),
     };
     tokio::spawn({
         let manager = Arc::clone(&manager);
@@ -604,6 +611,7 @@ async fn reload_rejects_bad_config_and_keeps_serving_old() {
         &srv.config,
         &srv.apikeys,
         &srv.manager,
+        &srv.stats,
         &last_mtime,
     )
     .await;
@@ -635,6 +643,7 @@ async fn reload_rejects_bad_config_and_keeps_serving_old() {
         &srv.config,
         &srv.apikeys,
         &srv.manager,
+        &srv.stats,
         &last_mtime,
     )
     .await;
@@ -655,6 +664,7 @@ async fn reload_rejects_bad_config_and_keeps_serving_old() {
         &srv.config,
         &srv.apikeys,
         &srv.manager,
+        &srv.stats,
         &last_mtime,
     )
     .await;
@@ -1291,6 +1301,7 @@ async fn alias_targets_hot_reloaded() {
         &srv.config,
         &srv.apikeys,
         &srv.manager,
+        &srv.stats,
         &last_mtime,
     )
     .await;
@@ -2118,4 +2129,188 @@ async fn remote_model_without_remote_auth_sends_no_header() {
     );
 
     stub.kill().await.unwrap();
+}
+
+// ── Token / model statistics ─────────────────────────────────────────────────
+
+/// Boot a server with the `stats:` section enabled, writing to a file in
+/// the test directory.
+async fn boot_with_stats(dir: &Path, models_yaml: &str) -> (TestServer, PathBuf) {
+    let listen_port = free_port();
+    let stats_file = dir.join("stats.json");
+    let config_yaml = format!(
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\napikeys_file: \"apikeys.txt\"\nstats:\n  file: \"{}\"\n{models_yaml}",
+        stats_file.display()
+    );
+    let config_path = dir.join("config.yaml");
+    std::fs::write(&config_path, config_yaml).unwrap();
+    let srv = boot_from_config_path(dir, &config_path, "tester: secret-key\n").await;
+    (srv, stats_file)
+}
+
+#[tokio::test]
+async fn stats_counters_json_file_and_endpoint() {
+    let dir = temp_dir("stats");
+    let (srv, stats_file) = boot_with_stats(&dir, &models_yaml("", 60)).await;
+    let client = reqwest::Client::new();
+
+    // Non-streaming chat completion (stub: prompt=5, completion=3).
+    let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&chat_body("m"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The JSON file is written on the first served request.
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&stats_file).unwrap()).unwrap();
+    assert_eq!(doc["version"], 1);
+    assert!(doc["started_at"].is_number());
+    assert!(doc["updated_at"].is_number());
+    let total = &doc["models"]["m"]["total"];
+    assert_eq!(total["requests"], 1);
+    assert_eq!(total["prompt_tokens"], 5);
+    assert_eq!(total["completion_tokens"], 3);
+    assert_eq!(total["ttft_count"], 0, "non-streaming: no TTFT");
+    assert!(total["duration_sum_ms"].is_number());
+    assert_eq!(
+        &doc["models"]["m"]["boot"], total,
+        "single boot: boot counters equal total counters"
+    );
+
+    // Streaming chat completion → TTFT is measured.
+    let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("[DONE]"), "stream must complete: {body}");
+
+    // /v1/stats (auth-gated) reflects both requests.
+    let resp = client
+        .get(format!("{}/v1/stats", srv.url))
+        .bearer_auth("secret-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["enabled"], true);
+    assert_eq!(v["version"], 1);
+    let m = &v["models"]["m"]["total"];
+    assert_eq!(m["requests"], 2);
+    assert_eq!(m["prompt_tokens"], 10);
+    assert_eq!(m["completion_tokens"], 6);
+    assert_eq!(m["ttft_count"], 1, "one streaming request measured");
+    assert!(
+        m["ttft_min_ms"].is_u64() && m["ttft_max_ms"].is_u64(),
+        "ttft min/max must be present after a streaming request"
+    );
+    assert_eq!(v["models"]["m"]["boot"], v["models"]["m"]["total"]);
+
+    // The JSON file agrees with the endpoint.
+    let doc2: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&stats_file).unwrap()).unwrap();
+    assert_eq!(doc2["models"]["m"]["total"]["requests"], 2);
+    assert_eq!(doc2["models"]["m"]["total"]["ttft_count"], 1);
+
+    // No auth → 401.
+    let resp = client
+        .get(format!("{}/v1/stats", srv.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn stats_disabled_reports_enabled_false() {
+    let dir = temp_dir("stats-off");
+    let srv = boot(&dir, "tester: secret-key\n", &models_yaml("", 60)).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{}/v1/stats", srv.url))
+        .bearer_auth("secret-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["enabled"], false, "no stats: section → enabled=false");
+    assert_eq!(v["models"].as_object().map(|o| o.len()), Some(0));
+}
+
+#[tokio::test]
+async fn stats_hot_reload_retargers_file() {
+    let dir = temp_dir("stats-retarget");
+    let (srv, stats_file) = boot_with_stats(&dir, &models_yaml("", 60)).await;
+    let client = reqwest::Client::new();
+
+    let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&chat_body("m"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Point the stats file at a new path and reload.
+    let new_file = dir.join("stats-new.json");
+    let config_path = dir.join("config.yaml");
+    let updated = std::fs::read_to_string(&config_path).unwrap().replace(
+        format!("\"{}\"", stats_file.display()).as_str(),
+        format!("\"{}\"", new_file.display()).as_str(),
+    );
+    std::fs::write(&config_path, updated).unwrap();
+    let last_mtime = Arc::new(Mutex::new(None));
+    reload::handle_config_reload(
+        &config_path,
+        &srv.config,
+        &srv.apikeys,
+        &srv.manager,
+        &srv.stats,
+        &last_mtime,
+    )
+    .await;
+
+    // The new file is published immediately with the existing counters.
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&new_file).unwrap()).unwrap();
+    assert_eq!(doc["models"]["m"]["total"]["requests"], 1);
+
+    // New requests land in the new file.
+    let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&chat_body("m"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&new_file).unwrap()).unwrap();
+    assert_eq!(doc["models"]["m"]["total"]["requests"], 2);
+}
+
+#[tokio::test]
+async fn stats_config_validation() {
+    let dir = temp_dir("stats-validation");
+    std::fs::write(dir.join("apikeys.txt"), "tester: secret-key\n").unwrap();
+
+    // Missing parent directory → rejected at config load.
+    let bad = format!(
+        "server:\n  listen: \"127.0.0.1:{}\"\n  port_range: \"ephemeral\"\napikeys_file: \"apikeys.txt\"\nstats:\n  file: \"no-such-dir/stats.json\"\n",
+        free_port()
+    );
+    let bad_path = dir.join("bad-config.yaml");
+    std::fs::write(&bad_path, bad).unwrap();
+    assert!(
+        config::Config::load(&bad_path).is_err(),
+        "stats.file with a missing parent directory must be rejected"
+    );
 }

@@ -228,6 +228,80 @@ pub async fn info_endpoint(
     .await
 }
 
+// ── /v1/stats ─────────────────────────────────────────────────────────────────
+
+/// `GET /v1/stats` response: per-model token counters plus the latest
+/// GPU metrics snapshot.
+#[derive(Debug, serde::Serialize)]
+pub struct StatsResponse {
+    /// `true` when the `stats:` config section is set.
+    pub enabled: bool,
+    /// Schema version (currently 1).
+    pub version: u32,
+    /// Unix seconds of the first startup (restored from the stats file
+    /// if present; 0 when disabled).
+    pub started_at: u64,
+    /// Unix seconds of the most recent recorded request (0 when
+    /// disabled).
+    pub updated_at: u64,
+    /// Per-model counters: `total` (across restarts) and `boot` (since
+    /// this process started).
+    pub models: std::collections::HashMap<String, crate::stats::StatsModel>,
+    /// Latest GPU metrics snapshot (empty on CPU-only hosts).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub gpus: Vec<GpuStatus>,
+}
+
+/// `GET /v1/stats` — token / model statistics, auth-gated.
+///
+/// Designed for external polling (e.g. Home Assistant's HTTP
+/// integration): always returns 200 — `enabled: false` when stats are
+/// not configured — so pollers never have to handle error states.
+pub async fn stats_endpoint(State(state): State<AppState>, _key: ApiKey) -> Json<StatsResponse> {
+    let gpu_metrics = state.gpu.read().await.clone();
+    let gpus: Vec<GpuStatus> = gpu_metrics
+        .iter()
+        .map(|g| {
+            let vram_util_pct = if g.vram_total_bytes > 0 {
+                (g.vram_used_bytes as f64 / g.vram_total_bytes as f64) * 100.0
+            } else {
+                0.0
+            };
+            GpuStatus {
+                index: g.index,
+                pci_slot: g.pci_slot.clone(),
+                vram_vendor: g.vram_vendor.clone(),
+                vram_used_bytes: g.vram_used_bytes,
+                vram_total_bytes: g.vram_total_bytes,
+                vram_util_pct,
+                temperature_c: g.temperature_c,
+                power_w: g.power_w,
+                gpu_busy_pct: g.gpu_busy_pct,
+                sclk_mhz: g.sclk_mhz,
+                mclk_mhz: g.mclk_mhz,
+            }
+        })
+        .collect();
+    match state.stats.snapshot() {
+        Some(doc) => Json(StatsResponse {
+            enabled: true,
+            version: doc.version,
+            started_at: doc.started_at,
+            updated_at: doc.updated_at,
+            models: doc.models,
+            gpus,
+        }),
+        None => Json(StatsResponse {
+            enabled: false,
+            version: 1,
+            started_at: 0,
+            updated_at: 0,
+            models: std::collections::HashMap::new(),
+            gpus,
+        }),
+    }
+}
+
 /// `GET /v1/requests/{request_id}` — authenticated request lifecycle status.
 pub async fn request_status(
     State(state): State<AppState>,
@@ -447,6 +521,7 @@ pub async fn chat_completions(
                 instance_id.clone(),
                 debug_ctx,
                 state.manager.clone(),
+                state.stats.clone(),
                 key.label.clone(),
                 request_id.clone(),
                 idle_timeout,
@@ -490,6 +565,23 @@ pub async fn chat_completions(
             }
 
             log_completion(&response_body, &model_name, &instance_id, elapsed);
+
+            // Statistics (opt-in).
+            record_stats(
+                &state,
+                &model_name,
+                response_body
+                    .pointer("/usage/prompt_tokens")
+                    .and_then(|v| v.as_u64()),
+                response_body
+                    .pointer("/usage/prompt_tokens_details/cached_tokens")
+                    .and_then(|v| v.as_u64()),
+                response_body
+                    .pointer("/usage/completion_tokens")
+                    .and_then(|v| v.as_u64()),
+                elapsed.as_millis() as u64,
+                None,
+            );
 
             // Record in per-model ring buffer for /admin/status.
             {
@@ -746,6 +838,7 @@ pub async fn responses(
                 instance_id.clone(),
                 debug_ctx,
                 state.manager.clone(),
+                state.stats.clone(),
                 key.label.clone(),
                 request_id.clone(),
                 idle_timeout,
@@ -813,6 +906,23 @@ pub async fn responses(
                 prompt_tokens,
                 gen_tokens,
                 elapsed.as_millis()
+            );
+
+            // Statistics (opt-in).
+            record_stats(
+                &state,
+                &model_name,
+                response_body
+                    .pointer("/usage/input_tokens")
+                    .and_then(|v| v.as_u64()),
+                response_body
+                    .pointer("/usage/input_tokens_details/cached_tokens")
+                    .and_then(|v| v.as_u64()),
+                response_body
+                    .pointer("/usage/output_tokens")
+                    .and_then(|v| v.as_u64()),
+                elapsed.as_millis() as u64,
+                None,
             );
 
             // Record in per-model ring buffer for /admin/status.
@@ -1138,6 +1248,7 @@ pub async fn completions(
                 instance_id.clone(),
                 None,
                 state.manager.clone(),
+                state.stats.clone(),
                 key.label.clone(),
                 request_id.clone(),
                 idle_timeout,
@@ -1159,6 +1270,24 @@ pub async fn completions(
             let elapsed = t0.elapsed();
 
             log_completion(&response_body, &model_name, &instance_id, elapsed);
+
+            // Statistics (opt-in).
+            record_stats(
+                &state,
+                &model_name,
+                response_body
+                    .pointer("/usage/prompt_tokens")
+                    .and_then(|v| v.as_u64()),
+                response_body
+                    .pointer("/usage/prompt_tokens_details/cached_tokens")
+                    .and_then(|v| v.as_u64()),
+                response_body
+                    .pointer("/usage/completion_tokens")
+                    .and_then(|v| v.as_u64()),
+                elapsed.as_millis() as u64,
+                None,
+            );
+
             state.manager.update_request_state(
                 &request_id,
                 RequestState::Completed,
@@ -1241,6 +1370,10 @@ pub async fn embeddings(
             e
         })?;
         let elapsed = t0.elapsed();
+        // Captured before `response_body` is consumed by the parse below.
+        let stats_prompt = response_body
+            .pointer("/usage/prompt_tokens")
+            .and_then(|v| v.as_u64());
 
         let instance_id = {
             let inst = guard.handle().inner().lock().unwrap();
@@ -1259,6 +1392,17 @@ pub async fn embeddings(
             instance_id,
             resp.data.len(),
             elapsed.as_millis()
+        );
+
+        // Statistics (opt-in): embeddings have no generation tokens.
+        record_stats(
+            &state,
+            &model_name,
+            stats_prompt,
+            None,
+            None,
+            elapsed.as_millis() as u64,
+            None,
         );
 
         Ok(Json(resp))
@@ -1398,6 +1542,19 @@ pub async fn rerank(
                 },
             );
         }
+
+        // Statistics (opt-in): reranking has no generation tokens.
+        record_stats(
+            &state,
+            &model_name,
+            response_body
+                .pointer("/usage/prompt_tokens")
+                .and_then(|v| v.as_u64()),
+            None,
+            None,
+            elapsed.as_millis() as u64,
+            None,
+        );
 
         // Record in per-model ring buffer for /admin/status.
         // Rerank responses carry only prompt/total tokens — no generation.
@@ -1726,6 +1883,7 @@ async fn forward_audio_post(
             target.instance_id,
             None, // debug context: SSE chunks may carry base64 audio — skip
             state.manager.clone(),
+            state.stats.clone(),
             api_user.to_owned(),
             request_id.to_owned(),
             target.idle_timeout,
@@ -3047,6 +3205,33 @@ fn log_completion(
     );
 }
 
+// ── Statistics ───────────────────────────────────────────────────────────────
+
+/// Record one served request in the stats store — only when the
+/// backend reported usage (so uninstrumented responses do not pollute
+/// the counters).  No-op when stats are not configured; the store is
+/// best-effort and never fails the request.
+fn record_stats(
+    state: &AppState,
+    model_name: &str,
+    prompt_tokens: Option<u64>,
+    cached_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    duration_ms: u64,
+    ttft_ms: Option<u64>,
+) {
+    if prompt_tokens.is_some() || completion_tokens.is_some() {
+        state.stats.record(
+            model_name,
+            prompt_tokens,
+            cached_tokens,
+            completion_tokens,
+            duration_ms,
+            ttft_ms,
+        );
+    }
+}
+
 // ── Backend forwarding ───────────────────────────────────────────────────────
 
 /// Attach the resolved `Authorization` header (remote models with
@@ -3128,6 +3313,7 @@ async fn build_sse_stream(
     instance_id: String,
     debug: Option<DebugStreamContext>,
     manager: Arc<InstanceManager>,
+    stats: Arc<crate::stats::StatsStore>,
     api_user: String,
     request_id: String,
     idle_timeout: std::time::Duration,
@@ -3233,6 +3419,7 @@ async fn build_sse_stream(
         instance_id,
         debug,
         manager,
+        stats,
         api_user,
         request_id,
         idle_timeout,
@@ -3566,6 +3753,7 @@ async fn build_assigned_sse_stream(
         instance_id,
         debug,
         state.manager,
+        state.stats.clone(),
         api_user,
         request_id,
         idle_timeout,
@@ -3620,10 +3808,15 @@ struct SseForwarder<S> {
     idle_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
     /// Used to record completion stats on stream end.
     manager: Arc<InstanceManager>,
+    /// Used to record token statistics on stream end (no-op when
+    /// stats are not configured).
+    stats: Arc<crate::stats::StatsStore>,
     model_name: String,
     api_user: String,
     request_id: String,
     t0: std::time::Instant,
+    /// When the first non-empty SSE data chunk arrived (TTFT).
+    first_chunk_at: Option<std::time::Instant>,
     /// Kept alive until the stream ends.
     _guard: SlotGuard,
     instance_id: String,
@@ -3641,6 +3834,7 @@ where
         instance_id: String,
         debug: Option<DebugStreamContext>,
         manager: Arc<InstanceManager>,
+        stats: Arc<crate::stats::StatsStore>,
         api_user: String,
         request_id: String,
         idle_timeout: std::time::Duration,
@@ -3663,10 +3857,12 @@ where
             idle_timeout,
             idle_sleep,
             manager,
+            stats,
             model_name,
             api_user,
             request_id,
             t0: std::time::Instant::now(),
+            first_chunk_at: None,
             _guard: guard,
             instance_id,
         }
@@ -3693,6 +3889,11 @@ where
                     // recognized as a clean completion.
                     self.saw_done = true;
                 } else if !data.is_empty() {
+                    if self.first_chunk_at.is_none() {
+                        // TTFT: first non-empty data chunk (a proxy for
+                        // the first generated token).
+                        self.first_chunk_at = Some(std::time::Instant::now());
+                    }
                     if self.debug.is_some() {
                         // Full accumulation for the debug log body.
                         self.chunks.push(data);
@@ -3825,6 +4026,9 @@ impl<S> Drop for SseForwarder<S> {
             let mut prompt_tokens = 0u64;
             let mut gen_tokens = 0u64;
             let mut cached_tokens = 0u64;
+            let mut prompt_opt: Option<u64> = None;
+            let mut gen_opt: Option<u64> = None;
+            let mut cached_opt: Option<u64> = None;
             for chunk in self.chunks.iter().rev() {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(chunk)
                     && let Some(usage) = v.get("usage")
@@ -3841,8 +4045,41 @@ impl<S> Drop for SseForwarder<S> {
                         .pointer("/prompt_tokens_details/cached_tokens")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
+                    // Statistics: accept both naming schemes (chat /
+                    // completions and the Responses API).
+                    prompt_opt = usage
+                        .get("prompt_tokens")
+                        .and_then(|v| v.as_u64())
+                        .or_else(|| usage.get("input_tokens").and_then(|v| v.as_u64()));
+                    gen_opt = usage
+                        .get("completion_tokens")
+                        .and_then(|v| v.as_u64())
+                        .or_else(|| usage.get("output_tokens").and_then(|v| v.as_u64()));
+                    cached_opt = usage
+                        .pointer("/prompt_tokens_details/cached_tokens")
+                        .and_then(|v| v.as_u64())
+                        .or_else(|| {
+                            usage
+                                .pointer("/input_tokens_details/cached_tokens")
+                                .and_then(|v| v.as_u64())
+                        });
                     break;
                 }
+            }
+            // Statistics (opt-in) — clean completions only, same rule
+            // as the ring buffer above.
+            if prompt_opt.is_some() || gen_opt.is_some() {
+                let ttft_ms = self
+                    .first_chunk_at
+                    .map(|t| t.saturating_duration_since(self.t0).as_millis() as u64);
+                self.stats.record(
+                    &self.model_name,
+                    prompt_opt,
+                    cached_opt,
+                    gen_opt,
+                    duration_ms,
+                    ttft_ms,
+                );
             }
             self.manager.record_completion(
                 &self.model_name,
@@ -4123,6 +4360,7 @@ true\r\n\
             "m@cpu#0".into(),
             None,
             mgr,
+            Arc::new(crate::stats::StatsStore::default()),
             "user".into(),
             "req-1".into(),
             std::time::Duration::ZERO, // idle timeout disabled
@@ -4265,6 +4503,7 @@ true\r\n\
             "m@cpu#0".into(),
             None,
             mgr.clone(),
+            Arc::new(crate::stats::StatsStore::default()),
             "user".into(),
             "req-1".into(),
             std::time::Duration::from_millis(50),

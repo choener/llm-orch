@@ -1,5 +1,7 @@
 use clap::Parser;
-use llm_orch::{apikeys, config, debug_log, gpu, keepalive, reload, scheduler, server, watcher};
+use llm_orch::{
+    apikeys, config, debug_log, gpu, keepalive, reload, scheduler, server, stats, watcher,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, broadcast};
@@ -175,6 +177,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "llm-orch starting (types-idempotent, debug-log, autoscale)"
     );
     let debug_loggers = Arc::new(debug_log::DebugLoggers::new());
+    let stats = stats::from_config(&shared_cfg.read().await.stats);
+    if stats.path().is_some() {
+        info!(path = %stats.path().unwrap().display(), "statistics enabled");
+    }
     let app_state = server::AppState {
         config: Arc::clone(&shared_cfg),
         apikeys: Arc::clone(&shared_apikeys),
@@ -182,6 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client: manager.client().clone(),
         gpu: gpu_snapshot,
         debug_loggers,
+        stats: Arc::clone(&stats),
     };
     let mut server_task = tokio::spawn(server::serve(app_state, shutdown_rx));
 
@@ -241,6 +248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &cfg,
                             &apikeys,
                             &manager,
+                            &stats,
                             &last_mtime,
                         )
                         .await;
@@ -264,6 +272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &cfg,
                             &apikeys,
                             &manager,
+                            &stats,
                             &last_mtime,
                         )
                         .await;

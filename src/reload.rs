@@ -4,7 +4,7 @@
 // swap only on success, record the file mtime only after a successful swap
 // so rejected or failed reloads are retried on the next file event.
 
-use crate::{apikeys, config, scheduler};
+use crate::{apikeys, config, scheduler, stats};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, warn};
@@ -15,6 +15,7 @@ pub async fn handle_config_reload(
     cfg: &Arc<RwLock<config::Config>>,
     apikeys: &Arc<RwLock<apikeys::ApikeysStore>>,
     manager: &Arc<scheduler::InstanceManager>,
+    stats: &Arc<stats::StatsStore>,
     last_mtime: &Arc<Mutex<Option<std::time::SystemTime>>>,
 ) {
     // Skip if the file's mtime hasn't changed since our last reload.
@@ -60,6 +61,18 @@ pub async fn handle_config_reload(
             // device maps, port range, keep-alive, crash blocks) before
             // swapping the shared config that handlers validate against.
             manager.reconcile_config(&new_cfg).await;
+
+            // Retarget the stats file if the path changed (counter state
+            // is kept; the new file is published immediately).
+            let old_stats_path = cfg.read().await.stats.as_ref().map(|s| s.file.clone());
+            let new_stats_path = new_cfg.stats.as_ref().map(|s| s.file.clone());
+            if old_stats_path != new_stats_path {
+                match &new_stats_path {
+                    Some(p) => info!(path = %p.display(), "stats file retargeted"),
+                    None => info!("stats disabled on reload"),
+                }
+                stats.set_path(new_stats_path.as_ref());
+            }
 
             // Atomic swap.
             let model_count = new_cfg.models.len();

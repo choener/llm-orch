@@ -42,6 +42,8 @@ pub struct AppState {
     pub gpu: Arc<RwLock<Vec<GpuMetrics>>>,
     /// Per-model debug log writers (JSONL).
     pub debug_loggers: Arc<DebugLoggers>,
+    /// Token / model statistics store (disabled unless configured).
+    pub stats: Arc<crate::stats::StatsStore>,
 }
 
 // ── Router ───────────────────────────────────────────────────────────────────
@@ -54,6 +56,7 @@ pub fn build_router(state: AppState) -> Router {
         // OpenAI-compatible endpoints.
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/info", get(handlers::info_endpoint))
+        .route("/v1/stats", get(handlers::stats_endpoint))
         .route("/v1/requests/{request_id}", get(handlers::request_status))
         .route("/v1/chat/completions", post(handlers::chat_completions))
         .route("/v1/responses", post(handlers::responses))

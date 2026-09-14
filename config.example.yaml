@@ -222,6 +222,20 @@ cmd_aliases:
 #     sleep: 5
 
 # ---------------------------------------------------------------------------
+# Token / model statistics
+# ---------------------------------------------------------------------------
+# Opt-in.  When set, per-model counters are tracked in two sets —
+# `total` (persisted across restarts) and `boot` (since this process
+# started): served requests, prompt / cached / completion tokens, TTFT
+# (min/avg/max, streaming), request duration (sum/avg) — and the JSON
+# file is atomically rewritten after every served request.  Exposed on
+# the auth-gated `GET /v1/stats` endpoint (counters + current GPU
+# metrics), which Home Assistant's HTTP integration can poll directly.
+#
+# stats:
+#   file: /var/lib/llm-orch/stats.json
+
+# ---------------------------------------------------------------------------
 # Model definitions
 # ---------------------------------------------------------------------------
 models:

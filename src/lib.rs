@@ -18,5 +18,6 @@ pub mod port_alloc;
 pub mod reload;
 pub mod scheduler;
 pub mod server;
+pub mod stats;
 pub mod types;
 pub mod watcher;
