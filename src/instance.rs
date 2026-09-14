@@ -78,6 +78,18 @@ pub struct Instance {
     /// Transition that owns this instance, if it participates in one.
     pub migration_id: Option<u64>,
 
+    /// Base URL of a remote backend (e.g. `https://host:8080`).
+    /// `None` for locally spawned processes/containers; when set, requests
+    /// are forwarded to `{base}{path}` instead of
+    /// `http://127.0.0.1:{port}{path}` and no local lifecycle (spawn,
+    /// idle eviction, crash monitoring) applies.
+    pub remote_base_url: Option<String>,
+
+    /// `remote_auth` template of the owning model, resolved against
+    /// `key_files` at request time.  `None` unless the model forwards
+    /// an `Authorization` header.
+    pub auth_template: Option<String>,
+
     /// Subprocess handle (`None` before spawn, or after the process exits).
     pub child: Option<Child>,
 
@@ -151,6 +163,8 @@ impl Instance {
             load_purpose,
             generation: 0,
             migration_id: None,
+            remote_base_url: None,
+            auth_template: None,
             child: None,
             container_name: None,
             output: None,
@@ -160,6 +174,29 @@ impl Instance {
             release_tx,
             config_fingerprint: 0,
         }
+    }
+
+    /// Create an instance descriptor for a remote http(s) endpoint.
+    ///
+    /// No local process, port, or GPU placement: `port` is 0 and
+    /// `gpu_indices` empty.  The manager health-probes `base_url` before
+    /// marking the instance ready.
+    pub fn new_remote(
+        model_name: &str,
+        base_url: String,
+        auth_template: Option<String>,
+        release_tx: Option<mpsc::UnboundedSender<String>>,
+        load_purpose: InstanceLoadPurpose,
+    ) -> Self {
+        let mut inst = Self::new_with_purpose(model_name, Vec::new(), 0, release_tx, load_purpose);
+        inst.remote_base_url = Some(base_url);
+        inst.auth_template = auth_template;
+        inst
+    }
+
+    /// Whether this is a remote (URL-targeted) instance.
+    pub fn is_remote(&self) -> bool {
+        self.remote_base_url.is_some()
     }
 
     /// Mark this instance as ready (health check passed).
@@ -281,6 +318,33 @@ impl InstanceHandle {
     /// Unique identifier of this instance (e.g. `"qwen3-32b@0,1"`).
     pub fn id(&self) -> String {
         self.inner.lock().unwrap().id.clone()
+    }
+
+    /// Backend base (no path) — `http://127.0.0.1:{port}` for spawned
+    /// processes, or the configured remote base URL (trailing `/` trimmed)
+    /// for remote instances.
+    pub fn backend_base(&self) -> String {
+        let inst = self.inner.lock().unwrap();
+        match &inst.remote_base_url {
+            Some(base) => base.trim_end_matches('/').to_string(),
+            None => format!("http://127.0.0.1:{}", inst.port),
+        }
+    }
+
+    /// Full backend URL for `path` — `{base}{path}` with exactly one
+    /// slash between base and path.
+    pub fn backend_url(&self, path: &str) -> String {
+        format!(
+            "{}{}",
+            self.backend_base(),
+            if path.starts_with('/') { path } else { "/" }
+        )
+    }
+
+    /// The model's `remote_auth` template (for `key_files` resolution at
+    /// request time), or `None` when no auth header is configured.
+    pub fn auth_template(&self) -> Option<String> {
+        self.inner.lock().unwrap().auth_template.clone()
     }
 
     /// Acquire a slot on the instance.  Returns a RAII guard that releases

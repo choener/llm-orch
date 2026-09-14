@@ -1153,7 +1153,14 @@ mod tests {
         inject_container_args(&mut args, "my-container");
         assert_eq!(
             args,
-            s(&["run", "--rm", "--name", "my-container", "some-image", "--arg1"])
+            s(&[
+                "run",
+                "--rm",
+                "--name",
+                "my-container",
+                "some-image",
+                "--arg1"
+            ])
         );
     }
 

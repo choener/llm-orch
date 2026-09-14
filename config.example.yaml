@@ -73,6 +73,24 @@ server:
 apikeys_file: "apikeys.txt"
 
 # ---------------------------------------------------------------------------
+# Key files (remote model authentication)
+# ---------------------------------------------------------------------------
+# Named files whose *contents* are substituted as `{name}` placeholders in
+# the `remote_auth` field of remote models (see Example 8).  Typical use:
+# a bearer token or API key for a remote http(s) endpoint, kept out of the
+# config file itself.
+#
+# - The files must exist at load / `--check-config` time (path is
+#   validated; contents are read at startup, on config hot-reload, and
+#   when the files themselves change on disk — no restart needed).
+# - Contents are trimmed; a trailing newline in the file is not part of
+#   the substituted value.
+# - Names `port`, `context_length`, `max_concurrent`, and `name` are
+#   reserved (they would shadow runtime placeholders).
+# key_files:
+#   deploy_key: /etc/llm-orch/keys/deploy.key
+
+# ---------------------------------------------------------------------------
 # Device mapping
 # ---------------------------------------------------------------------------
 # Map backend device indices to PCI slots.  The indices here are what
@@ -494,6 +512,37 @@ models:
   #       --cfg-scale 1.0
   #       --rng cpu
   #       --fps 24
+
+  # --- Example 8: a remote http(s) endpoint (pure passthrough) -----------
+  # A model whose `cmd` is an `http://` / `https://` URL is detected
+  # automatically as a *remote* model: llm-orch spawns no process and
+  # allocates no port or GPU — the first request health-probes
+  # `GET {cmd}/health` (10 s budget) and registers the endpoint as a
+  # single passthrough instance.
+  #
+  # Lifecycle differences vs. local models:
+  # - `autoscale` is a config error (there is nothing to scale);
+  # - device pools, `vram`, and `gpus > 1` are config errors;
+  # - the instance is never idle-evicted and is never "killed" on config
+  #   reload or shutdown (there is no local process) — it is re-probed on
+  #   the next request, so a down endpoint recovers without operator
+  #   intervention;
+  # - a failed probe does not block the model (unlike pre-output process
+  #   crashes); with `queue_depth: 0` it surfaces as a 429, otherwise the
+  #   request queues and a later request re-probes;
+  # - EMA load/latency metrics work as usual (in-flight + queued counts).
+  #
+  # `remote_auth` is sent as the `Authorization` header on every forwarded
+  # request; `{name}` placeholders resolve against `key_files` at request
+  # time, so rotating the key file (or hot-reloading the config) applies
+  # immediately without instance replacement.
+  # - name: "remote-qwen"
+  #   context_length: 32768
+  #   max_instances: 1
+  #   max_concurrent: 8          # concurrency cap on the remote endpoint
+  #   queue_depth: 10
+  #   cmd: "https://gpu-host.example.com:8080"
+  #   remote_auth: "Bearer {deploy_key}"
 
 # ---------------------------------------------------------------------------
 # Aliases

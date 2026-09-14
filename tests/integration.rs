@@ -311,7 +311,7 @@ async fn queued_stream_emits_sse_comment_before_assignment() {
     // not a synthetic completion.
     drop(first);
     let mut forwarded = String::new();
-    for _ in 0..100 {
+    for _ in 0..300 {
         let Some(chunk) = tokio::time::timeout(Duration::from_secs(3), body.next())
             .await
             .expect("assigned backend stream must continue")
@@ -411,7 +411,7 @@ async fn migration_preserves_busy_victim_and_loads_target_after_handoff() {
         .unwrap();
     assert_eq!(second.status(), 200);
     let second_task = tokio::spawn(async move { second.text().await.unwrap() });
-    for _ in 0..100 {
+    for _ in 0..300 {
         if srv.manager.instance_counts().get("m1").copied() == Some(1)
             && srv.manager.instance_counts().get("m2").copied() == Some(1)
         {
@@ -1631,7 +1631,10 @@ async fn sd_image_edits_sync() {
                 .text("model", "sd-m")
                 .text("prompt", "make it red")
                 .text("n", "1")
-                .part("image[]", reqwest::multipart::Part::bytes(vec![0u8; 64]).file_name("test.png")),
+                .part(
+                    "image[]",
+                    reqwest::multipart::Part::bytes(vec![0u8; 64]).file_name("test.png"),
+                ),
         )
         .send()
         .await
@@ -1657,11 +1660,16 @@ async fn sd_video_generation_sync() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    let ct = resp.headers().get("content-type")
+    let ct = resp
+        .headers()
+        .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    assert!(ct.contains("video/webm"), "expected video/webm content-type, got: {ct}");
+    assert!(
+        ct.contains("video/webm"),
+        "expected video/webm content-type, got: {ct}"
+    );
 }
 
 #[tokio::test]
@@ -1688,7 +1696,10 @@ async fn sd_passthrough_sdapi_txt2img() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["images"].is_array(), "sdapi txt2img must return images array");
+    assert!(
+        body["images"].is_array(),
+        "sdapi txt2img must return images array"
+    );
 }
 
 #[tokio::test]
@@ -1738,7 +1749,11 @@ async fn sd_passthrough_default_diffusion_fallback() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "must fall back to default_diffusion_model");
+    assert_eq!(
+        resp.status(),
+        200,
+        "must fall back to default_diffusion_model"
+    );
 }
 
 #[tokio::test]
@@ -1762,9 +1777,16 @@ async fn sd_passthrough_x_llm_model_header() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "X-LLM-Model header must route to configured model");
+    assert_eq!(
+        resp.status(),
+        200,
+        "X-LLM-Model header must route to configured model"
+    );
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["supported_modes"].is_array(), "must return capabilities");
+    assert!(
+        body["supported_modes"].is_array(),
+        "must return capabilities"
+    );
 }
 
 #[tokio::test]
@@ -1797,7 +1819,13 @@ async fn sd_endpoints_require_auth() {
     let srv = boot(&dir, "tester: secret-key\n", &sd_models_yaml(60)).await;
     let client = reqwest::Client::new();
 
-    for path in ["/v1/images/generations", "/v1/images/edits", "/v1/video/generations", "/sdapi/v1/txt2img", "/sdcpp/v1/capabilities"] {
+    for path in [
+        "/v1/images/generations",
+        "/v1/images/edits",
+        "/v1/video/generations",
+        "/sdapi/v1/txt2img",
+        "/sdcpp/v1/capabilities",
+    ] {
         let resp = client
             .post(format!("{}{}", srv.url, path))
             .json(&serde_json::json!({"model": "sd-m", "prompt": "test"}))
@@ -1810,4 +1838,284 @@ async fn sd_endpoints_require_auth() {
             resp.status()
         );
     }
+}
+
+// ── Remote http(s) models ────────────────────────────────────────────────────
+
+/// Boot the stub backend standalone (not under llm-orch management) on a
+/// fresh port and wait for its readiness.
+async fn boot_standalone_stub() -> (u16, tokio::process::Child) {
+    let port = free_port();
+    let mut child = tokio::process::Command::new(STUB_BIN)
+        .arg("--port")
+        .arg(port.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let probe = reqwest::Client::new();
+    for _ in 0..300 {
+        if probe
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+        {
+            return (port, child);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    child.kill().await.unwrap();
+    panic!("standalone stub never became ready");
+}
+
+/// Bring up the stub on an already-chosen port (recovery tests).
+async fn start_standalone_stub(port: u16) -> tokio::process::Child {
+    let mut child = tokio::process::Command::new(STUB_BIN)
+        .arg("--port")
+        .arg(port.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let probe = reqwest::Client::new();
+    for _ in 0..300 {
+        if probe
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+        {
+            return child;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    child.kill().await.unwrap();
+    panic!("standalone stub on port {port} never became ready");
+}
+
+fn remote_model_yaml(stub_port: u16, key_file: &str) -> String {
+    format!(
+        "key_files:\n  deploy_key: \"{key_file}\"\nmodels:\n  - name: r\n    context_length: 4096\n    cmd: \"http://127.0.0.1:{stub_port}\"\n    remote_auth: \"Bearer {{deploy_key}}\"\n    max_instances: 1\n"
+    )
+}
+
+fn remote_model_yaml_queue0(stub_port: u16, key_file: &str) -> String {
+    remote_model_yaml(stub_port, key_file) + "    queue_depth: 0\n"
+}
+
+#[tokio::test]
+async fn remote_model_forwards_and_injects_resolved_auth() {
+    let dir = temp_dir("remote-auth");
+    let (port, mut stub) = boot_standalone_stub().await;
+    let key_path = dir.join("deploy.key");
+    std::fs::write(&key_path, "remote-secret-token\n").unwrap();
+
+    let listen_port = free_port();
+    let config_yaml = format!(
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\napikeys_file: \"apikeys.txt\"\n{}",
+        remote_model_yaml(port, &key_path.display().to_string())
+    );
+    let config_path = dir.join("config.yaml");
+    std::fs::write(&config_path, config_yaml).unwrap();
+    let srv = boot_from_config_path(&dir, &config_path, "tester: secret-key\n").await;
+    let client = reqwest::Client::new();
+
+    let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&serde_json::json!({
+            "model": "r",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "remote chat must succeed: {}",
+        resp.text().await.unwrap_or_default()
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "tok-0 tok-1 tok-2 "
+    );
+
+    // The stub must have received the key-file-resolved Authorization
+    // header — proving `key_files` + `remote_auth` substitution end to end.
+    let echo: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{port}/test/last-auth"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        echo["authorization"],
+        serde_json::json!("Bearer remote-secret-token"),
+        "remote backend must see the resolved Authorization header"
+    );
+
+    // A key file content change applies on refresh without any instance
+    // replacement (resolution happens at request time).
+    std::fs::write(&key_path, "rotated-token\n").unwrap();
+    let cfg = srv.config.read().await;
+    srv.manager.refresh_key_files(&cfg);
+    drop(cfg);
+    let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&serde_json::json!({
+            "model": "r",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let echo: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{port}/test/last-auth"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        echo["authorization"],
+        serde_json::json!("Bearer rotated-token"),
+        "rotated key file content must apply without instance replacement"
+    );
+
+    stub.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn remote_model_down_fails_fast_then_recovers() {
+    let dir = temp_dir("remote-down");
+    let key_path = dir.join("deploy.key");
+    std::fs::write(&key_path, "tok\n").unwrap();
+
+    // Nothing is listening on `dead_port` yet.
+    let dead_port = free_port();
+    let listen_port = free_port();
+    let config_yaml = format!(
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\napikeys_file: \"apikeys.txt\"\n{}",
+        remote_model_yaml_queue0(dead_port, &key_path.display().to_string())
+    );
+    let config_path = dir.join("config.yaml");
+    std::fs::write(&config_path, config_yaml).unwrap();
+    let srv = boot_from_config_path(&dir, &config_path, "tester: secret-key\n").await;
+    let client = reqwest::Client::new();
+
+    // queue_depth: 0 → a failed probe surfaces as 429 instead of
+    // queueing.  (The zero-depth path also triggers the spawn attempt
+    // and waits for it before rejecting.)
+    let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&serde_json::json!({
+            "model": "r",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        429,
+        "unreachable remote endpoint must fail fast (body: {})",
+        resp.text().await.unwrap_or_default()
+    );
+
+    // The model must NOT be blocked by the failed probe: bring the
+    // endpoint up.  The next zero-depth request triggers a fresh probe
+    // (which now succeeds) and is still rejected per the zero-depth
+    // contract; the following request gets the warm instance.
+    let mut stub = start_standalone_stub(dead_port).await;
+    let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&serde_json::json!({
+            "model": "r",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        429,
+        "second zero-depth request warms the instance"
+    );
+    let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&serde_json::json!({
+            "model": "r",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "recovered remote endpoint must serve: {}",
+        resp.text().await.unwrap_or_default()
+    );
+
+    stub.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn remote_model_without_remote_auth_sends_no_header() {
+    let dir = temp_dir("remote-noauth");
+    let key_path = dir.join("deploy.key");
+    std::fs::write(&key_path, "sekret\n").unwrap();
+
+    let (port, mut stub) = boot_standalone_stub().await;
+    let listen_port = free_port();
+    // Remote model with a configured key file but *no* `remote_auth`:
+    // the stub must see no Authorization header at all.
+    let config_yaml = format!(
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\napikeys_file: \"apikeys.txt\"\nkey_files:\n  deploy_key: \"{key}\"\nmodels:\n  - name: r\n    context_length: 4096\n    cmd: \"http://127.0.0.1:{port}\"\n    max_instances: 1\n",
+        key = key_path.display()
+    );
+    let config_path = dir.join("config.yaml");
+    std::fs::write(&config_path, config_yaml).unwrap();
+    let srv = boot_from_config_path(&dir, &config_path, "tester: secret-key\n").await;
+    let client = reqwest::Client::new();
+
+    let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&serde_json::json!({
+            "model": "r",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "remote chat without remote_auth must succeed: {}",
+        resp.text().await.unwrap_or_default()
+    );
+
+    let echo: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{port}/test/last-auth"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        echo["authorization"],
+        serde_json::Value::Null,
+        "no remote_auth configured — the backend must not see an Authorization header"
+    );
+
+    stub.kill().await.unwrap();
 }

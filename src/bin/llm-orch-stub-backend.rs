@@ -21,6 +21,9 @@
 //   GET  /sdcpp/v1/capabilities   → canned capability JSON
 //   POST /sdapi/v1/txt2img        → canned sdapi image response
 //   POST /sdapi/v1/img2img        → canned sdapi image response
+//   GET  /test/last-auth          → test support: Authorization header of
+//                                   the most recent request (JSON)
+//                                   (`{"authorization": "…" | null}`)
 //
 // Flags control the canned response: number of chunks, per-chunk delay
 // (slow streaming for drain/timeout tests).  audiocpp_server-style flags
@@ -130,6 +133,10 @@ struct Cli {
 struct StubConfig {
     chunks: usize,
     chunk_delay: Duration,
+    /// Test support: Authorization header of the most recent request
+    /// (recorded by middleware for every endpoint), exposed via
+    /// `GET /test/last-auth`.
+    last_auth: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 #[tokio::main]
@@ -144,9 +151,11 @@ async fn main() {
     let cfg = StubConfig {
         chunks: cli.chunks,
         chunk_delay: Duration::from_millis(cli.chunk_delay_ms),
+        last_auth: std::sync::Arc::new(std::sync::Mutex::new(None)),
     };
 
     let app = Router::new()
+        .route("/test/last-auth", get(test_last_auth))
         .route("/health", get(health))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(embeddings))
@@ -163,6 +172,10 @@ async fn main() {
         .route("/sdcpp/v1/capabilities", get(sdcpp_capabilities))
         .route("/sdapi/v1/txt2img", post(sdapi_txt2img))
         .route("/sdapi/v1/img2img", post(sdapi_img2img))
+        .route_layer(axum::middleware::from_fn_with_state(
+            cfg.clone(),
+            record_auth_middleware,
+        ))
         .with_state(cfg);
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", cli.port))
@@ -173,6 +186,33 @@ async fn main() {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Test support: the Authorization header of the most recent request.
+async fn test_last_auth(
+    axum::extract::State(cfg): axum::extract::State<StubConfig>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "authorization": *cfg.last_auth.lock().unwrap() }))
+}
+
+/// Test support middleware: record the Authorization header of every
+/// request into the shared state (absent header → `None`).
+async fn record_auth_middleware(
+    axum::extract::State(cfg): axum::extract::State<StubConfig>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    // Test endpoints must not clobber the recorded value (their own
+    // header-less GET would reset it before the handler reads it).
+    if req.uri().path().starts_with("/test/") {
+        return next.run(req).await;
+    }
+    *cfg.last_auth.lock().unwrap() = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    next.run(req).await
 }
 
 async fn chat_completions(
@@ -544,9 +584,7 @@ use std::time::SystemTime;
 /// Shared counter for sdcpp job IDs.
 static SDCPP_JOB_SEQ: AtomicU64 = AtomicU64::new(1);
 
-async fn images_generations(
-    Json(body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+async fn images_generations(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
     let _model = body
         .get("model")
         .and_then(|v| v.as_str())
@@ -593,7 +631,10 @@ async fn images_edits(
 async fn sdcpp_vid_gen(
     Json(_body): Json<serde_json::Value>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
-    let id = format!("job_stub_vid_{}", SDCPP_JOB_SEQ.fetch_add(1, Ordering::Relaxed));
+    let id = format!(
+        "job_stub_vid_{}",
+        SDCPP_JOB_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
@@ -611,7 +652,10 @@ async fn sdcpp_vid_gen(
 async fn sdcpp_img_gen(
     Json(_body): Json<serde_json::Value>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
-    let id = format!("job_stub_img_{}", SDCPP_JOB_SEQ.fetch_add(1, Ordering::Relaxed));
+    let id = format!(
+        "job_stub_img_{}",
+        SDCPP_JOB_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
@@ -633,7 +677,11 @@ async fn sdcpp_job_status(
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    let kind = if id.contains("vid") { "vid_gen" } else { "img_gen" };
+    let kind = if id.contains("vid") {
+        "vid_gen"
+    } else {
+        "img_gen"
+    };
     Json(serde_json::json!({
         "id": id,
         "kind": kind,
@@ -704,9 +752,7 @@ async fn sdcpp_capabilities() -> Json<serde_json::Value> {
     }))
 }
 
-async fn sdapi_txt2img(
-    Json(_body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+async fn sdapi_txt2img(Json(_body): Json<serde_json::Value>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "images": [canned_image_b64()],
         "parameters": {},
@@ -714,9 +760,7 @@ async fn sdapi_txt2img(
     }))
 }
 
-async fn sdapi_img2img(
-    Json(_body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+async fn sdapi_img2img(Json(_body): Json<serde_json::Value>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "images": [canned_image_b64()],
         "parameters": {},

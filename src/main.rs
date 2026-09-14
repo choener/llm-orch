@@ -193,22 +193,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Behind a lock so the reload task can rebuild the watcher when the
     // apikeys path changes on reload.  Dropping the handle stops watching.
     let watch_handle = Arc::new(Mutex::new(None::<watcher::WatchHandle>));
-    *watch_handle.lock().await = match watcher::watch_paths(
-        vec![config_path.clone(), apikeys_path.clone()],
-        reload_tx,
-        Duration::from_secs(2),
-    )
-    .await
-    {
-        Ok(wh) => {
-            info!("watching config and apikeys files for changes");
-            Some(wh)
-        }
-        Err(e) => {
-            warn!("file watcher failed: {}", e);
-            None
-        }
-    };
+    // Watch the config, the apikeys file, and every key file (their
+    // contents feed remote `remote_auth` resolution at request time).
+    let mut watch_paths = vec![config_path.clone(), apikeys_path.clone()];
+    watch_paths.extend(shared_cfg.read().await.key_files.values().cloned());
+    *watch_handle.lock().await =
+        match watcher::watch_paths(watch_paths, reload_tx, Duration::from_secs(2)).await {
+            Ok(wh) => {
+                info!("watching config and apikeys files for changes");
+                Some(wh)
+            }
+            Err(e) => {
+                warn!("file watcher failed: {}", e);
+                None
+            }
+        };
 
     tokio::spawn({
         let cfg = Arc::clone(&shared_cfg);
@@ -221,6 +220,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The apikeys path currently being watched — updated when a
             // config reload points us at a different file.
             let mut watched_apikeys = apikeys_path.clone();
+            // Key file paths currently being watched.
+            let mut watched_keyfiles: Vec<std::path::PathBuf> =
+                cfg.read().await.key_files.values().cloned().collect();
             loop {
                 let event = match reload_rx.recv().await {
                     Ok(event) => event,
@@ -275,25 +277,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => {}
                 }
 
-                // If a config reload changed the apikeys path, rebuild the
-                // watcher to follow the new file (replacing the handle
-                // drops the old watcher).
-                let current_apikeys = cfg.read().await.apikeys_file.clone();
-                if current_apikeys != watched_apikeys {
-                    match watcher::watch_paths(
-                        vec![config_path.clone(), current_apikeys.clone()],
-                        watcher_tx.clone(),
-                        Duration::from_secs(2),
-                    )
+                // A watched key file changed → re-read its contents into
+                // the manager.  The config itself is unchanged, so no
+                // reconcile is needed: `remote_auth` resolves against the
+                // fresh contents at request time.
+                let current_keyfiles = cfg
+                    .read()
                     .await
+                    .key_files
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if let Some(c) = &changed
+                    && current_keyfiles
+                        .iter()
+                        .any(|p| p.canonicalize().ok().as_ref() == Some(c))
+                {
+                    let c = cfg.read().await;
+                    manager.refresh_key_files(&c);
+                }
+
+                // If a config reload changed the apikeys path or the key
+                // file set, rebuild the watcher to follow the new files
+                // (replacing the handle drops the old watcher).
+                let (current_apikeys, current_keyfiles) = {
+                    let c = cfg.read().await;
+                    (
+                        c.apikeys_file.clone(),
+                        c.key_files.values().cloned().collect::<Vec<_>>(),
+                    )
+                };
+                if current_apikeys != watched_apikeys || current_keyfiles != watched_keyfiles {
+                    let mut paths = vec![config_path.clone(), current_apikeys.clone()];
+                    paths.extend(current_keyfiles.clone());
+                    match watcher::watch_paths(paths, watcher_tx.clone(), Duration::from_secs(2))
+                        .await
                     {
                         Ok(wh) => {
                             info!(
-                                "apikeys path changed — now watching {}",
-                                current_apikeys.display()
+                                "watch set changed — now following apikeys {} and {} key file(s)",
+                                current_apikeys.display(),
+                                current_keyfiles.len()
                             );
                             *watch_handle.lock().await = Some(wh);
                             watched_apikeys = current_apikeys;
+                            watched_keyfiles = current_keyfiles;
                         }
                         Err(e) => {
                             warn!("watcher rebuild failed (keeping old watch set): {}", e);

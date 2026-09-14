@@ -386,18 +386,16 @@ pub async fn chat_completions(
                 .and_then(|m| m.debug_log.clone())
         }; // cfg read guard dropped
 
-        // ── 4. Capture instance ID and port. ───────────────────────────────
+        // ── 4. Capture instance ID, backend base, auth. ────────────────────
         let instance_id = {
             let inst = guard.handle().inner().lock().unwrap();
             inst.id.clone()
         }; // inner lock dropped — `guard` itself is still alive
 
-        let port = {
-            let inst = guard.handle().inner().lock().unwrap();
-            inst.port
-        }; // inner lock dropped — `guard` itself is still alive
+        let base = guard.handle().backend_base();
+        let auth = state.manager.resolve_auth(guard.handle());
 
-        let backend_url = format!("http://127.0.0.1:{}/v1/chat/completions", port);
+        let backend_url = format!("{base}/v1/chat/completions");
 
         // ── 5. Forward the request. ─────────────────────────────────────────
         // Forward the *resolved* model name to the backend, not the alias —
@@ -443,6 +441,7 @@ pub async fn chat_completions(
                 state.client.clone(),
                 backend_url,
                 request_body,
+                auth.clone(),
                 guard,
                 model_name.clone(),
                 instance_id.clone(),
@@ -463,6 +462,7 @@ pub async fn chat_completions(
                 &state.client,
                 &backend_url,
                 &request_body,
+                &auth,
                 total_timeout,
             )
             .await?;
@@ -693,12 +693,10 @@ pub async fn responses(
             inst.id.clone()
         }; // inner lock dropped — `guard` itself is still alive
 
-        let port = {
-            let inst = guard.handle().inner().lock().unwrap();
-            inst.port
-        }; // inner lock dropped
+        let base = guard.handle().backend_base();
+        let auth = state.manager.resolve_auth(guard.handle());
 
-        let backend_url = format!("http://127.0.0.1:{}/v1/responses", port);
+        let backend_url = format!("{base}/v1/responses");
 
         // ── 5. Forward the *resolved* model name to the backend, not the
         //    alias — strict backends validate the model field. ───────────────
@@ -742,6 +740,7 @@ pub async fn responses(
                 state.client.clone(),
                 backend_url,
                 request,
+                auth.clone(),
                 guard,
                 model_name.clone(),
                 instance_id.clone(),
@@ -758,9 +757,14 @@ pub async fn responses(
         } else {
             // Non-streaming mode: aggregate the backend response.
             let t0 = std::time::Instant::now();
-            let response_body =
-                forward_request_aggregate(&state.client, &backend_url, &request, total_timeout)
-                    .await?;
+            let response_body = forward_request_aggregate(
+                &state.client,
+                &backend_url,
+                &request,
+                &auth,
+                total_timeout,
+            )
+            .await?;
             let elapsed = t0.elapsed();
 
             // Debug log: response.
@@ -904,13 +908,11 @@ pub async fn responses_input_tokens(
             inst.id.clone()
         };
 
-        // ── 4. Read port. ───────────────────────────────────────────────────
-        let port = {
-            let inst = guard.handle().inner().lock().unwrap();
-            inst.port
-        };
+        // ── 4. Read backend base + auth. ────────────────────────────────────
+        let base = guard.handle().backend_base();
+        let auth = state.manager.resolve_auth(guard.handle());
 
-        let backend_url = format!("http://127.0.0.1:{}/v1/responses/input_tokens", port);
+        let backend_url = format!("{base}/v1/responses/input_tokens");
 
         // Forward the *resolved* model name to the backend, not the alias.
         request["model"] = serde_json::Value::String(model_name.clone());
@@ -938,7 +940,8 @@ pub async fn responses_input_tokens(
         // ── 5. Forward request, aggregate, release. ─────────────────────────
         let t0 = std::time::Instant::now();
         let response_body =
-            forward_request_aggregate(&state.client, &backend_url, &request, total_timeout).await?;
+            forward_request_aggregate(&state.client, &backend_url, &request, &auth, total_timeout)
+                .await?;
         let elapsed = t0.elapsed();
 
         // Debug log: response.
@@ -1114,13 +1117,11 @@ pub async fn completions(
             inst.id.clone()
         };
 
-        // ── 4. Read port. ──────────────────────────────────────────────────
-        let port = {
-            let inst = guard.handle().inner().lock().unwrap();
-            inst.port
-        };
+        // ── 4. Read backend base + auth. ────────────────────────────────────
+        let base = guard.handle().backend_base();
+        let auth = state.manager.resolve_auth(guard.handle());
 
-        let backend_url = format!("http://127.0.0.1:{}/v1/completions", port);
+        let backend_url = format!("{base}/v1/completions");
 
         // ── 5. Forward request. ─────────────────────────────────────────────
         // Forward the *resolved* model name to the backend, not the alias.
@@ -1131,6 +1132,7 @@ pub async fn completions(
                 state.client.clone(),
                 backend_url,
                 serde_json::to_value(&request).unwrap_or_default(),
+                auth.clone(),
                 guard,
                 model_name.clone(),
                 instance_id.clone(),
@@ -1150,6 +1152,7 @@ pub async fn completions(
                 &state.client,
                 &backend_url,
                 &serde_json::to_value(&request).unwrap_or_default(),
+                &auth,
                 total_timeout,
             )
             .await?;
@@ -1217,13 +1220,11 @@ pub async fn embeddings(
         // Forward the *resolved* model name to the backend, not the alias.
         request.model = model_name.clone();
 
-        // ── 4. Read port. ──────────────────────────────────────────────────
-        let port = {
-            let inst = guard.handle().inner().lock().unwrap();
-            inst.port
-        };
+        // ── 4. Read backend base + auth. ────────────────────────────────────
+        let base = guard.handle().backend_base();
+        let auth = state.manager.resolve_auth(guard.handle());
 
-        let backend_url = format!("http://127.0.0.1:{}/v1/embeddings", port);
+        let backend_url = format!("{base}/v1/embeddings");
 
         // ── 5. Forward request, aggregate, release. ────────────────────────
         let t0 = std::time::Instant::now();
@@ -1231,6 +1232,7 @@ pub async fn embeddings(
             &state.client,
             &backend_url,
             &serde_json::to_value(&request).unwrap_or_default(),
+            &auth,
             total_timeout,
         )
         .await
@@ -1332,13 +1334,11 @@ pub async fn rerank(
             inst.id.clone()
         };
 
-        // ── 4. Read port. ──────────────────────────────────────────────────
-        let port = {
-            let inst = guard.handle().inner().lock().unwrap();
-            inst.port
-        };
+        // ── 4. Read backend base + auth. ────────────────────────────────────
+        let base = guard.handle().backend_base();
+        let auth = state.manager.resolve_auth(guard.handle());
 
-        let backend_url = format!("http://127.0.0.1:{}/v1/rerank", port);
+        let backend_url = format!("{base}/v1/rerank");
 
         // ── 5. Forward request, aggregate, release. ────────────────────────
         let request_body = serde_json::to_value(&request).unwrap_or_default();
@@ -1364,13 +1364,18 @@ pub async fn rerank(
         }
 
         let t0 = std::time::Instant::now();
-        let response_body =
-            forward_request_aggregate(&state.client, &backend_url, &request_body, total_timeout)
-                .await
-                .map_err(|e| {
-                    warn!("rerank backend request failed: {}", e);
-                    e
-                })?;
+        let response_body = forward_request_aggregate(
+            &state.client,
+            &backend_url,
+            &request_body,
+            &auth,
+            total_timeout,
+        )
+        .await
+        .map_err(|e| {
+            warn!("rerank backend request failed: {}", e);
+            e
+        })?;
         let elapsed = t0.elapsed();
 
         // Debug log: response.
@@ -1459,7 +1464,10 @@ struct AudioTarget {
     model_name: String,
     /// Model name as the client sent it (for logging / debug log alias).
     request_model: String,
-    port: u16,
+    /// Backend base (`http://127.0.0.1:{port}` or the remote base URL).
+    base: String,
+    /// Resolved `remote_auth` (remote models), if configured.
+    auth: Option<String>,
     instance_id: String,
     guard: SlotGuard,
     idle_timeout: std::time::Duration,
@@ -1548,14 +1556,17 @@ async fn build_audio_target(
             .find(|m| m.name == model_name)
             .and_then(|m| m.debug_log.clone())
     };
-    let (port, instance_id) = {
+    let base = guard.handle().backend_base();
+    let auth = state.manager.resolve_auth(guard.handle());
+    let instance_id = {
         let inst = guard.handle().inner().lock().unwrap();
-        (inst.port, inst.id.clone())
+        inst.id.clone()
     };
     Ok(AudioTarget {
         model_name,
         request_model: request_model.to_owned(),
-        port,
+        base,
+        auth,
         instance_id,
         guard,
         idle_timeout,
@@ -1610,7 +1621,7 @@ async fn forward_audio_post(
     request_id: &str,
     api_user: &str,
 ) -> Result<Response, ApiError> {
-    let backend_url = format!("http://127.0.0.1:{}{}", target.port, path);
+    let backend_url = format!("{}{}", target.base, path);
 
     // Debug log: request.  JSON bodies are logged verbatim; anything else
     // (multipart with embedded audio) is logged as metadata only.
@@ -1641,12 +1652,15 @@ async fn forward_audio_post(
         );
     }
 
-    let send = state
-        .client
-        .post(&backend_url)
-        .header(header::CONTENT_TYPE, content_type)
-        .body(body)
-        .send();
+    let send = with_auth(
+        state
+            .client
+            .post(&backend_url)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(body),
+        &target.auth,
+    )
+    .send();
     // The idle timeout also bounds the wait for the first response
     // headers — a hung backend must not hold the slot while silent.
     let resp = if target.idle_timeout.is_zero() {
@@ -1969,11 +1983,11 @@ pub async fn audio_voices(
         let admission = acquire_audio_target(&state, &request_model, &request_id).await?;
         let target = finish_audio_admission(&state, &request_model, admission).await?;
         let backend_url = format!(
-            "http://127.0.0.1:{}/v1/audio/voices?model={}",
-            target.port,
+            "{}/v1/audio/voices?model={}",
+            target.base,
             urlencoding_simple(&target.model_name),
         );
-        let send = state.client.get(&backend_url).send();
+        let send = with_auth(state.client.get(&backend_url), &target.auth).send();
         let resp = if target.total_timeout.is_zero() {
             send.await
         } else {
@@ -2017,7 +2031,10 @@ pub async fn audio_voices(
 struct DiffusionTarget {
     model_name: String,
     request_model: String,
-    port: u16,
+    /// Backend base (`http://127.0.0.1:{port}` or the remote base URL).
+    base: String,
+    /// Resolved `remote_auth` (remote models), if configured.
+    auth: Option<String>,
     instance_id: String,
     /// Keeps the instance slot held for the duration of the request —
     /// never read directly, but dropping it would free the instance mid-
@@ -2092,14 +2109,17 @@ async fn build_diffusion_target(
             .find(|m| m.name == model_name)
             .and_then(|m| m.debug_log.clone())
     };
-    let (port, instance_id) = {
+    let base = guard.handle().backend_base();
+    let auth = state.manager.resolve_auth(guard.handle());
+    let instance_id = {
         let inst = guard.handle().inner().lock().unwrap();
-        (inst.port, inst.id.clone())
+        inst.id.clone()
     };
     Ok(DiffusionTarget {
         model_name,
         request_model: request_model.to_owned(),
-        port,
+        base,
+        auth,
         instance_id,
         guard,
         total_timeout,
@@ -2120,12 +2140,11 @@ async fn forward_diffusion_json(
     request_id: &str,
     _api_user: &str,
 ) -> Result<Response, ApiError> {
-    let backend_url = format!("http://127.0.0.1:{}{}", target.port, path);
+    let backend_url = format!("{}{}", target.base, path);
 
     // Debug log: request body as JSON
     if let Some(ref log_path) = target.debug_log_path {
-        let debug_body: Option<serde_json::Value> =
-            serde_json::from_slice(&body).ok();
+        let debug_body: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
         state.debug_loggers.write_line(
             log_path,
             &DebugLogEntry {
@@ -2144,12 +2163,15 @@ async fn forward_diffusion_json(
         );
     }
 
-    let send = state
-        .client
-        .post(&backend_url)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .send();
+    let send = with_auth(
+        state
+            .client
+            .post(&backend_url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body),
+        &target.auth,
+    )
+    .send();
 
     let resp = if target.total_timeout.is_zero() {
         send.await
@@ -2195,7 +2217,15 @@ async fn forward_diffusion_json(
                 })),
                 usage: None,
                 duration_ms: None,
-                error: if status.is_success() { None } else { Some(format!("backend {}: {}", status.as_u16(), String::from_utf8_lossy(&bytes))) },
+                error: if status.is_success() {
+                    None
+                } else {
+                    Some(format!(
+                        "backend {}: {}",
+                        status.as_u16(),
+                        String::from_utf8_lossy(&bytes)
+                    ))
+                },
             },
         );
     }
@@ -2232,8 +2262,7 @@ pub async fn images_generations(
         .as_deref()
         .ok_or_else(|| ApiError::BadRequest("missing 'model' field".into()))?
         .to_owned();
-    let target =
-        acquire_diffusion_target(&state, &request_model, &request_id).await?;
+    let target = acquire_diffusion_target(&state, &request_model, &request_id).await?;
 
     // Build the body to forward to sd-server.
     // Start from the known fields, then merge in the extra fields.
@@ -2251,8 +2280,7 @@ pub async fn images_generations(
         forward_body[k] = v.clone();
     }
     // Rewrite `model` to the resolved name for logging/debugging.
-    forward_body["model"] =
-        serde_json::Value::String(target.model_name.clone());
+    forward_body["model"] = serde_json::Value::String(target.model_name.clone());
 
     let bytes = serde_json::to_vec(&forward_body)
         .map_err(|e| ApiError::BadRequest(format!("serialization error: {}", e)))?;
@@ -2300,12 +2328,10 @@ pub async fn images_edits(
         })
         .ok_or_else(|| ApiError::BadRequest("missing 'model' field in multipart body".into()))?;
 
-    let target =
-        acquire_diffusion_target(&state, &request_model, &request_id).await?;
+    let target = acquire_diffusion_target(&state, &request_model, &request_id).await?;
 
     // Rewrite the model field in the multipart body to the resolved name.
-    let forwarded_body =
-        rewrite_multipart_field(&body, &boundary, "model", &target.model_name);
+    let forwarded_body = rewrite_multipart_field(&body, &boundary, "model", &target.model_name);
 
     forward_diffusion_post_raw(
         &state,
@@ -2332,14 +2358,17 @@ async fn forward_diffusion_post_raw(
     _request_id: &str,
     _api_user: &str,
 ) -> Result<Response, ApiError> {
-    let backend_url = format!("http://127.0.0.1:{}{}", target.port, path);
+    let backend_url = format!("{}{}", target.base, path);
 
-    let send = state
-        .client
-        .post(&backend_url)
-        .header(header::CONTENT_TYPE, content_type)
-        .body(body)
-        .send();
+    let send = with_auth(
+        state
+            .client
+            .post(&backend_url)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(body),
+        &target.auth,
+    )
+    .send();
 
     let resp = if target.total_timeout.is_zero() {
         send.await
@@ -2401,8 +2430,7 @@ pub async fn video_generations(
         .as_deref()
         .ok_or_else(|| ApiError::BadRequest("missing 'model' field".into()))?
         .to_owned();
-    let target =
-        acquire_diffusion_target(&state, &request_model, &request_id).await?;
+    let target = acquire_diffusion_target(&state, &request_model, &request_id).await?;
 
     // Build the body for sd-server's /sdcpp/v1/vid_gen.
     let mut forward_body = serde_json::json!({
@@ -2432,18 +2460,20 @@ pub async fn video_generations(
     let bytes = serde_json::to_vec(&forward_body)
         .map_err(|e| ApiError::BadRequest(format!("serialization error: {}", e)))?;
 
-    let backend_url =
-        format!("http://127.0.0.1:{}/sdcpp/v1/vid_gen", target.port);
+    let backend_url = format!("{}/sdcpp/v1/vid_gen", target.base);
 
     // Submit the video job.
-    let submit_resp = state
-        .client
-        .post(&backend_url)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(bytes)
-        .send()
-        .await
-        .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
+    let submit_resp = with_auth(
+        state
+            .client
+            .post(&backend_url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(bytes),
+        &target.auth,
+    )
+    .send()
+    .await
+    .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
 
     let submit_status = submit_resp.status();
     let submit_body: serde_json::Value = submit_resp
@@ -2465,7 +2495,7 @@ pub async fn video_generations(
         .ok_or_else(|| ApiError::Internal("no job id in submit response".into()))?;
 
     // Poll until completed or timeout.
-    let poll_base = format!("http://127.0.0.1:{}/sdcpp/v1/jobs/{}", target.port, job_id);
+    let poll_base = format!("{}/sdcpp/v1/jobs/{}", target.base, job_id);
     let deadline = tokio::time::Instant::now() + target.total_timeout;
     let mut delay = std::time::Duration::from_millis(500);
 
@@ -2479,9 +2509,7 @@ pub async fn video_generations(
         tokio::time::sleep(delay).await;
         delay = std::cmp::min(delay * 2, std::time::Duration::from_secs(5));
 
-        let poll_resp = state
-            .client
-            .get(&poll_base)
+        let poll_resp = with_auth(state.client.get(&poll_base), &target.auth)
             .send()
             .await
             .map_err(|e| ApiError::Internal(format!("poll failed: {}", e)))?;
@@ -2495,9 +2523,7 @@ pub async fn video_generations(
             return Err(ApiError::Internal("video job not found".into()));
         }
 
-        let job_status = poll_body["status"]
-            .as_str()
-            .unwrap_or("unknown");
+        let job_status = poll_body["status"].as_str().unwrap_or("unknown");
         match job_status {
             "completed" => {
                 // Extract the result payload.
@@ -2528,7 +2554,10 @@ pub async fn video_generations(
                     .as_object()
                     .map(|e| format!("{}", serde_json::json!(e)))
                     .unwrap_or_else(|| "unknown error".into());
-                return Err(ApiError::Internal(format!("video generation failed: {}", err)));
+                return Err(ApiError::Internal(format!(
+                    "video generation failed: {}",
+                    err
+                )));
             }
             "cancelled" => {
                 return Err(ApiError::Internal("video generation cancelled".into()));
@@ -2555,7 +2584,8 @@ async fn acquire_passthrough_target(
 ) -> Result<DiffusionTarget, ApiError> {
     let request_model = {
         // Check for explicit header override.
-        if let Some(h) = headers.get("x-llm-model")
+        if let Some(h) = headers
+            .get("x-llm-model")
             .and_then(|v| v.to_str().ok())
             .filter(|s| !s.is_empty())
         {
@@ -2646,12 +2676,9 @@ pub async fn passthrough_sdcpp_get(
 ) -> Result<Response, ApiError> {
     let request_id = uuid::Uuid::new_v4().to_string();
     let target = acquire_passthrough_target(&state, &headers, &request_id).await?;
-    let backend_url =
-        format!("http://127.0.0.1:{}/sdcpp/v1/{}", target.port, path);
+    let backend_url = format!("{}/sdcpp/v1/{}", target.base, path);
 
-    let resp = state
-        .client
-        .get(&backend_url)
+    let resp = with_auth(state.client.get(&backend_url), &target.auth)
         .send()
         .await
         .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
@@ -3022,6 +3049,15 @@ fn log_completion(
 
 // ── Backend forwarding ───────────────────────────────────────────────────────
 
+/// Attach the resolved `Authorization` header (remote models with
+/// `remote_auth`) to a backend request builder.
+fn with_auth(builder: reqwest::RequestBuilder, auth: &Option<String>) -> reqwest::RequestBuilder {
+    match auth {
+        Some(value) => builder.header(header::AUTHORIZATION, value),
+        None => builder,
+    }
+}
+
 /// Forward a request to a backend and aggregate the full response.
 ///
 /// `total_timeout` bounds the whole exchange (request + full body): a
@@ -3031,12 +3067,11 @@ async fn forward_request_aggregate(
     client: &reqwest::Client,
     backend_url: &str,
     body: &serde_json::Value,
+    auth: &Option<String>,
     total_timeout: std::time::Duration,
 ) -> Result<serde_json::Value, ApiError> {
     let work = async {
-        let resp = client
-            .post(backend_url)
-            .json(body)
+        let resp = with_auth(client.post(backend_url).json(body), auth)
             .send()
             .await
             .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
@@ -3087,6 +3122,7 @@ async fn build_sse_stream(
     client: reqwest::Client,
     backend_url: String,
     body: serde_json::Value,
+    auth: Option<String>,
     guard: SlotGuard,
     model_name: String,
     instance_id: String,
@@ -3098,7 +3134,7 @@ async fn build_sse_stream(
 ) -> Result<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>, reqwest::Error> {
     // The idle timeout also bounds the wait for the first response
     // headers — a hung backend must not hold the slot while silent.
-    let send = client.post(&backend_url).json(&body).send();
+    let send = with_auth(client.post(&backend_url).json(&body), &auth).send();
     let resp = if idle_timeout.is_zero() {
         send.await?
     } else {
@@ -3486,9 +3522,11 @@ async fn build_assigned_sse_stream(
     } else {
         None
     };
-    let (port, instance_id) = {
+    let base = guard.handle().backend_base();
+    let auth = state.manager.resolve_auth(guard.handle());
+    let instance_id = {
         let instance = guard.handle().inner().lock().unwrap();
-        (instance.port, instance.id.clone())
+        instance.id.clone()
     };
     if let Some(ref path) = debug_log_path {
         state.debug_loggers.write_line(
@@ -3508,7 +3546,7 @@ async fn build_assigned_sse_stream(
             },
         );
     }
-    let backend_url = format!("http://127.0.0.1:{port}{backend_path}");
+    let backend_url = format!("{base}{backend_path}");
     let debug = debug_log_path.map(|path| DebugStreamContext {
         loggers: state.debug_loggers.clone(),
         path,
@@ -3522,6 +3560,7 @@ async fn build_assigned_sse_stream(
         state.client.clone(),
         backend_url,
         request_body,
+        auth,
         guard,
         model_name,
         instance_id,
@@ -4270,6 +4309,7 @@ true\r\n\
             &client,
             &url,
             &serde_json::json!({"model": "m"}),
+            &None,
             std::time::Duration::from_millis(200),
         )
         .await

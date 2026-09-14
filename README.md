@@ -71,6 +71,27 @@ In `config.yaml`, each model definition controls its lifecycle:
 - `vulkan_devices`, `cuda_devices`, or `rocm_devices`: The pool of backend GPU indices this model is allowed to use. These namespaces are mutually exclusive per model. Two forms are accepted: a flat pool (`[0, 1]`, each instance spans `gpus` devices chosen from it) or explicit placement alternatives (`[[0],[1]]` = single-GPU, either one; `[[0,1]]` = dual-GPU, using both; `gpus` must stay 1).
 - **Speculative decoding**: when a model's `cmd` enables draft-model speculation (a draft-model flag like `--spec-draft-model`/`-md`, or `--spec-type draft-simple|draft-eagle3|draft-mtp`, including internal MTP heads), llm-orch pins the draft context to the same device(s) as the instance by appending `--spec-draft-device VulkanN,…` (CUDA/ROCm prefixes for those namespaces) at spawn — llama.cpp would otherwise run it on the process-default backend (not the model's pinned device), which can OOM against the loaded model. Self-speculative `ngram-*` types are never touched. An explicit `--spec-draft-device`/`--device-draft`/`-devd` or `--spec-draft-ngl 0` in `cmd` is always respected.
 
+### Remote models (http/s endpoints)
+A model whose `cmd` is an `http://` or `https://` URL is automatically detected as a **remote** model — a pure passthrough to an already-running backend (llama-server, vLLM, …) on another host. No process is spawned and no port or GPU is allocated: the first request health-probes `GET {cmd}/health` (10 s budget) and registers the endpoint as a single passthrough instance.
+
+```yaml
+key_files:                       # {name} → file contents, for remote_auth
+  deploy_key: /etc/llm-orch/keys/deploy.key
+models:
+  - name: remote-qwen
+    context_length: 32768
+    cmd: "https://gpu-host.example.com:8080"   # no {port} — none is allocated
+    remote_auth: "Bearer {deploy_key}"          # sent as the Authorization header
+    max_concurrent: 8
+```
+
+Lifecycle differences vs. local models:
+
+- `autoscale` is a config error (there is nothing to spawn or despawn); device pools, `vram`, and `gpus > 1` are rejected the same way.
+- The instance is never idle-evicted and nothing is killed on config reload or shutdown — there is no local process. A down endpoint simply fails its probe; the model is **not** blocked, and the next request re-probes, so the model recovers without operator intervention.
+- `remote_auth` placeholders resolve against `key_files` **at request time**: rotating the key file (or hot-reloading the config) applies immediately, no instance replacement needed. Files are watched; contents are re-read on file change, config reload, and startup.
+- EMA load/latency metrics work as usual (in-flight + queued request counts).
+
 ### Autoscaling
 
 Per-model load-based autoscaling adjusts the number of parallel instances of a

@@ -30,6 +30,13 @@ pub struct Config {
     #[serde(default)]
     pub cmd_aliases: HashMap<String, String>,
 
+    /// Named files whose *contents* are substituted as `{name}`
+    /// placeholders in `remote_auth` fields.  Typical use: bearer tokens
+    /// or API keys for remote http(s) endpoints.  Files are re-read on
+    /// config hot-reload and when the files themselves change.
+    #[serde(default)]
+    pub key_files: HashMap<String, PathBuf>,
+
     #[serde(default)]
     pub models: Vec<ModelConfig>,
 
@@ -111,6 +118,56 @@ impl Config {
             if m.max_concurrent == 0 {
                 return Err(ConfigError::Validation(format!(
                     "model '{}': max_concurrent must be > 0 (0 would reject every request)",
+                    m.name
+                )));
+            }
+            // --- remote http(s) models ---
+            // A remote model is a pure passthrough target: no local
+            // process, no GPU placement, no lifecycle to scale or unload.
+            if m.is_remote(&self.cmd_aliases) {
+                if m.autoscale.is_some() {
+                    return Err(ConfigError::Validation(format!(
+                        "model '{}': autoscale is not supported for remote models (there is no local instance to spawn or despawn)",
+                        m.name
+                    )));
+                }
+                if !m.vulkan_devices.is_empty()
+                    || !m.cuda_devices.is_empty()
+                    || !m.rocm_devices.is_empty()
+                {
+                    return Err(ConfigError::Validation(format!(
+                        "model '{}': remote models must not declare a device pool (vulkan_devices/cuda_devices/rocm_devices) — there is no local process to pin",
+                        m.name
+                    )));
+                }
+                if m.vram > 0 {
+                    return Err(ConfigError::Validation(format!(
+                        "model '{}': remote models must not declare vram ({} MB) — there is no local process to account for",
+                        m.name, m.vram
+                    )));
+                }
+                if m.gpus != 1 {
+                    return Err(ConfigError::Validation(format!(
+                        "model '{}': remote models must use gpus: 1 (got {})",
+                        m.name, m.gpus
+                    )));
+                }
+                let resolved = resolve_model_cmd(&self.cmd_aliases, m, 0);
+                if resolved.contains("{port}") {
+                    return Err(ConfigError::Validation(format!(
+                        "model '{}': remote base URL must not contain {{port}} (no port is allocated for remote endpoints)",
+                        m.name
+                    )));
+                }
+                if m.remote_auth.as_ref().is_some_and(|a| a.trim().is_empty()) {
+                    return Err(ConfigError::Validation(format!(
+                        "model '{}': remote_auth must not be empty",
+                        m.name
+                    )));
+                }
+            } else if m.remote_auth.is_some() {
+                return Err(ConfigError::Validation(format!(
+                    "model '{}': remote_auth is only valid for remote (http(s) cmd) models",
                     m.name
                 )));
             }
@@ -273,6 +330,30 @@ impl Config {
                 return Err(ConfigError::Validation(format!(
                     "cmd_aliases: '{}' is a reserved name",
                     reserved
+                )));
+            }
+        }
+
+        // --- key_files ---
+        // Names feed `{name}` substitution in `remote_auth`; the runtime
+        // placeholder names stay reserved so a key file can never shadow
+        // a `{port}`-style placeholder, and every file must exist so a
+        // typo fails at load / --check-config instead of silently sending
+        // a broken Authorization header.
+        for reserved in ["port", "context_length", "max_concurrent", "name"] {
+            if self.key_files.contains_key(reserved) {
+                return Err(ConfigError::Validation(format!(
+                    "key_files: '{}' is a reserved name",
+                    reserved
+                )));
+            }
+        }
+        for (name, path) in &self.key_files {
+            if !path.exists() {
+                return Err(ConfigError::Validation(format!(
+                    "key_files: file for '{}' does not exist: {}",
+                    name,
+                    path.display()
                 )));
             }
         }
@@ -825,7 +906,19 @@ pub struct ModelConfig {
     /// time; `{port}` is replaced with the allocated port number,
     /// `{context_length}` with the model's declared `context_length`, and
     /// `{max_concurrent}` with the model's declared `max_concurrent`.
+    ///
+    /// For remote models (see [`ModelConfig::is_remote`]) this is the
+    /// endpoint's base URL (`http://host:port` or `https://host:port`);
+    /// the `{port}` placeholder is not available there.
     pub cmd: String,
+
+    /// Authorization header value for remote models, e.g.
+    /// `"Bearer {deploy_key}"` where `{deploy_key}` comes from
+    /// [`Config::key_files`].  Sent as the `Authorization` header on
+    /// every forwarded request.  Ignored for local (process/container)
+    /// models.
+    #[serde(default)]
+    pub remote_auth: Option<String>,
 
     /// Vulkan devices this model can be placed on (from `devices.vulkan`).
     /// Empty = CPU only (unless `cuda_devices` or `rocm_devices` is set).
@@ -925,11 +1018,28 @@ pub fn resolve_model_cmd(
         let placeholder = format!("{{{}}}", key);
         resolved = resolved.replace(&placeholder, value);
     }
-    resolved
-        .replace("{port}", &port.to_string())
-        .replace("{context_length}", &cfg.context_length.to_string())
-        .replace("{max_concurrent}", &cfg.max_concurrent.to_string())
-        .replace("{name}", &cfg.name)
+    // Mirror `runner()`'s remote detection (first token after alias
+    // substitution) *without* calling it — `runner` itself resolves `cmd`,
+    // so an `is_remote` call here would recurse.
+    let is_remote = resolved
+        .split_whitespace()
+        .next()
+        .is_some_and(|prog| prog.starts_with("http://") || prog.starts_with("https://"));
+    if is_remote {
+        // Remote base URLs never receive a locally allocated port; leaving
+        // a literal `{port}` would corrupt the URL, so it is rejected at
+        // validation and simply not substituted here.
+        resolved
+            .replace("{context_length}", &cfg.context_length.to_string())
+            .replace("{max_concurrent}", &cfg.max_concurrent.to_string())
+            .replace("{name}", &cfg.name)
+    } else {
+        resolved
+            .replace("{port}", &port.to_string())
+            .replace("{context_length}", &cfg.context_length.to_string())
+            .replace("{max_concurrent}", &cfg.max_concurrent.to_string())
+            .replace("{name}", &cfg.name)
+    }
 }
 
 /// Detect an operator-declared device selector in a model's resolved
@@ -1009,6 +1119,33 @@ fn cpu_cmd_offload_decl(cmd_aliases: &HashMap<String, String>, m: &ModelConfig) 
     }
 }
 
+/// Read every configured `key_files` entry and return `name → trimmed
+/// contents`.  A single unreadable file fails the whole load — callers
+/// that keep previous state on error (hot-reload) map the error to a
+/// warning and keep the old values.
+pub fn load_key_files(
+    key_files: &HashMap<String, PathBuf>,
+) -> Result<HashMap<String, String>, ConfigError> {
+    let mut out = HashMap::with_capacity(key_files.len());
+    for (name, path) in key_files {
+        let contents = std::fs::read_to_string(path)?;
+        out.insert(name.clone(), contents.trim().to_string());
+    }
+    Ok(out)
+}
+
+/// Substitute `{name}` placeholders from `key_files` into a `remote_auth`
+/// template.  Unknown placeholders are left as-is (the operator will see
+/// the resulting 401 from the remote endpoint) rather than failing the
+/// request, so one stale key can never break otherwise-working auth.
+pub fn resolve_remote_auth(key_files: &HashMap<String, String>, template: &str) -> String {
+    let mut resolved = template.to_string();
+    for (name, value) in key_files {
+        resolved = resolved.replace(&format!("{{{name}}}"), value);
+    }
+    resolved
+}
+
 fn default_context_length() -> usize {
     4096
 }
@@ -1042,6 +1179,10 @@ pub enum Runner {
     Process,
     /// Podman container (`podman run --rm …` lifecycle).
     Container,
+    /// Remote http(s) endpoint — no local process; requests are forwarded
+    /// to the URL in `cmd` (optionally with an `Authorization` header from
+    /// `remote_auth`).
+    Remote,
 }
 
 impl ModelConfig {
@@ -1053,11 +1194,19 @@ impl ModelConfig {
         let resolved = resolve_model_cmd(cmd_aliases, self, 0);
         let prog = resolved.split_whitespace().next().unwrap_or("");
         let basename = prog.rsplit('/').next().unwrap_or(prog);
-        if basename == "podman" {
+        if prog.starts_with("http://") || prog.starts_with("https://") {
+            Runner::Remote
+        } else if basename == "podman" {
             Runner::Container
         } else {
             Runner::Process
         }
+    }
+
+    /// Whether the model targets a remote http(s) endpoint instead of a
+    /// locally spawned process/container.
+    pub fn is_remote(&self, cmd_aliases: &HashMap<String, String>) -> bool {
+        self.runner(cmd_aliases) == Runner::Remote
     }
 }
 
@@ -2227,10 +2376,7 @@ models:
             cmd: "podman run --rm some-image".into(),
             ..ModelConfig::default_for_tests()
         };
-        assert_eq!(
-            cfg.runner(&HashMap::new()),
-            Runner::Container
-        );
+        assert_eq!(cfg.runner(&HashMap::new()), Runner::Container);
     }
 
     #[test]
@@ -2240,10 +2386,7 @@ models:
             cmd: "/usr/bin/podman run --rm some-image".into(),
             ..ModelConfig::default_for_tests()
         };
-        assert_eq!(
-            cfg.runner(&HashMap::new()),
-            Runner::Container
-        );
+        assert_eq!(cfg.runner(&HashMap::new()), Runner::Container);
     }
 
     #[test]
@@ -2253,10 +2396,7 @@ models:
             cmd: "llama-server --model m.gguf".into(),
             ..ModelConfig::default_for_tests()
         };
-        assert_eq!(
-            cfg.runner(&HashMap::new()),
-            Runner::Process
-        );
+        assert_eq!(cfg.runner(&HashMap::new()), Runner::Process);
     }
 
     #[test]
@@ -2268,10 +2408,7 @@ models:
         };
         let mut aliases = HashMap::new();
         aliases.insert("podman".into(), "podman".into());
-        assert_eq!(
-            cfg.runner(&aliases),
-            Runner::Container
-        );
+        assert_eq!(cfg.runner(&aliases), Runner::Container);
     }
 
     // ── Container model validation ────────────────────────────────────
@@ -2352,7 +2489,178 @@ models:
                 debug_log: None,
                 autoscale: None,
                 spawn_timeout_secs: None,
+                remote_auth: None,
             }
         }
+    }
+
+    // ── Remote models ─────────────────────────────────────────────────
+
+    fn remote_yaml(extra: &str) -> String {
+        let mut s = String::from(
+            r#"
+server: {}
+apikeys_file: apikeys.txt
+models:
+  - name: r
+    cmd: "https://remote.example.com:8080"
+"#,
+        );
+        if !extra.is_empty() {
+            s.push_str("    ");
+            s.push_str(extra);
+            s.push('\n');
+        }
+        s
+    }
+
+    #[test]
+    fn detects_remote_runner() {
+        let cfg = parse(
+            r#"
+server: {}
+apikeys_file: apikeys.txt
+models:
+  - name: r
+    cmd: "https://remote.example.com:8080"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.models[0].runner(&cfg.cmd_aliases), Runner::Remote);
+        assert!(cfg.models[0].is_remote(&cfg.cmd_aliases));
+    }
+
+    #[test]
+    fn local_runner_unaffected_by_remote_detection() {
+        let cfg = parse(BASE).unwrap();
+        assert_eq!(cfg.models[0].runner(&cfg.cmd_aliases), Runner::Process);
+    }
+
+    #[test]
+    fn remote_model_is_valid() {
+        parse(&remote_yaml("")).unwrap();
+    }
+
+    #[test]
+    fn remote_model_with_auth_and_key_files_is_valid() {
+        let dir = std::env::temp_dir().join(format!("llm-orch-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_path = dir.join("deploy.key");
+        std::fs::write(&key_path, "sekret-token\n").unwrap();
+        let yaml = r#"
+server: {}
+apikeys_file: apikeys.txt
+key_files:
+  deploy_key: __KEY_PATH__
+models:
+  - name: r
+    cmd: "https://remote.example.com:8080"
+    remote_auth: "Bearer {deploy_key}"
+"#
+        .replace("__KEY_PATH__", &key_path.display().to_string());
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.key_files.len(), 1);
+        let loaded = load_key_files(&cfg.key_files).unwrap();
+        assert_eq!(loaded.get("deploy_key").unwrap(), "sekret-token");
+        let auth = resolve_remote_auth(&loaded, cfg.models[0].remote_auth.as_ref().unwrap());
+        assert_eq!(auth, "Bearer sekret-token");
+        std::fs::remove_file(&key_path).ok();
+    }
+
+    #[test]
+    fn rejects_remote_model_with_autoscale() {
+        let yaml = remote_yaml(
+            "autoscale:\n      enabled: false\n      scale_up_at: 4\n      scale_down_at: 2",
+        );
+        expect_validation_error(&yaml, "autoscale is not supported for remote models");
+    }
+
+    #[test]
+    fn rejects_remote_model_with_device_pool() {
+        let yaml = remote_yaml("vulkan_devices: [0]");
+        expect_validation_error(&yaml, "must not declare a device pool");
+    }
+
+    #[test]
+    fn rejects_remote_model_with_vram() {
+        let yaml = remote_yaml("vram: 24000");
+        expect_validation_error(&yaml, "must not declare vram");
+    }
+
+    #[test]
+    fn rejects_remote_model_with_gpus_over_one() {
+        let yaml = remote_yaml("gpus: 2");
+        expect_validation_error(&yaml, "must use gpus: 1");
+    }
+
+    #[test]
+    fn rejects_remote_cmd_with_port_placeholder() {
+        let yaml = remote_yaml("").replace(
+            "https://remote.example.com:8080",
+            "https://remote.example.com:{port}",
+        );
+        expect_validation_error(&yaml, "must not contain {port}");
+    }
+
+    #[test]
+    fn remote_auth_placeholder_not_substituted_as_port() {
+        // `resolve_model_cmd` must leave remote URLs untouched by the
+        // marker port and substitute key-independent placeholders only.
+        let cfg = parse(&remote_yaml("remote_auth: \"Bearer abc\"")).unwrap();
+        let resolved = resolve_model_cmd(&cfg.cmd_aliases, &cfg.models[0], 7777);
+        assert_eq!(resolved, "https://remote.example.com:8080");
+    }
+
+    #[test]
+    fn rejects_remote_auth_on_local_model() {
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\n    remote_auth: \"Bearer abc\"",
+        );
+        expect_validation_error(&yaml, "remote_auth is only valid for remote");
+    }
+
+    #[test]
+    fn rejects_empty_remote_auth() {
+        let yaml = remote_yaml("remote_auth: \"  \"");
+        expect_validation_error(&yaml, "remote_auth must not be empty");
+    }
+
+    #[test]
+    fn rejects_missing_key_file() {
+        let yaml = r#"
+server: {}
+apikeys_file: apikeys.txt
+key_files:
+  k: /nonexistent/llm-orch-test-key
+"#;
+        expect_validation_error(yaml, "does not exist");
+    }
+
+    #[test]
+    fn rejects_reserved_key_file_name() {
+        let dir = std::env::temp_dir().join(format!("llm-orch-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("reserved.key");
+        std::fs::write(&path, "x").unwrap();
+        let yaml = r#"
+server: {}
+apikeys_file: apikeys.txt
+key_files:
+  port: __KEY_PATH__
+"#
+        .replace("__KEY_PATH__", &path.display().to_string());
+        expect_validation_error(&yaml, "reserved name");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn resolve_remote_auth_leaves_unknown_placeholders() {
+        let mut keys = HashMap::new();
+        keys.insert("known".into(), "value".into());
+        assert_eq!(
+            resolve_remote_auth(&keys, "Bearer {known} {missing}"),
+            "Bearer value {missing}"
+        );
     }
 }

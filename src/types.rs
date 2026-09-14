@@ -494,9 +494,15 @@ pub struct ImagesGenerationRequest {
     pub extra: Map<String, Value>,
 }
 
-fn default_one() -> u32 { 1 }
-fn default_output_format() -> String { "png".into() }
-fn default_max_compression() -> u32 { 100 }
+fn default_one() -> u32 {
+    1
+}
+fn default_output_format() -> String {
+    "png".into()
+}
+fn default_max_compression() -> u32 {
+    100
+}
 
 /// Response body for `POST /v1/images/generations`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -581,7 +587,9 @@ pub struct VideoGenerationRequest {
     pub extra: Map<String, Value>,
 }
 
-fn default_video_output_format() -> String { "webm".into() }
+fn default_video_output_format() -> String {
+    "webm".into()
+}
 
 /// Response body for `POST /v1/video/generations` (llm-orch internal).
 /// The handler decodes the base64 container and returns raw bytes instead.

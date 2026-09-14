@@ -4,11 +4,14 @@
 // spawning, slot acquisition, queueing, idle eviction, and shutdown.
 
 use crate::backend::{
-    Backend, ContainerBackend, DeviceKind, LlamaCppBackend, StableDiffusionCppBackend,
-    ReadyOutcome, inject_container_args, output_lines, poll_readiness, shutdown_child,
+    Backend, ContainerBackend, DeviceKind, LlamaCppBackend, ReadyOutcome,
+    StableDiffusionCppBackend, inject_container_args, output_lines, poll_readiness, shutdown_child,
     shutdown_container, spawn_process,
 };
-use crate::config::{AliasPolicy, DevicePool, EmaWindow, MakeRoomMode, ModelConfig, Runner};
+use crate::config::{
+    AliasPolicy, DevicePool, EmaWindow, MakeRoomMode, ModelConfig, Runner, load_key_files,
+    resolve_remote_auth,
+};
 use crate::gpu::GpuMetrics;
 use crate::http_client;
 use crate::instance::{Instance, InstanceHandle, InstanceLoadPurpose, InstanceState, SlotGuard};
@@ -30,6 +33,12 @@ use tracing::{debug, error, info, warn};
 /// Slow loads keep waiting *without* the semaphore afterwards so one
 /// slow model cannot head-of-line block spawns of every other model.
 const SPAWN_SERIAL_WINDOW: Duration = Duration::from_secs(15);
+
+/// Timeout for the single `/health` probe of a remote endpoint during
+/// provisioning.  A reachable endpoint answers quickly; anything slower is
+/// treated as down (the request queues or fails, and a later request
+/// re-probes).
+const REMOTE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Snapshot of the logical route captured when a request enters a queue.
 /// Physical instance handles are deliberately absent: migration may replace
@@ -947,6 +956,10 @@ fn fingerprint_with_aliases(cmd_aliases: &HashMap<String, String>, cfg: &ModelCo
     cfg.gpus.hash(&mut h);
     cfg.vram.hash(&mut h);
     cfg.context_length.hash(&mut h);
+    // For remote models `resolved` is the base URL and `remote_auth` is
+    // the auth template — both define the provisioned instance, so
+    // changing either retires existing instances on config reload.
+    cfg.remote_auth.hash(&mut h);
     h.finish()
 }
 
@@ -982,6 +995,11 @@ pub struct InstanceManager {
 
     /// Named `{key}` → value fragments from `cmd_aliases`.
     cmd_aliases: RwLock<HashMap<String, String>>,
+
+    /// Resolved `key_files` contents (`name → trimmed file contents`),
+    /// used to resolve `remote_auth` templates at request time.  Re-read
+    /// on config hot-reload and when the key files themselves change.
+    key_files: RwLock<HashMap<String, String>>,
 
     /// Running instances, keyed by model name.
     instances: RwLock<HashMap<String, Vec<InstanceHandle>>>,
@@ -1134,6 +1152,25 @@ impl InstanceManager {
     /// Both tasks run with no locks held, so they can safely acquire
     /// `instances.read()` → `metrics.write()` without deadlocking with the
     /// request-completion Drop path.
+    /// Load `key_files` contents, downgrading read failures to a warning
+    /// (a missing key degrades one remote model's auth instead of taking
+    /// the whole service down; `--check-config` already verified
+    /// existence at load time).
+    fn load_key_files_or_warn(config: &crate::config::Config) -> HashMap<String, String> {
+        match load_key_files(&config.key_files) {
+            Ok(keys) => {
+                if !keys.is_empty() {
+                    info!(count = keys.len(), "key_files loaded");
+                }
+                keys
+            }
+            Err(e) => {
+                warn!("key_files load failed (continuing without): {e}");
+                HashMap::new()
+            }
+        }
+    }
+
     pub fn new(
         config: &crate::config::Config,
         gpu_snapshot: Arc<tokio::sync::RwLock<Vec<GpuMetrics>>>,
@@ -1181,6 +1218,7 @@ impl InstanceManager {
             ports: Mutex::new(PortAllocator::new(config.server.port_range.clone())),
             model_configs: RwLock::new(model_configs),
             cmd_aliases: RwLock::new(config.cmd_aliases.clone()),
+            key_files: RwLock::new(Self::load_key_files_or_warn(config)),
             instances: RwLock::new(HashMap::new()),
             queues: RwLock::new(HashMap::new()),
             next_queue_id: AtomicU64::new(0),
@@ -3056,6 +3094,13 @@ impl InstanceManager {
         cfg: &ModelConfig,
         options: SpawnOptions,
     ) -> Option<InstanceHandle> {
+        // Remote endpoints have no local process, port, or GPU placement:
+        // provisioning is a single bounded health probe, handled by a
+        // dedicated (much cheaper) path.
+        if cfg.is_remote(&self.cmd_aliases.read().unwrap()) {
+            return self.try_provision_remote(model_name, cfg, options).await;
+        }
+
         // Serialize the critical section of spawn attempts globally —
         // prevents concurrent model loads from thrashing the SSD and
         // interleaving VRAM.  Released after SPAWN_SERIAL_WINDOW of
@@ -3219,7 +3264,10 @@ impl InstanceManager {
             // Speculative decoding: pin the draft model to the same device(s)
             // the instance is placed on.  No-op for non-llama programs.
             LlamaCppBackend::inject_spec_draft_device(
-                prog, &mut args, cfg.device_kind(), &gpu_indices,
+                prog,
+                &mut args,
+                cfg.device_kind(),
+                &gpu_indices,
             );
         }
         let envs = model_backend.gpu_env(&gpu_indices);
@@ -3407,10 +3455,132 @@ impl InstanceManager {
         Some(handle)
     }
 
+    /// Provision a remote http(s) endpoint: verify it answers
+    /// `GET {base}/health` within [`REMOTE_PROBE_TIMEOUT`], then register
+    /// the instance as Ready.  No child process, port, GPU reservation,
+    /// keep-alive, or crash monitor is involved.
+    ///
+    /// A failed probe simply leaves the model without an instance — the
+    /// request queues (when `queue_depth > 0`) or fails `Unavailable`,
+    /// and a later request re-probes.  Probes do not count toward the
+    /// pre-output crash block: the endpoint is not ours to restart.
+    async fn try_provision_remote(
+        &self,
+        model_name: &str,
+        cfg: &ModelConfig,
+        options: SpawnOptions,
+    ) -> Option<InstanceHandle> {
+        // Serialize against concurrent provisioning of the same model so
+        // the instance cap below stays race-free (same rationale as the
+        // process spawn path, without the SSD-thrashing concern).
+        let _permit = self.spawn_semaphore.clone().acquire_owned().await.ok()?;
+
+        if options.enforce_instance_cap {
+            let instances = self.instances.read().unwrap();
+            if let Some(list) = instances.get(model_name) {
+                let active = list
+                    .iter()
+                    .filter(|h| h.inner().lock().unwrap().counts_toward_instance_cap())
+                    .count();
+                if active >= cfg.max_instances {
+                    return None;
+                }
+            }
+        }
+
+        // `resolve_cmd` skips the `{port}` substitution for remote models
+        // (see `resolve_model_cmd`), so the marker port 0 is safe.
+        let base_url = self.resolve_cmd(cfg, 0);
+        let health_url = format!("{}/health", base_url.trim_end_matches('/'));
+
+        let healthy =
+            match tokio::time::timeout(REMOTE_PROBE_TIMEOUT, self.client.get(&health_url).send())
+                .await
+            {
+                Ok(Ok(resp)) => resp.status().is_success(),
+                other => {
+                    warn!(
+                        model = %model_name,
+                        url = %health_url,
+                        outcome = ?other,
+                        "remote health probe failed or timed out"
+                    );
+                    false
+                }
+            };
+        if !healthy {
+            return None;
+        }
+
+        let log_url = base_url.clone();
+        let mut inst = Instance::new_remote(
+            model_name,
+            base_url,
+            cfg.remote_auth.clone(),
+            Some(self.release_tx.clone()),
+            options.load_purpose,
+        );
+        inst.migration_id = options.migration_id;
+        inst.config_fingerprint = self.spawn_fingerprint(cfg);
+        inst.id = format!(
+            "{}#{}",
+            inst.id,
+            self.instance_seq.fetch_add(1, Ordering::Relaxed)
+        );
+        inst.mark_ready();
+        let handle = InstanceHandle::new(inst);
+
+        {
+            let mut instances = self.instances.write().unwrap();
+            instances
+                .entry(model_name.to_owned())
+                .or_default()
+                .push(handle.clone());
+        }
+
+        self.touch_activity(model_name);
+        // A successful probe resets any stale crash-counter state.
+        self.crash_counts.lock().unwrap().remove(model_name);
+
+        let instance_id = handle.id();
+        info!(model = %model_name, inst = %instance_id, url = %log_url, "remote instance provisioned");
+
+        Some(handle)
+    }
+
     /// Spawn-config fingerprint of `cfg` resolved against the *current*
     /// cmd aliases (see `fingerprint_with_aliases`).
     fn spawn_fingerprint(&self, cfg: &ModelConfig) -> u64 {
         fingerprint_with_aliases(&self.cmd_aliases.read().unwrap(), cfg)
+    }
+
+    /// Replace the resolved `key_files` contents (hot-reload of the key
+    /// files themselves).
+    pub fn set_key_files(&self, key_files: HashMap<String, String>) {
+        *self.key_files.write().unwrap() = key_files;
+    }
+
+    /// Re-read `key_files` from `config` (name → path mapping from the
+    /// config, contents from disk).  On read failure the previous values
+    /// are kept — a transient I/O error must not break auth for working
+    /// models.
+    pub fn refresh_key_files(&self, config: &crate::config::Config) {
+        match load_key_files(&config.key_files) {
+            Ok(keys) => {
+                self.set_key_files(keys);
+                debug!("key_files refreshed");
+            }
+            Err(e) => warn!("key_files reload failed (keeping old): {e}"),
+        }
+    }
+
+    /// Resolve the `remote_auth` template of a remote instance against the
+    /// current `key_files` contents.  Returns `None` for local instances
+    /// or models without `remote_auth`.
+    pub fn resolve_auth(&self, handle: &InstanceHandle) -> Option<String> {
+        let template = handle.auth_template()?;
+        let keys = self.key_files.read().unwrap();
+        Some(resolve_remote_auth(&keys, &template))
     }
 
     /// Resolve `cmd_aliases`, `{port}`, `{context_length}`, `{max_concurrent}`,
@@ -4047,8 +4217,14 @@ impl InstanceManager {
             }
         }
 
-        let port = handle.inner().lock().unwrap().port;
-        self.ports.lock().await.free(port);
+        let (port, is_remote) = {
+            let inst = handle.inner().lock().unwrap();
+            (inst.port, inst.is_remote())
+        };
+        // Remote instances never took a port from the allocator.
+        if !is_remote {
+            self.ports.lock().await.free(port);
+        }
 
         // Keep-alive: release this instance's per-GPU reference (acquired
         // at spawn registration).  The task stops when the last instance
@@ -4393,6 +4569,10 @@ impl InstanceManager {
         *self.scale_up_value.write().unwrap() = config.server.scale_up_value;
         *self.scale_down_value.write().unwrap() = config.server.scale_down_value;
         *self.migration_timeout_secs.write().unwrap() = config.server.migration_timeout_secs;
+        // Re-read key file contents (paths may have changed; contents may
+        // have changed on disk without a config edit).  Read failures keep
+        // the previous values (see refresh_key_files).
+        self.refresh_key_files(config);
         self.ports
             .lock()
             .await
@@ -4659,8 +4839,7 @@ impl InstanceManager {
             // Use the same per-model override as the spawn path so slow
             // loaders (e.g. vLLM with CUDA graph capture, minutes) are not
             // reaped mid-load by the smaller global default.
-            let model_spawn_timeout =
-                Duration::from_secs(cfg.spawn_timeout_secs.unwrap_or(120));
+            let model_spawn_timeout = Duration::from_secs(cfg.spawn_timeout_secs.unwrap_or(120));
             let stranded: Vec<InstanceHandle> = {
                 let instances = self.instances.read().unwrap();
                 instances
@@ -4685,6 +4864,15 @@ impl InstanceManager {
                     "reaping instance stranded in Loading state"
                 );
                 self.force_remove_instance(model_name, &handle).await;
+            }
+
+            // Remote instances are never idle-evicted: the endpoint is not
+            // ours to unload, and the "instance" is only a passthrough
+            // registration.  (Autoscaling is rejected for remote models
+            // at config load, so only the global idle-reap logic below
+            // needs guarding.)
+            if cfg.is_remote(&self.cmd_aliases.read().unwrap()) {
+                continue;
             }
 
             let num_instances = {
