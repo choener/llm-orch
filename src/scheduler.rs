@@ -982,6 +982,17 @@ fn cuda_device_maps(
 
 // ── Manager ──────────────────────────────────────────────────────────────────
 
+/// A forwarded request's cluster-peering route: which peer serves it,
+/// the request ID the peer tracks it under, and the master-side model
+/// name (for qualifying the peer's status responses).
+#[derive(Debug, Clone)]
+pub struct PeerRequestRoute {
+    pub peer: String,
+    pub leaf_id: String,
+    pub model_name: String,
+    recorded_at: std::time::Instant,
+}
+
 pub struct InstanceManager {
     /// Shared HTTP client for health checks and request forwarding.
     client: Client,
@@ -992,6 +1003,13 @@ pub struct InstanceManager {
     /// Per-model configuration, indexed by model name.
     /// Swapped on config hot-reload (`reconcile_config`).
     model_configs: RwLock<HashMap<String, ModelConfig>>,
+
+    /// Master request ID → (peer name, leaf request ID, master-side
+    /// model name, recorded-at), for cluster-peering forwards (see
+    /// `docs/006-cluster-peering.md`).  Populated at the forwarding
+    /// boundary from the leaf's `x-llm-orch-request-id` header; pruned
+    /// by `drain_idle_timeout_secs` on insert.
+    peer_requests: RwLock<HashMap<String, PeerRequestRoute>>,
 
     /// Named `{key}` → value fragments from `cmd_aliases`.
     cmd_aliases: RwLock<HashMap<String, String>>,
@@ -1237,6 +1255,7 @@ impl InstanceManager {
             crash_limit: 3,
             spawn_timeout: Duration::from_secs(120),
             drain_idle_timeout_secs: RwLock::new(config.server.drain_idle_timeout_secs),
+            peer_requests: RwLock::new(HashMap::new()),
             queue_wait_timeout_secs: RwLock::new(config.server.queue_wait_timeout_secs),
             scale_up_value: RwLock::new(config.server.scale_up_value),
             scale_down_value: RwLock::new(config.server.scale_down_value),
@@ -3583,6 +3602,77 @@ impl InstanceManager {
         Some(resolve_remote_auth(&keys, &template))
     }
 
+    // ── Cluster peering helpers ─────────────────────────────────────────
+
+    /// Whether a model name is known (local or materialized peer model).
+    pub fn has_model(&self, name: &str) -> bool {
+        self.model_configs.read().unwrap().contains_key(name)
+    }
+
+    /// The leaf-side model name a peer (virtual) model must be addressed
+    /// by in forwarded bodies — `None` for local models, whose
+    /// master-side name is the backend name.
+    pub fn upstream_model(&self, name: &str) -> Option<String> {
+        self.model_configs
+            .read()
+            .unwrap()
+            .get(name)
+            .and_then(|cfg| cfg.upstream_model.clone())
+    }
+
+    /// Convenience wrapper: the name to write into a forwarded request
+    /// body for `name` (the upstream name for peer models, `name`
+    /// unchanged for local models).
+    pub fn backend_model_name(&self, name: &str) -> String {
+        self.upstream_model(name)
+            .unwrap_or_else(|| name.to_string())
+    }
+
+    /// Whether a model is a materialized peer (virtual) model.
+    pub fn is_peer_model(&self, name: &str) -> bool {
+        self.model_configs
+            .read()
+            .unwrap()
+            .get(name)
+            .is_some_and(|cfg| cfg.peer.is_some())
+    }
+
+    /// The owning peer's name for a materialized peer model.
+    pub fn peer_of_model(&self, name: &str) -> Option<String> {
+        self.model_configs
+            .read()
+            .unwrap()
+            .get(name)
+            .and_then(|cfg| cfg.peer.clone())
+    }
+
+    /// Record that master request `request_id` was forwarded to `peer`
+    /// (resolved from model `model_name`), which tracks it as `leaf_id`.
+    /// Prunes entries older than `drain_idle_timeout_secs` — after that
+    /// horizon even loaded models have been reaped, so there is nothing
+    /// left to query.
+    pub fn note_peer_request(&self, request_id: &str, peer: &str, model_name: &str, leaf_id: &str) {
+        let retention = Duration::from_secs(self.drain_idle_timeout_secs.read().unwrap().max(1));
+        let mut map = self.peer_requests.write().unwrap();
+        let now = std::time::Instant::now();
+        map.retain(|_, route| now.duration_since(route.recorded_at) < retention);
+        map.insert(
+            request_id.to_string(),
+            PeerRequestRoute {
+                peer: peer.to_string(),
+                leaf_id: leaf_id.to_string(),
+                model_name: model_name.to_string(),
+                recorded_at: now,
+            },
+        );
+    }
+
+    /// Look up the forwarding route a master request took, when still
+    /// retained.
+    pub fn peer_request_route(&self, request_id: &str) -> Option<PeerRequestRoute> {
+        self.peer_requests.read().unwrap().get(request_id).cloned()
+    }
+
     /// Resolve `cmd_aliases`, `{port}`, `{context_length}`, `{max_concurrent}`,
     /// and `{name}` in the model's command string.  `{name}` substitutes
     /// the model's config name, enabling generic cmd templates such as
@@ -4742,6 +4832,12 @@ impl InstanceManager {
     /// Record a completed request in the per-model ring buffer.
     /// Keeps at most 5 entries per model, newest first.
     pub fn record_completion(&self, model_name: &str, record: CompletionRecord) {
+        // Cluster peering: peer-model completions are recorded on the
+        // owning leaf — the master's ring buffer stays local-only
+        // (docs/006, decision 9).
+        if self.is_peer_model(model_name) {
+            return;
+        }
         info!(
             model = %model_name,
             user = %record.api_user,

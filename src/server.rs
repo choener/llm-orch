@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::debug_log::DebugLoggers;
 use crate::gpu::GpuMetrics;
 use crate::handlers;
+use crate::peers::PeerRegistry;
 use crate::scheduler::InstanceManager;
 
 use axum::{
@@ -44,6 +45,9 @@ pub struct AppState {
     pub debug_loggers: Arc<DebugLoggers>,
     /// Token / model statistics store (disabled unless configured).
     pub stats: Arc<crate::stats::StatsStore>,
+    /// Cluster peer registry (empty / inert unless `peers:` is
+    /// configured).  See `docs/006-cluster-peering.md`.
+    pub peers: Arc<PeerRegistry>,
 }
 
 // ── Router ───────────────────────────────────────────────────────────────────

@@ -45,7 +45,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tracing::{debug, info, warn};
 
-use crate::config::{AliasConfig, AliasPolicy, MakeRoomMode};
+use crate::config::{AliasPolicy, MakeRoomMode};
 use crate::debug_log::{DebugLogEntry, DebugStreamContext, ts_now};
 use crate::instance::SlotGuard;
 use crate::scheduler::{AcquireError, Admission, InstanceManager, PendingAssignment};
@@ -63,13 +63,22 @@ use tracing::Instrument;
 pub async fn list_models(
     State(state): State<AppState>,
     _key: ApiKey,
-) -> Result<Json<ModelsResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let span = tracing::info_span!("list_models", id = %uuid::Uuid::new_v4().to_string());
     async {
+        // ── 0. Cluster peering: refresh stale peer catalogs so the
+        //    listing reflects the peers' current model sets (docs/006 —
+        //    a stale `/v1/models` listing is a refresh trigger).
+        state.peers.refresh_and_materialize().await;
+
         // ── 1. Read config, clone what we need, drop the guard. ──────────────
-        let (models, aliases) = {
+        let (models, aliases, node_name) = {
             let cfg = state.config.read().await;
-            (cfg.models.clone(), cfg.aliases.clone())
+            (
+                cfg.models.clone(),
+                cfg.aliases.clone(),
+                cfg.node_name.clone(),
+            )
         }; // cfg read guard dropped here — future is `Send`
 
         // ── 2. Build response (pure computation, no locks held). ────────────
@@ -89,6 +98,26 @@ pub async fn list_models(
             })
             .collect();
 
+        // Cluster peering: local models are also listed under their
+        // node-qualified form (`<node>/<model>`).  Peer models are
+        // already listed by their materialized names (`<peer>/<model>`
+        // plus bare aliases) — the client-side provider prefix (e.g.
+        // pi's `llm/`) never appears.
+        if let Some(ref node) = node_name {
+            let qualified: Vec<ModelEntry> = models
+                .iter()
+                .filter(|m| m.peer.is_none())
+                .map(|m| ModelEntry {
+                    id: format!("{node}/{}", m.name),
+                    object: "model".into(),
+                    created: now,
+                    owned_by: "llm-orch".into(),
+                    context_length: Some(m.context_length),
+                })
+                .collect();
+            data.extend(qualified);
+        }
+
         // Aliases also appear as models.
         for a in &aliases {
             let ctx = a
@@ -105,10 +134,21 @@ pub async fn list_models(
             });
         }
 
-        Ok(Json(ModelsResponse {
+        // Cluster peering: announce this instance's node name so a
+        // master's catalog fetch can filter our node-qualified self-listing
+        // (otherwise it would re-export `cortana/cortana/qwen-flash` —
+        // nested qualification, docs/006).
+        let mut response = Json(ModelsResponse {
             object: "list".into(),
             data,
-        }))
+        })
+        .into_response();
+        if let Some(node) = node_name.as_deref()
+            && let Ok(value) = header::HeaderValue::from_str(node)
+        {
+            response.headers_mut().insert("x-llm-orch-node", value);
+        }
+        Ok(response)
     }
     .instrument(span)
     .await
@@ -157,6 +197,10 @@ pub async fn info_endpoint(
         // ── 5. Build response. ──────────────────────────────────────────────
         let model_infos: Vec<ModelInfo> = models
             .iter()
+            // Cluster peering: skip materialized peer models here — the
+            // owning leaf's own /v1/info is merged below (merge_peer_info)
+            // and is authoritative for them.
+            .filter(|m| m.peer.is_none())
             .map(|m| {
                 let mets = metrics_snapshot.get(&m.name);
                 let backend = model_backend_kind(m);
@@ -205,6 +249,7 @@ pub async fn info_endpoint(
                     index: g.index,
                     pci_slot: g.pci_slot.clone(),
                     vram_vendor: g.vram_vendor.clone(),
+                    node: None,
                     vram_used_bytes: g.vram_used_bytes,
                     vram_total_bytes: g.vram_total_bytes,
                     vram_util_pct,
@@ -217,15 +262,87 @@ pub async fn info_endpoint(
             })
             .collect();
 
-        Ok(Json(InfoResponse {
-            models: model_infos,
-            aliases: alias_infos,
-            gpus: gpu_statuses,
-            metrics: state.manager.scheduler_metrics_snapshot(),
-        }))
+        let merged = merge_peer_info(
+            &state,
+            InfoResponse {
+                models: model_infos,
+                aliases: alias_infos,
+                gpus: gpu_statuses,
+                metrics: state.manager.scheduler_metrics_snapshot(),
+                peers: crate::peers::peer_status_snapshot(&state.peers),
+            },
+        )
+        .await;
+        Ok(Json(merged))
     }
     .instrument(span)
     .await
+}
+
+/// Merge the cluster peers' `/v1/info` into an `InfoResponse` (docs/006,
+/// decision 9): peer models and aliases are prefixed with the peer's
+/// node name, GPUs are labeled with the peer name, and scheduler metrics
+/// stay local (they describe *this* scheduler).  The master's own entries
+/// keep their bare names; local models additionally appear under their
+/// node-qualified form when `node_name` is set.
+async fn merge_peer_info(state: &AppState, mut response: InfoResponse) -> InfoResponse {
+    let node_name = state.peers.node_name();
+    // Self-qualification is a gateway feature (see stats_endpoint).
+    let is_gateway = !state.peers.peer_names().is_empty();
+    if is_gateway && let Some(node) = &node_name {
+        let qualified: Vec<ModelInfo> = response
+            .models
+            .iter()
+            .filter(|m| !m.name.contains('/'))
+            .map(|m| {
+                let mut q = m.clone();
+                q.name = format!("{node}/{}", m.name);
+                q
+            })
+            .collect();
+        response.models.extend(qualified);
+        let qualified_aliases: Vec<AliasInfo> = response
+            .aliases
+            .iter()
+            .filter(|a| !a.name.contains('/'))
+            .map(|a| {
+                let mut q = a.clone();
+                q.name = format!("{node}/{}", a.name);
+                q
+            })
+            .collect();
+        response.aliases.extend(qualified_aliases);
+    }
+
+    let peer_names = state.peers.peer_names();
+    if peer_names.is_empty() {
+        return response;
+    }
+    let fetched =
+        futures_util::future::join_all(peer_names.iter().map(|p| state.peers.peer_info(p))).await;
+    for (peer, info) in peer_names.iter().zip(fetched) {
+        let Some(info) = info else {
+            continue;
+        };
+        for mut model in info.models {
+            model.name = format!("{peer}/{}", model.name);
+            response.models.push(model);
+        }
+        for mut alias in info.aliases {
+            alias.name = format!("{peer}/{}", alias.name);
+            alias.targets = alias
+                .targets
+                .into_iter()
+                .map(|t| format!("{peer}/{t}"))
+                .collect();
+            response.aliases.push(alias);
+        }
+        for mut gpu in info.gpus {
+            gpu.node = Some(peer.clone());
+            response.gpus.push(gpu);
+        }
+    }
+    response
 }
 
 // ── /v1/stats ─────────────────────────────────────────────────────────────────
@@ -259,7 +376,7 @@ pub struct StatsResponse {
 /// not configured — so pollers never have to handle error states.
 pub async fn stats_endpoint(State(state): State<AppState>, _key: ApiKey) -> Json<StatsResponse> {
     let gpu_metrics = state.gpu.read().await.clone();
-    let gpus: Vec<GpuStatus> = gpu_metrics
+    let mut gpus: Vec<GpuStatus> = gpu_metrics
         .iter()
         .map(|g| {
             let vram_util_pct = if g.vram_total_bytes > 0 {
@@ -271,6 +388,7 @@ pub async fn stats_endpoint(State(state): State<AppState>, _key: ApiKey) -> Json
                 index: g.index,
                 pci_slot: g.pci_slot.clone(),
                 vram_vendor: g.vram_vendor.clone(),
+                node: None,
                 vram_used_bytes: g.vram_used_bytes,
                 vram_total_bytes: g.vram_total_bytes,
                 vram_util_pct,
@@ -282,32 +400,148 @@ pub async fn stats_endpoint(State(state): State<AppState>, _key: ApiKey) -> Json
             }
         })
         .collect();
-    match state.stats.snapshot() {
-        Some(doc) => Json(StatsResponse {
-            enabled: true,
-            version: doc.version,
-            started_at: doc.started_at,
-            updated_at: doc.updated_at,
-            models: doc.models,
-            gpus,
-        }),
-        None => Json(StatsResponse {
-            enabled: false,
-            version: 1,
-            started_at: 0,
-            updated_at: 0,
-            models: std::collections::HashMap::new(),
-            gpus,
-        }),
+    let doc = state.stats.snapshot();
+    let (version, started_at) = doc
+        .as_ref()
+        .map(|d| (d.version, d.started_at))
+        .unwrap_or((1, 0));
+    let mut updated_at = doc.as_ref().map(|d| d.updated_at).unwrap_or(0);
+    // ── Cluster peering: on-demand union with the peers' stats ────────
+    // (docs/006, decision 9: fetched concurrently when this endpoint is
+    // queried — 10 s per-peer timeout, last-known fallback, singleflight
+    // per peer; the master never counts forwarded requests itself, the
+    // leaves' numbers are authoritative for their models).
+    let peer_names = state.peers.peer_names();
+    let mut peer_models: Vec<(
+        String,
+        std::collections::HashMap<String, crate::stats::StatsModel>,
+    )> = Vec::new();
+    if !peer_names.is_empty() {
+        let fetched =
+            futures_util::future::join_all(peer_names.iter().map(|p| state.peers.peer_stats(p)))
+                .await;
+        for (peer, result) in peer_names.iter().zip(fetched) {
+            let Some((value, _fetched_at)) = result else {
+                continue;
+            };
+            if let Some(ts) = value.get("updated_at").and_then(|v| v.as_u64()) {
+                updated_at = updated_at.max(ts);
+            }
+            if let Ok(mut peer_gpus) =
+                serde_json::from_value::<Vec<GpuStatus>>(value["gpus"].clone())
+            {
+                for gpu in &mut peer_gpus {
+                    gpu.node = Some(peer.clone());
+                }
+                gpus.extend(peer_gpus);
+            }
+            if let Ok(models) = serde_json::from_value::<
+                std::collections::HashMap<String, crate::stats::StatsModel>,
+            >(value["models"].clone())
+            {
+                peer_models.push((peer.clone(), models));
+            }
+        }
     }
+
+    // ── Union model map ───────────────────────────────────────────────
+    // - node-qualified entries (`<node>/<model>` for local models,
+    //   `<peer>/<model>` for leaf models) carry that node's numbers;
+    // - bare entries are the sum over every node serving the name.
+    let mut models: std::collections::HashMap<String, crate::stats::StatsModel> =
+        doc.map(|d| d.models).unwrap_or_default();
+    // Self-qualification (`<node>/<model>` copies of local entries) is a
+    // gateway feature: a node without peers emits bare-only stats so a
+    // consuming master re-exports each entry exactly once (no nested
+    // `cortana/cortana/...` qualification).
+    let is_gateway = !peer_names.is_empty();
+    if is_gateway && let Some(node) = state.peers.node_name() {
+        let qualified: Vec<(String, crate::stats::StatsModel)> = models
+            .iter()
+            .map(|(name, m)| (format!("{node}/{name}"), *m))
+            .collect();
+        for (name, m) in qualified {
+            models.insert(name, m);
+        }
+    }
+    for (peer, pmodels) in peer_models {
+        for (leaf_name, m) in pmodels {
+            // Qualified leaf entry: the leaf's numbers verbatim.
+            models.insert(format!("{peer}/{leaf_name}"), m);
+            // Bare entry: sum over every node serving the name.
+            let bare = models.entry(leaf_name).or_default();
+            bare.merge(&m);
+        }
+    }
+    let enabled = state.stats.snapshot().is_some() || !models.is_empty();
+
+    Json(StatsResponse {
+        enabled,
+        version,
+        started_at,
+        updated_at,
+        models,
+        gpus,
+    })
 }
 
 /// `GET /v1/requests/{request_id}` — authenticated request lifecycle status.
+///
+/// Cluster peering: forwarded requests are authoritative on the leaf —
+/// when the request was routed to a peer, the leaf's status is proxied
+/// (docs/006, decision 10).
 pub async fn request_status(
     State(state): State<AppState>,
     _key: ApiKey,
     Path(request_id): Path<String>,
 ) -> Result<Json<RequestStatus>, ApiError> {
+    if let Some(route) = state.manager.peer_request_route(&request_id)
+        && let Some((peer_cfg, auth)) = state.peers.resolved_peer(&route.peer)
+    {
+        let url = format!(
+            "{}/v1/requests/{}",
+            peer_cfg.url.trim_end_matches('/'),
+            route.leaf_id
+        );
+        let mut builder = state
+            .client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(10));
+        if let Some(auth) = auth {
+            builder = builder.header(header::AUTHORIZATION, auth);
+        }
+        match builder.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(mut status) = resp.json::<RequestStatus>().await {
+                    // Present the master's view: the client asked about
+                    // its own request ID and master-side model names.
+                    status.request_id = request_id.clone();
+                    let upstream = state.manager.upstream_model(&route.model_name);
+                    if status.logical_model == upstream.as_deref().unwrap_or("") {
+                        status.logical_model = route.model_name.clone();
+                    }
+                    if let Some(resolved) = &status.resolved_model
+                        && Some(resolved.as_str()) == upstream.as_deref()
+                    {
+                        status.resolved_model = Some(route.model_name.clone());
+                    }
+                    return Ok(Json(status));
+                }
+            }
+            Ok(resp) => {
+                // The leaf no longer knows the request (expired there or
+                // restarted) — fall through to the local record.
+                debug!(
+                    peer = %route.peer,
+                    status = %resp.status(),
+                    "peer request status unavailable — falling back to local record"
+                );
+            }
+            Err(e) => {
+                warn!(peer = %route.peer, error = %e, "peer request status fetch failed");
+            }
+        }
+    }
     state
         .manager
         .request_status(&request_id)
@@ -355,30 +589,16 @@ pub async fn chat_completions(
         // ── 1. Resolve alias → candidate models; extract the backend
         //    timeouts.  Read config, extract what we need, drop the guard.
         let request_model = request.model.clone();
-        let (
-            candidates,
-            policy,
-            make_room,
-            drain_timeout,
-            idle_timeout,
-            total_timeout,
-            heartbeat_secs,
-        ) = {
+        let (idle_timeout, total_timeout, heartbeat_secs) = {
             let cfg = state.config.read().await;
-            let (c, p, mr, dt) = resolve_alias(&cfg.aliases, &request.model);
-            if !c.iter().any(|n| cfg.models.iter().any(|m| &m.name == n)) {
-                return Err(ApiError::ModelNotFound(request_model.clone()));
-            }
             (
-                c,
-                p,
-                mr,
-                dt,
                 std::time::Duration::from_secs(cfg.server.backend_idle_timeout_secs),
                 std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs),
                 cfg.server.queue_heartbeat_secs,
             )
         }; // cfg read guard dropped — future is `Send`
+        let (candidates, policy, make_room, drain_timeout) =
+            resolve_candidates(&state, &request.model).await?;
         state.manager.register_request(&request_id, &request_model);
 
         debug!(
@@ -525,6 +745,7 @@ pub async fn chat_completions(
                 key.label.clone(),
                 request_id.clone(),
                 idle_timeout,
+                Some(Arc::clone(&state.peers)),
             )
             .await
             .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
@@ -539,6 +760,7 @@ pub async fn chat_completions(
                 &request_body,
                 &auth,
                 total_timeout,
+                peer_forward(&state, &model_name, &request_id),
             )
             .await?;
             let elapsed = t0.elapsed();
@@ -672,30 +894,16 @@ pub async fn responses(
     async {
         // ── 1. Resolve alias → candidate models; extract the backend
         //    timeouts. ───────────────────────────────────────────────────────
-        let (
-            candidates,
-            policy,
-            make_room,
-            drain_timeout,
-            idle_timeout,
-            total_timeout,
-            heartbeat_secs,
-        ) = {
+        let (idle_timeout, total_timeout, heartbeat_secs) = {
             let cfg = state.config.read().await;
-            let (c, p, mr, dt) = resolve_alias(&cfg.aliases, &requested_model);
-            if !c.iter().any(|n| cfg.models.iter().any(|m| &m.name == n)) {
-                return Err(ApiError::ModelNotFound(requested_model.clone()));
-            }
             (
-                c,
-                p,
-                mr,
-                dt,
                 std::time::Duration::from_secs(cfg.server.backend_idle_timeout_secs),
                 std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs),
                 cfg.server.queue_heartbeat_secs,
             )
         }; // cfg read guard dropped — future is `Send`
+        let (candidates, policy, make_room, drain_timeout) =
+            resolve_candidates(&state, &requested_model).await?;
         state
             .manager
             .register_request(&request_id, &requested_model);
@@ -842,6 +1050,7 @@ pub async fn responses(
                 key.label.clone(),
                 request_id.clone(),
                 idle_timeout,
+                Some(Arc::clone(&state.peers)),
             )
             .await
             .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
@@ -856,6 +1065,7 @@ pub async fn responses(
                 &request,
                 &auth,
                 total_timeout,
+                peer_forward(&state, &model_name, &request_id),
             )
             .await?;
             let elapsed = t0.elapsed();
@@ -982,20 +1192,14 @@ pub async fn responses_input_tokens(
     );
     async {
         // ── 1. Resolve alias → candidates; extract the backend timeout. ─────
-        let (candidates, policy, make_room, drain_timeout, total_timeout) = {
+        let (total_timeout,) = {
             let cfg = state.config.read().await;
-            let (c, p, mr, dt) = resolve_alias(&cfg.aliases, &requested_model);
-            if !c.iter().any(|n| cfg.models.iter().any(|m| &m.name == n)) {
-                return Err(ApiError::ModelNotFound(requested_model.clone()));
-            }
-            (
-                c,
-                p,
-                mr,
-                dt,
-                std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs),
-            )
+            (std::time::Duration::from_secs(
+                cfg.server.backend_total_timeout_secs,
+            ),)
         };
+        let (candidates, policy, make_room, drain_timeout) =
+            resolve_candidates(&state, &requested_model).await?;
 
         // ── 2. Acquire an instance slot on one of the candidates (or queue).
         let (model_name, guard) = state
@@ -1049,9 +1253,15 @@ pub async fn responses_input_tokens(
 
         // ── 5. Forward request, aggregate, release. ─────────────────────────
         let t0 = std::time::Instant::now();
-        let response_body =
-            forward_request_aggregate(&state.client, &backend_url, &request, &auth, total_timeout)
-                .await?;
+        let response_body = forward_request_aggregate(
+            &state.client,
+            &backend_url,
+            &request,
+            &auth,
+            total_timeout,
+            peer_forward(&state, &model_name, &request_id),
+        )
+        .await?;
         let elapsed = t0.elapsed();
 
         // Debug log: response.
@@ -1133,30 +1343,16 @@ pub async fn completions(
     let wait_events = wait_events_requested(&headers);
     async {
         // ── 1. Resolve alias → candidates; read the backend timeouts. ──────
-        let (
-            candidates,
-            policy,
-            make_room,
-            drain_timeout,
-            idle_timeout,
-            total_timeout,
-            heartbeat_secs,
-        ) = {
+        let (idle_timeout, total_timeout, heartbeat_secs) = {
             let cfg = state.config.read().await;
-            let (c, p, mr, dt) = resolve_alias(&cfg.aliases, &request.model);
-            if !c.iter().any(|n| cfg.models.iter().any(|m| &m.name == n)) {
-                return Err(ApiError::ModelNotFound(request.model.clone()));
-            }
             (
-                c,
-                p,
-                mr,
-                dt,
                 std::time::Duration::from_secs(cfg.server.backend_idle_timeout_secs),
                 std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs),
                 cfg.server.queue_heartbeat_secs,
             )
         };
+        let (candidates, policy, make_room, drain_timeout) =
+            resolve_candidates(&state, &request.model).await?;
         state.manager.register_request(&request_id, &request.model);
 
         // ── 2. Register admission before any slow spawn or migration.
@@ -1252,6 +1448,7 @@ pub async fn completions(
                 key.label.clone(),
                 request_id.clone(),
                 idle_timeout,
+                Some(Arc::clone(&state.peers)),
             )
             .await
             .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
@@ -1265,6 +1462,7 @@ pub async fn completions(
                 &serde_json::to_value(&request).unwrap_or_default(),
                 &auth,
                 total_timeout,
+                peer_forward(&state, &model_name, &request_id),
             )
             .await?;
             let elapsed = t0.elapsed();
@@ -1324,20 +1522,14 @@ pub async fn embeddings(
     );
     async {
         // ── 1. Resolve alias → candidates; read the backend timeout. ───────
-        let (candidates, policy, make_room, drain_timeout, total_timeout) = {
+        let (total_timeout,) = {
             let cfg = state.config.read().await;
-            let (c, p, mr, dt) = resolve_alias(&cfg.aliases, &request.model);
-            if !c.iter().any(|n| cfg.models.iter().any(|m| &m.name == n)) {
-                return Err(ApiError::ModelNotFound(request.model.clone()));
-            }
-            (
-                c,
-                p,
-                mr,
-                dt,
-                std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs),
-            )
+            (std::time::Duration::from_secs(
+                cfg.server.backend_total_timeout_secs,
+            ),)
         };
+        let (candidates, policy, make_room, drain_timeout) =
+            resolve_candidates(&state, &request.model).await?;
 
         // ── 2. Acquire an instance slot on one of the candidates (or queue).
         let (model_name, guard) = state
@@ -1363,6 +1555,7 @@ pub async fn embeddings(
             &serde_json::to_value(&request).unwrap_or_default(),
             &auth,
             total_timeout,
+            peer_forward(&state, &model_name, &request_id),
         )
         .await
         .map_err(|e| {
@@ -1436,20 +1629,14 @@ pub async fn rerank(
     );
     async {
         // ── 1. Resolve alias → candidates; extract the backend timeout. ─────
-        let (candidates, policy, make_room, drain_timeout, total_timeout) = {
+        let (total_timeout,) = {
             let cfg = state.config.read().await;
-            let (c, p, mr, dt) = resolve_alias(&cfg.aliases, &request.model);
-            if !c.iter().any(|n| cfg.models.iter().any(|m| &m.name == n)) {
-                return Err(ApiError::ModelNotFound(request.model.clone()));
-            }
-            (
-                c,
-                p,
-                mr,
-                dt,
-                std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs),
-            )
+            (std::time::Duration::from_secs(
+                cfg.server.backend_total_timeout_secs,
+            ),)
         };
+        let (candidates, policy, make_room, drain_timeout) =
+            resolve_candidates(&state, &request.model).await?;
 
         let request_model = request.model.clone();
 
@@ -1514,6 +1701,7 @@ pub async fn rerank(
             &request_body,
             &auth,
             total_timeout,
+            peer_forward(&state, &model_name, &request_id),
         )
         .await
         .map_err(|e| {
@@ -1649,22 +1837,16 @@ async fn acquire_audio_target(
     request_model: &str,
     request_id: &str,
 ) -> Result<AudioAdmission, ApiError> {
-    let (candidates, policy, make_room, drain_timeout, idle_timeout, total_timeout, heartbeat_secs) = {
+    let (idle_timeout, total_timeout, heartbeat_secs) = {
         let cfg = state.config.read().await;
-        let (c, p, mr, dt) = resolve_alias(&cfg.aliases, request_model);
-        if !c.iter().any(|n| cfg.models.iter().any(|m| &m.name == n)) {
-            return Err(ApiError::ModelNotFound(request_model.to_owned()));
-        }
         (
-            c,
-            p,
-            mr,
-            dt,
             std::time::Duration::from_secs(cfg.server.backend_idle_timeout_secs),
             std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs),
             cfg.server.queue_heartbeat_secs,
         )
     };
+    let (candidates, policy, make_room, drain_timeout) =
+        resolve_candidates(state, request_model).await?;
 
     let admission = state
         .manager
@@ -1809,6 +1991,9 @@ async fn forward_audio_post(
         );
     }
 
+    // Cluster peering: rewrite the body's model to the leaf-side name
+    // (JSON bodies only; multipart model fields were rewritten upstream).
+    let body = rewrite_raw_model(state, &target.model_name, body, content_type);
     let send = with_auth(
         state
             .client
@@ -1837,6 +2022,7 @@ async fn forward_audio_post(
     .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
 
     let status = resp.status();
+    note_peer_from_response(state, &target.model_name, request_id, &resp, status);
     let resp_content_type = resp
         .headers()
         .get(header::CONTENT_TYPE)
@@ -1882,6 +2068,7 @@ async fn forward_audio_post(
             target.model_name,
             target.instance_id,
             None, // debug context: SSE chunks may carry base64 audio — skip
+            None, // peer model rewrite: audio chunks carry no model field
             state.manager.clone(),
             state.stats.clone(),
             api_user.to_owned(),
@@ -2212,20 +2399,14 @@ async fn acquire_diffusion_target(
     request_model: &str,
     request_id: &str,
 ) -> Result<DiffusionTarget, ApiError> {
-    let (candidates, policy, make_room, drain_timeout, total_timeout) = {
+    let (total_timeout,) = {
         let cfg = state.config.read().await;
-        let (c, p, mr, dt) = resolve_alias(&cfg.aliases, request_model);
-        if !c.iter().any(|n| cfg.models.iter().any(|m| &m.name == n)) {
-            return Err(ApiError::ModelNotFound(request_model.to_owned()));
-        }
-        (
-            c,
-            p,
-            mr,
-            dt,
-            std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs),
-        )
+        (std::time::Duration::from_secs(
+            cfg.server.backend_total_timeout_secs,
+        ),)
     };
+    let (candidates, policy, make_room, drain_timeout) =
+        resolve_candidates(state, request_model).await?;
 
     let admission = state
         .manager
@@ -2321,6 +2502,8 @@ async fn forward_diffusion_json(
         );
     }
 
+    // Cluster peering: rewrite the body's model to the leaf-side name.
+    let body = rewrite_raw_model(state, &target.model_name, body, "application/json");
     let send = with_auth(
         state
             .client
@@ -2348,6 +2531,7 @@ async fn forward_diffusion_json(
     .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
 
     let status = resp.status();
+    note_peer_from_response(state, &target.model_name, request_id, &resp, status);
     let content_type = resp
         .headers()
         .get(header::CONTENT_TYPE)
@@ -2518,6 +2702,7 @@ async fn forward_diffusion_post_raw(
 ) -> Result<Response, ApiError> {
     let backend_url = format!("{}{}", target.base, path);
 
+    let body = rewrite_raw_model(state, &target.model_name, body, content_type);
     let send = with_auth(
         state
             .client
@@ -2545,6 +2730,7 @@ async fn forward_diffusion_post_raw(
     .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
 
     let status = resp.status();
+    note_peer_from_response(state, &target.model_name, _request_id, &resp, status);
     let resp_ct = resp
         .headers()
         .get(header::CONTENT_TYPE)
@@ -2993,6 +3179,12 @@ pub async fn admin_load(
 ) -> Result<Json<AdminResponse>, ApiError> {
     let span = tracing::info_span!("admin_load", id = %uuid::Uuid::new_v4().to_string(), model = %body.model);
     async {
+        // Cluster peering: forward to the owning leaf (docs/006, decision
+        // 7) — the leaf spawns the real instance.
+        if let Some(response) = forward_admin_action(&state, "/admin/load", &body).await? {
+            return Ok(response);
+        }
+
         // Verify the model exists.
         {
             let cfg = state.config.read().await;
@@ -3030,6 +3222,11 @@ pub async fn admin_unload(
 ) -> Result<Json<AdminResponse>, ApiError> {
     let span = tracing::info_span!("admin_unload", id = %uuid::Uuid::new_v4().to_string(), model = %body.model);
     async {
+        // Cluster peering: forward to the owning leaf (docs/006, decision 7).
+        if let Some(response) = forward_admin_action(&state, "/admin/unload", &body).await? {
+            return Ok(response);
+        }
+
         // Verify the model exists.
         {
             let cfg = state.config.read().await;
@@ -3060,6 +3257,11 @@ pub async fn admin_unblock(
 ) -> Result<Json<AdminResponse>, ApiError> {
     let span = tracing::info_span!("admin_unblock", id = %uuid::Uuid::new_v4().to_string(), model = %body.model);
     async {
+        // Cluster peering: forward to the owning leaf (docs/006, decision 7).
+        if let Some(response) = forward_admin_action(&state, "/admin/unblock", &body).await? {
+            return Ok(response);
+        }
+
         // Verify the model exists.
         {
             let cfg = state.config.read().await;
@@ -3088,6 +3290,52 @@ pub async fn admin_unblock(
 }
 
 // ── Helpers (lock-free) ──────────────────────────────────────────────────────
+
+/// Forward an admin model action to the peer that owns the model
+/// (cluster peering, docs/006 decision 7).  Returns `Ok(None)` when the
+/// model is local (the caller proceeds with the local code path) and
+/// `Ok(Some(response))` with the leaf's answer when it is a peer model.
+/// The leaf-side model name is rewritten into the body.
+async fn forward_admin_action(
+    state: &AppState,
+    path: &str,
+    body: &AdminModelAction,
+) -> Result<Option<Json<AdminResponse>>, ApiError> {
+    let Some(peer) = state.manager.peer_of_model(&body.model) else {
+        return Ok(None);
+    };
+    let Some((peer_cfg, auth)) = state.peers.resolved_peer(&peer) else {
+        return Err(ApiError::Internal(format!("peer '{peer}' not configured")));
+    };
+    let upstream = state.manager.backend_model_name(&body.model);
+    let url = format!("{}{path}", peer_cfg.url.trim_end_matches('/'));
+    let payload = serde_json::json!({ "model": upstream });
+    let mut builder = state
+        .client
+        .post(&url)
+        .json(&payload)
+        .timeout(std::time::Duration::from_secs(30));
+    if let Some(auth) = auth {
+        builder = builder.header(header::AUTHORIZATION, auth);
+    }
+    let resp = builder
+        .send()
+        .await
+        .map_err(|e| ApiError::Internal(format!("peer request failed: {e}")))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_else(|_| "unknown error".into());
+        return Err(ApiError::Internal(format!(
+            "peer returned {status}: {text}"
+        )));
+    }
+    let answer: AdminResponse = resp
+        .json()
+        .await
+        .map_err(|e| ApiError::Internal(format!("invalid peer response: {e}")))?;
+    info!(peer = %peer, path = %path, model = %body.model, "admin action forwarded to peer");
+    Ok(Some(Json(answer)))
+}
 
 /// Map an instance-acquisition failure to the HTTP error for this model.
 fn acquire_error_for_request(
@@ -3136,10 +3384,16 @@ fn acquire_error(model_name: &str, e: AcquireError) -> ApiError {
 ///   make-room disabled — direct (non-alias) requests never evict
 ///   (`docs/003-smart-handling.md`, decision 9).
 fn resolve_alias(
-    aliases: &[AliasConfig],
+    cfg: &crate::config::Config,
     requested_model: &str,
 ) -> (Vec<String>, AliasPolicy, MakeRoomMode, u64) {
-    if let Some(alias) = aliases.iter().find(|a| a.name == requested_model) {
+    // Cluster peering (docs/006): strip client-side path prefixes from
+    // the requested name — our own node qualification and opaque client
+    // provider prefixes (e.g. pi's `llm/`), while keeping `<peer>/...`
+    // pins intact.
+    let name =
+        crate::peers::strip_client_prefixes(requested_model, cfg.node_name.as_deref(), &cfg.peers);
+    if let Some(alias) = cfg.aliases.iter().find(|a| a.name == name) {
         return (
             alias.targets.clone(),
             alias.policy,
@@ -3147,12 +3401,36 @@ fn resolve_alias(
             alias.drain_timeout,
         );
     }
-    (
-        vec![requested_model.to_owned()],
-        AliasPolicy::PreferLoaded,
-        MakeRoomMode::None,
-        0,
-    )
+    (vec![name], AliasPolicy::PreferLoaded, MakeRoomMode::None, 0)
+}
+
+/// Resolve a requested model into admission candidates, with the lazy
+/// peer-catalog refresh from `docs/006-cluster-peering.md`: an unknown
+/// name may be a new leaf model, so stale catalogs are refreshed (once,
+/// singleflight) and the effective config re-materialized before the
+/// request is rejected.
+async fn resolve_candidates(
+    state: &AppState,
+    requested_model: &str,
+) -> Result<(Vec<String>, AliasPolicy, MakeRoomMode, u64), ApiError> {
+    let (candidates, policy, make_room, drain_timeout) = {
+        let cfg = state.config.read().await;
+        resolve_alias(&cfg, requested_model)
+    }; // cfg read guard dropped — future is `Send`
+    if !candidates.iter().any(|n| state.manager.has_model(n)) {
+        state.peers.refresh_and_materialize().await;
+        // Re-*resolve* (not just re-check): materialization may have
+        // created a new bare-name alias for the requested model.
+        let (candidates, policy, make_room, drain_timeout) = {
+            let cfg = state.config.read().await;
+            resolve_alias(&cfg, requested_model)
+        };
+        if !candidates.iter().any(|n| state.manager.has_model(n)) {
+            return Err(ApiError::ModelNotFound(requested_model.to_string()));
+        }
+        return Ok((candidates, policy, make_room, drain_timeout));
+    }
+    Ok((candidates, policy, make_room, drain_timeout))
 }
 
 // ── Completion logging ───────────────────────────────────────────────────────
@@ -3220,6 +3498,13 @@ fn record_stats(
     duration_ms: u64,
     ttft_ms: Option<u64>,
 ) {
+    // Cluster peering: the master never counts forwarded requests into
+    // its own per-model metrics — the leaf's numbers are authoritative
+    // for its models (docs/006, decision 9; the union aggregates them
+    // at query time).
+    if state.manager.is_peer_model(model_name) {
+        return;
+    }
     if prompt_tokens.is_some() || completion_tokens.is_some() {
         state.stats.record(
             model_name,
@@ -3243,19 +3528,160 @@ fn with_auth(builder: reqwest::RequestBuilder, auth: &Option<String>) -> reqwest
     }
 }
 
+// ── Cluster peering: forwarding boundary ─────────────────────────────────
+
+/// Peer-forwarding context for a request routed to a cluster peer model
+/// (see `docs/006-cluster-peering.md`).  `None` (from [`peer_forward`])
+/// for local models — their forwarding path is byte-identical to today's.
+pub(crate) struct PeerForward<'a> {
+    pub state: &'a AppState,
+    /// Master-side model name (the name the client used / the effective
+    /// config's entry name).
+    pub model_name: &'a str,
+    pub request_id: &'a str,
+}
+
+/// Build the peer-forwarding context for a model, or `None` when the
+/// model is local.
+fn peer_forward<'a>(
+    state: &'a AppState,
+    model_name: &'a str,
+    request_id: &'a str,
+) -> Option<PeerForward<'a>> {
+    state
+        .manager
+        .is_peer_model(model_name)
+        .then_some(PeerForward {
+            state,
+            model_name,
+            request_id,
+        })
+}
+
+/// Rewrite a request body's top-level `model` field to the leaf-side
+/// name (the only documented exception to opaque-body passthrough).
+fn rewrite_request_model(
+    body: &serde_json::Value,
+    manager: &crate::scheduler::InstanceManager,
+    model_name: &str,
+) -> serde_json::Value {
+    match manager.upstream_model(model_name) {
+        Some(upstream) => {
+            let mut rewritten = body.clone();
+            rewritten["model"] = serde_json::Value::String(upstream);
+            rewritten
+        }
+        None => body.clone(),
+    }
+}
+
+/// Handle a leaf-side response at the forwarding boundary: record the
+/// leaf's request ID (for `/v1/requests/{id}` proxying) from its
+/// `x-llm-orch-request-id` header.
+fn note_leaf_request(peer: &PeerForward<'_>, resp: &reqwest::Response) {
+    if let Some(leaf_id) = resp
+        .headers()
+        .get("x-llm-orch-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        && let Some(peer_name) = peer.state.manager.peer_of_model(peer.model_name)
+    {
+        peer.state
+            .manager
+            .note_peer_request(peer.request_id, &peer_name, peer.model_name, leaf_id);
+    }
+}
+
+/// A non-success leaf response whose status suggests the leaf's model
+/// set drifted (404): schedule a background catalog refresh so
+/// subsequent requests recover.  The current request still fails.
+fn maybe_schedule_peer_refresh(peer: &PeerForward<'_>, status: reqwest::StatusCode) {
+    if status == reqwest::StatusCode::NOT_FOUND
+        && let Some(peer_name) = peer.state.manager.peer_of_model(peer.model_name)
+    {
+        peer.state.peers.schedule_refresh(&peer_name);
+    }
+}
+
+/// Rewrite a raw (already-serialized) request body's top-level `model`
+/// field to the leaf-side name — cluster peering, JSON bodies only.
+/// Non-JSON bodies (multipart audio) are returned unchanged: their
+/// model fields were rewritten before serialization.
+fn rewrite_raw_model(
+    state: &AppState,
+    model_name: &str,
+    body: Vec<u8>,
+    content_type: &str,
+) -> Vec<u8> {
+    if !state.manager.is_peer_model(model_name) || !content_type.starts_with("application/json") {
+        return body;
+    }
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    let upstream = state.manager.backend_model_name(model_name);
+    value["model"] = serde_json::Value::String(upstream);
+    serde_json::to_vec(&value).unwrap_or(body)
+}
+
+/// Record the leaf-side request ID (from its `x-llm-orch-request-id` response
+/// header) and schedule a catalog refresh on 404 — the forwarding
+/// boundary for the raw-body (audio / diffusion) helpers.
+fn note_peer_from_response(
+    state: &AppState,
+    model_name: &str,
+    request_id: &str,
+    resp: &reqwest::Response,
+    status: reqwest::StatusCode,
+) {
+    if !state.manager.is_peer_model(model_name) {
+        return;
+    }
+    if let Some(leaf_id) = resp
+        .headers()
+        .get("x-llm-orch-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        && let Some(peer_name) = state.manager.peer_of_model(model_name)
+    {
+        state
+            .manager
+            .note_peer_request(request_id, &peer_name, model_name, leaf_id);
+    }
+    if status == reqwest::StatusCode::NOT_FOUND
+        && let Some(peer_name) = state.manager.peer_of_model(model_name)
+    {
+        state.peers.schedule_refresh(&peer_name);
+    }
+}
+
 /// Forward a request to a backend and aggregate the full response.
 ///
 /// `total_timeout` bounds the whole exchange (request + full body): a
 /// hung-but-alive backend must not tie up the in-flight slot and the
 /// client request forever.  `Duration::ZERO` disables the timeout.
+///
+/// `peer` carries the cluster-peering forwarding context for peer
+/// models: the body's `model` is rewritten to the leaf-side name, the
+/// response's `model` back to the master-side name, and the leaf's
+/// request ID recorded.
 async fn forward_request_aggregate(
     client: &reqwest::Client,
     backend_url: &str,
     body: &serde_json::Value,
     auth: &Option<String>,
     total_timeout: std::time::Duration,
+    peer: Option<PeerForward<'_>>,
 ) -> Result<serde_json::Value, ApiError> {
     let work = async {
+        let rewritten;
+        let body = match &peer {
+            Some(p) => {
+                rewritten = rewrite_request_model(body, &p.state.manager, p.model_name);
+                &rewritten
+            }
+            None => body,
+        };
         let resp = with_auth(client.post(backend_url).json(body), auth)
             .send()
             .await
@@ -3263,6 +3689,9 @@ async fn forward_request_aggregate(
 
         let status = resp.status();
         if !status.is_success() {
+            if let Some(p) = &peer {
+                maybe_schedule_peer_refresh(p, status);
+            }
             let text = resp.text().await.unwrap_or_else(|_| "unknown error".into());
             warn!(backend_status = %status, error = %text, "backend returned non-success");
             return Err(ApiError::Internal(format!(
@@ -3271,9 +3700,22 @@ async fn forward_request_aggregate(
             )));
         }
 
-        resp.json::<serde_json::Value>()
+        if let Some(p) = &peer {
+            note_leaf_request(p, &resp);
+        }
+
+        let mut value: serde_json::Value = resp
+            .json()
             .await
-            .map_err(|e| ApiError::Internal(format!("failed to parse backend response: {}", e)))
+            .map_err(|e| ApiError::Internal(format!("failed to parse backend response: {}", e)))?;
+
+        // Restore the master-side model name in the response body.
+        if let Some(p) = &peer
+            && value.get("model").is_some_and(serde_json::Value::is_string)
+        {
+            value["model"] = serde_json::Value::String(p.model_name.to_string());
+        }
+        Ok(value)
     };
 
     if total_timeout.is_zero() {
@@ -3317,7 +3759,20 @@ async fn build_sse_stream(
     api_user: String,
     request_id: String,
     idle_timeout: std::time::Duration,
+    peers: Option<Arc<crate::peers::PeerRegistry>>,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>, reqwest::Error> {
+    // Cluster peering: rewrite the body's model to the leaf-side name
+    // and remember the (upstream, master) pair for the per-chunk rewrite.
+    let upstream = manager.upstream_model(&model_name);
+    let model_rewrite = upstream.as_ref().map(|up| (up.clone(), model_name.clone()));
+    let body = match &upstream {
+        Some(up) => {
+            let mut rewritten = body;
+            rewritten["model"] = serde_json::Value::String(up.clone());
+            rewritten
+        }
+        None => body,
+    };
     // The idle timeout also bounds the wait for the first response
     // headers — a hung backend must not hold the slot while silent.
     let send = with_auth(client.post(&backend_url).json(&body), &auth).send();
@@ -3370,6 +3825,15 @@ async fn build_sse_stream(
 
     let status = resp.status();
     if !status.is_success() {
+        // Cluster peering: a 404 from a leaf means its model set
+        // drifted — schedule a catalog refresh so subsequent requests
+        // recover (this one still fails).
+        if status == reqwest::StatusCode::NOT_FOUND
+            && let Some(peers) = &peers
+            && let Some(peer_name) = manager.peer_of_model(&model_name)
+        {
+            peers.schedule_refresh(&peer_name);
+        }
         // Non-success before streaming — return an error event stream.
         let error_text = resp.text().await.unwrap_or_else(|_| "unknown error".into());
         warn!(backend_status = %status, error = %error_text, "backend returned non-success");
@@ -3411,6 +3875,17 @@ async fn build_sse_stream(
     }
 
     // Success — forward the byte stream as SSE events.
+    // Cluster peering: record the leaf's request ID for
+    // /v1/requests/{id} proxying.
+    if let Some(leaf_id) = resp
+        .headers()
+        .get("x-llm-orch-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        && let Some(peer_name) = manager.peer_of_model(&model_name)
+    {
+        manager.note_peer_request(&request_id, &peer_name, &model_name, leaf_id);
+    }
     let byte_stream = resp.bytes_stream();
     let sse_stream = SseForwarder::new(
         byte_stream,
@@ -3418,6 +3893,7 @@ async fn build_sse_stream(
         model_name,
         instance_id,
         debug,
+        model_rewrite,
         manager,
         stats,
         api_user,
@@ -3757,6 +4233,7 @@ async fn build_assigned_sse_stream(
         api_user,
         request_id,
         idle_timeout,
+        Some(Arc::clone(&state.peers)),
     )
     .await
     {
@@ -3820,6 +4297,10 @@ struct SseForwarder<S> {
     /// Kept alive until the stream ends.
     _guard: SlotGuard,
     instance_id: String,
+    /// Cluster peering: rewrite each data chunk's top-level `model` from
+    /// the leaf-side name back to the master-side name.  `None` for local
+    /// models — chunks pass through untouched.
+    model_rewrite: Option<(String, String)>,
 }
 
 impl<S> SseForwarder<S>
@@ -3833,6 +4314,7 @@ where
         model_name: String,
         instance_id: String,
         debug: Option<DebugStreamContext>,
+        model_rewrite: Option<(String, String)>,
         manager: Arc<InstanceManager>,
         stats: Arc<crate::stats::StatsStore>,
         api_user: String,
@@ -3856,6 +4338,7 @@ where
             saw_done: false,
             idle_timeout,
             idle_sleep,
+            model_rewrite,
             manager,
             stats,
             model_name,
@@ -3882,7 +4365,9 @@ where
         }
         loop {
             // Try to extract a complete event from the buffer.
-            if let Some((event, data)) = extract_sse_event(&mut self.buffer) {
+            let model_rewrite = self.model_rewrite.clone();
+            if let Some((event, data)) = extract_sse_event(&mut self.buffer, model_rewrite.as_ref())
+            {
                 if data == "[DONE]" {
                     // The backend's own terminator — forwarded like any
                     // other event and remembered so the stream end is
@@ -4146,7 +4631,14 @@ impl<S> Drop for SseForwarder<S> {
 /// SSE events are terminated by a double newline (`\n\n` or `\r\n\r\n`).
 /// Returns the extracted event with its raw data string and removes both
 /// from the buffer.
-fn extract_sse_event(buffer: &mut Vec<u8>) -> Option<(Event, String)> {
+/// Extract one complete SSE event from `buffer`.  When `model_rewrite`
+/// is set (cluster peering), the data's top-level `model` field is
+/// rewritten from the leaf-side name back to the master-side name —
+/// chunks without a matching string `model` pass through byte-identical.
+fn extract_sse_event(
+    buffer: &mut Vec<u8>,
+    model_rewrite: Option<&(String, String)>,
+) -> Option<(Event, String)> {
     let double_nl = find_double_newline(buffer)?;
     let event_bytes: Vec<u8> = buffer.drain(..double_nl).collect();
     let sep_len = detect_separator_len(buffer);
@@ -4169,7 +4661,16 @@ fn extract_sse_event(buffer: &mut Vec<u8>) -> Option<(Event, String)> {
         return None;
     }
 
-    let data = data_lines.join("\n");
+    let mut data = data_lines.join("\n");
+    if let Some((upstream, master)) = model_rewrite
+        && data.starts_with('{')
+        && data.contains("\"model\"")
+        && let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&data)
+        && value.get("model").and_then(|m| m.as_str()) == Some(upstream.as_str())
+    {
+        value["model"] = serde_json::Value::String(master.clone());
+        data = value.to_string();
+    }
     let mut event = Event::default().data(data.clone());
     if let Some(et) = event_type {
         event = event.event(et);
@@ -4359,6 +4860,7 @@ true\r\n\
             "m".into(),
             "m@cpu#0".into(),
             None,
+            None,
             mgr,
             Arc::new(crate::stats::StatsStore::default()),
             "user".into(),
@@ -4502,6 +5004,7 @@ true\r\n\
             "m".into(),
             "m@cpu#0".into(),
             None,
+            None,
             mgr.clone(),
             Arc::new(crate::stats::StatsStore::default()),
             "user".into(),
@@ -4550,6 +5053,7 @@ true\r\n\
             &serde_json::json!({"model": "m"}),
             &None,
             std::time::Duration::from_millis(200),
+            None,
         )
         .await
         .expect_err("hung backend must time out");

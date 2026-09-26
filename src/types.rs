@@ -191,16 +191,19 @@ pub struct ModelEntry {
 
 // ── /v1/info and /admin/status response ──────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfoResponse {
     pub models: Vec<ModelInfo>,
     pub aliases: Vec<AliasInfo>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub gpus: Vec<GpuStatus>,
     pub metrics: SchedulerMetrics,
+    /// Cluster-peering observability (empty / omitted without peers).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<crate::peers::PeerStatus>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub name: String,
     pub context_length: usize,
@@ -228,7 +231,7 @@ pub struct ModelInfo {
     pub backend: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AliasInfo {
     pub name: String,
     pub targets: Vec<String>,
@@ -361,12 +364,16 @@ pub struct RequestStatus {
 // ── GPU status (for /admin/status) ───────────────────────────────────────────
 
 /// Summary of a single GPU, derived from the raw sysfs snapshot.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuStatus {
     pub index: usize,
     pub pci_slot: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vram_vendor: Option<String>,
+    /// Cluster peering: the node this GPU belongs to (`None` = this
+    /// instance).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
     /// VRAM used / total in bytes.
     pub vram_used_bytes: u64,
     pub vram_total_bytes: u64,
@@ -684,7 +691,7 @@ pub struct AdminModelAction {
     pub model: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminResponse {
     pub status: String,
     pub message: String,
@@ -693,7 +700,7 @@ pub struct AdminResponse {
 // ── Completion tracking (for /admin/status) ──────────────────────────────────
 
 /// A single completed request, stored in a per-model ring buffer.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionRecord {
     /// Unix timestamp with milliseconds.
     pub ts: String,

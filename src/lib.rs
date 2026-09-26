@@ -14,6 +14,7 @@ pub mod http_client;
 pub mod instance;
 pub mod keepalive;
 pub mod nvidia;
+pub mod peers;
 pub mod port_alloc;
 pub mod reload;
 pub mod scheduler;

@@ -4,18 +4,20 @@
 // swap only on success, record the file mtime only after a successful swap
 // so rejected or failed reloads are retried on the next file event.
 
-use crate::{apikeys, config, scheduler, stats};
+use crate::{apikeys, config, peers, scheduler, stats};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 /// Atomic config reload: validate first, swap only on success.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_config_reload(
     path: &std::path::Path,
     cfg: &Arc<RwLock<config::Config>>,
     apikeys: &Arc<RwLock<apikeys::ApikeysStore>>,
     manager: &Arc<scheduler::InstanceManager>,
     stats: &Arc<stats::StatsStore>,
+    peers: &Arc<peers::PeerRegistry>,
     last_mtime: &Arc<Mutex<Option<std::time::SystemTime>>>,
 ) {
     // Skip if the file's mtime hasn't changed since our last reload.
@@ -57,10 +59,20 @@ pub async fn handle_config_reload(
                 }
             }
 
+            // Cluster peering (docs/006): refresh the peer catalogs
+            // *before* applying the new config, so alias targets can
+            // reference peer models and the materialized entries are
+            // present from the first request after the reload.  A peer
+            // that is down keeps its cached catalog — a dead leaf must
+            // not wedge the reload.
+            peers.reconcile(&new_cfg);
+            peers.refresh_all_catalogs().await;
+            let effective = peers.effective_config(&new_cfg);
+
             // Reconcile the instance manager (model defs, cmd aliases,
             // device maps, port range, keep-alive, crash blocks) before
             // swapping the shared config that handlers validate against.
-            manager.reconcile_config(&new_cfg).await;
+            manager.reconcile_config(&effective).await;
 
             // Retarget the stats file if the path changed (counter state
             // is kept; the new file is published immediately).
@@ -75,8 +87,8 @@ pub async fn handle_config_reload(
             }
 
             // Atomic swap.
-            let model_count = new_cfg.models.len();
-            *cfg.write().await = new_cfg;
+            let model_count = effective.models.len();
+            *cfg.write().await = effective;
             // Record the mtime only on success — a rejected or failed
             // reload must be retried on the next file event, not consumed.
             *last_mtime.lock().await = Some(mtime);

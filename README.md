@@ -12,6 +12,7 @@
 - **API Key Authentication**: Simple, file-based API key management with hot-reload support.
 - **Multi-GPU Support**: Supports models that span multiple GPUs by coordinating tensor splits across specified devices.
 - **Model Aliasing**: Create aliases for models with optional system prompt injections for different use cases.
+- **Cluster Peering**: Front further llm-orch instances as one endpoint — peer models under `<peer>/<model>` names, one apikey per peer, unified stats and admin views.
 
 ## 🏗 Architecture
 
@@ -91,6 +92,41 @@ Lifecycle differences vs. local models:
 - The instance is never idle-evicted and nothing is killed on config reload or shutdown — there is no local process. A down endpoint simply fails its probe; the model is **not** blocked, and the next request re-probes, so the model recovers without operator intervention.
 - `remote_auth` placeholders resolve against `key_files` **at request time**: rotating the key file (or hot-reloading the config) applies immediately, no instance replacement needed. Files are watched; contents are re-read on file change, config reload, and startup.
 - EMA load/latency metrics work as usual (in-flight + queued request counts).
+
+### Cluster peering (gateway mode)
+
+Two hosts, one endpoint: a master llm-orch can front further llm-orch
+instances (peers) and re-export their models. The peers are ordinary
+orchestrators — each sees a single client holding one apikey, so user keys
+and per-user accounting stay entirely on the master. Full design:
+[`docs/006-cluster-peering.md`](docs/006-cluster-peering.md).
+
+```yaml
+node_name: cheyenne
+peers:
+  - name: cortana                    # becomes part of model names
+    url: "http://cortana.lan:8080"
+    remote_auth: "Bearer {peer_key_cortana}"
+```
+
+- **Naming**: peer models are pinned as `cortana/qwen-flash`; a bare
+  `qwen-flash` works when the name is unique (local models win bare-name
+  collisions). Local models are also addressable as `cheyenne/<model>`.
+  Client-side provider prefixes (e.g. `llm/cortana/qwen-flash`) are
+  stripped automatically — llm-orch never needs to know them.
+- **Discovery**: peer catalogs are fetched lazily (request routing,
+  `/v1/models`, before config hot-reloads) behind a TTL — no background
+  poller. A vanished model 404s once, then the catalog refreshes.
+- **Forwarding**: bodies pass through opaque except the top-level `model`
+  field (rewritten to the leaf-side name and back). The master never
+  counts forwarded requests in its own stats — `/v1/stats` merges the
+  leaves' numbers on demand (node-qualified entries plus bare-name sums
+  across duplicated models); `/v1/info` and `/admin/status` merge the same
+  way. `/admin/load|unload|unblock` and `/v1/requests/{id}` are proxied to
+  the owning leaf.
+- **No shim-side autoscaling or admission control**: the per-peer
+  `max_concurrent` is a circuit breaker; queueing and autoscaling happen
+  on the peers.
 
 ### Autoscaling
 

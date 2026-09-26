@@ -179,6 +179,40 @@ peers:
 A pure shim has `models: []`; local models plus `peers:` in one config is
 the intended common case (the master host also serves its dense models).
 
+# Implementation notes (post-implementation)
+
+Deviations and refinements discovered during implementation:
+
+1. **Nested-qualification guard.** A leaf's `/v1/models` includes its own
+   node-qualified names (the client-facing listing). To stop a master from
+   re-exporting them as `cortana/cortana/qwen-flash`, every `/v1/models`
+   response carries an `x-llm-orch-node` header; the catalog fetch filters
+   the peer's self-qualified entries.
+2. **Stats/info self-qualification is gateway-only.** The node-qualified
+   copies of local entries in `/v1/stats` and `/v1/info` are emitted only
+   when peers are configured (a gateway's union view). A peer-less node
+   emits bare-only responses, so a consuming master re-exports each entry
+   exactly once.
+3. **Alias target validation stays offline.** Peer-qualified alias
+   targets are validated structurally (the peer must be configured), not
+   against the live catalog — so `--check-config` works without network
+   access. A stale target surfaces as a request-time 404.
+4. **Bare-name overlap routing uses the alias machinery.** A bare name
+   served by several peers materializes as an alias over the qualified
+   names with the existing `prefer_loaded` policy, not a custom
+   round-robin — the existing candidate machinery covers the two-host
+   scale; the queue-depth tiebreak can be added later without config
+   changes.
+5. **Response `model` carries the resolved name.** A bare `qwen-flash`
+   request answers with `model: cortana/qwen-flash` — the model that
+   actually served it — consistent with pre-existing alias semantics.
+6. **404 recovery is scheduled, not inline.** A 404 from a leaf schedules
+   a background catalog refresh + rematerialization; the failing request
+   still errors. The next request recovers.
+7. **The request-ID map stores the model name** alongside (peer, leaf
+   id) so the proxied `/v1/requests/{id}` response is rewritten to the
+   master's request ID and master-side model names.
+
 # Implementation outline
 
 1. `PeerConfig` + `node_name` in `src/config.rs`; validation (node and

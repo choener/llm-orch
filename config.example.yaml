@@ -89,6 +89,33 @@ apikeys_file: "apikeys.txt"
 #   reserved (they would shadow runtime placeholders).
 # key_files:
 #   deploy_key: /etc/llm-orch/keys/deploy.key
+#   peer_key_cortana: /etc/llm-orch/keys/cortana.key
+
+# ---------------------------------------------------------------------------
+# Cluster peering (gateway mode) — see docs/006-cluster-peering.md
+# ---------------------------------------------------------------------------
+# This instance's node name.  When set, local models are additionally
+# addressable as `<node_name>/<model>`, and a leading `<node_name>/` (or
+# any other unknown first path segment — a client-side provider prefix
+# such as `llm/`) is stripped during model resolution.  Peer models are
+# addressed as `<peer>/<model>` (pinned) or bare `<model>` (unique name).
+# node_name: cheyenne
+
+# Leaf llm-orch instances whose models this instance re-exports.  Each
+# peer is an ordinary llm-orch: it sees a single client holding one
+# apikey (`remote_auth`).  Its models surface as remote models under
+# `<peer>/<model>` plus a bare-name alias when unique.  Catalogs are
+# fetched lazily (request routing, /v1/models, pre-hot-reload) — no
+# background poller.  Admin actions, /v1/requests/{id}, and the stats /
+# info unions are proxied / merged across peers.
+# peers:
+#   - name: cortana                 # [a-z0-9-]+, part of model names
+#     url: "http://cortana.lan:8080"
+#     remote_auth: "Bearer {peer_key_cortana}"
+#     catalog_ttl_secs: 60          # lazy catalog refresh threshold
+#     max_concurrent: 64            # shim-side circuit breaker
+#     # include: ["qwen-*"]         # optional re-export filters (* globs)
+#     # exclude: ["*-draft"]
 
 # ---------------------------------------------------------------------------
 # Device mapping

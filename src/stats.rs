@@ -103,6 +103,40 @@ pub struct StatsModel {
     pub boot: ModelCounters,
 }
 
+impl StatsModel {
+    /// Sum another node's counters into this one (cluster-peering stats
+    /// union — bare names sum over every node serving the model).
+    pub fn merge(&mut self, other: &StatsModel) {
+        self.total.merge(&other.total);
+        self.boot.merge(&other.boot);
+    }
+}
+
+impl ModelCounters {
+    /// Sum another set of counters into this one.  Minima/maxima combine
+    /// accordingly; `duration_avg_ms` is recomputed from the sums.
+    pub fn merge(&mut self, other: &ModelCounters) {
+        let requests = self.requests + other.requests;
+        self.requests = requests;
+        self.prompt_tokens += other.prompt_tokens;
+        self.cached_tokens += other.cached_tokens;
+        self.completion_tokens += other.completion_tokens;
+        self.ttft_count += other.ttft_count;
+        self.ttft_sum_ms += other.ttft_sum_ms;
+        self.ttft_min_ms = match (self.ttft_min_ms, other.ttft_min_ms) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        self.ttft_max_ms = match (self.ttft_max_ms, other.ttft_max_ms) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        self.duration_sum_ms += other.duration_sum_ms;
+        self.duration_avg_ms = self.duration_sum_ms.checked_div(requests).unwrap_or(0);
+        self.last_active = self.last_active.max(other.last_active);
+    }
+}
+
 /// Unix seconds since the epoch.
 fn now_secs() -> u64 {
     std::time::SystemTime::now()

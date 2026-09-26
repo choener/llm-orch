@@ -21,7 +21,7 @@ pub enum ConfigError {
 // ---------------------------------------------------------------------------
 
 /// Top-level configuration, deserialized from YAML.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
     pub apikeys_file: PathBuf,
@@ -36,6 +36,20 @@ pub struct Config {
     /// config hot-reload and when the files themselves change.
     #[serde(default)]
     pub key_files: HashMap<String, PathBuf>,
+
+    /// This instance's node name for cluster peering (see
+    /// `docs/006-cluster-peering.md`).  Local models are additionally
+    /// addressable as `<node_name>/<model>`, and a leading
+    /// `<node_name>/` (or any other unknown first path segment, e.g. a
+    /// client-side provider prefix like pi's `llm/`) is stripped during
+    /// model resolution.  `None` disables node-qualified naming.
+    #[serde(default)]
+    pub node_name: Option<String>,
+
+    /// Cluster peers (leaf llm-orch instances this instance fronts as a
+    /// gateway).  Empty = standalone operation.
+    #[serde(default)]
+    pub peers: Vec<PeerConfig>,
 
     #[serde(default)]
     pub models: Vec<ModelConfig>,
@@ -117,6 +131,12 @@ impl Config {
             if m.cmd.trim().is_empty() {
                 return Err(ConfigError::Validation(format!(
                     "model '{}': cmd must not be empty",
+                    m.name
+                )));
+            }
+            if m.name.contains('/') {
+                return Err(ConfigError::Validation(format!(
+                    "model '{}': names must not contain '/' — the path separator is reserved for node-qualified cluster peering names (<peer>/<model>)",
                     m.name
                 )));
             }
@@ -285,6 +305,7 @@ impl Config {
         // --- aliases ---
         let model_names: HashSet<&str> = self.models.iter().map(|m| m.name.as_str()).collect();
         let alias_names: HashSet<&str> = self.aliases.iter().map(|a| a.name.as_str()).collect();
+        let peer_names: HashSet<&str> = self.peers.iter().map(|p| p.name.as_str()).collect();
         let mut seen_aliases = HashSet::new();
         for a in &self.aliases {
             if a.name.is_empty() {
@@ -326,12 +347,98 @@ impl Config {
                         a.name, t
                     )));
                 }
-                if !model_names.contains(t.as_str()) {
+                // A target may name a local model or a peer model in
+                // qualified form `<peer>/<model>`.  Peer targets are
+                // checked structurally only (the peer must exist): the
+                // peer's live catalog is runtime state, so an unknown
+                // model on the peer surfaces as a request-time 404
+                // rather than a config rejection (which would make
+                // offline `--check-config` runs fail on live state).
+                if !model_names.contains(t.as_str()) && !t.contains('/') {
                     return Err(ConfigError::Validation(format!(
                         "alias '{}' targets unknown model '{}'",
                         a.name, t
                     )));
                 }
+                if let Some((peer, _)) = t.split_once('/')
+                    && !peer_names.contains(peer)
+                {
+                    return Err(ConfigError::Validation(format!(
+                        "alias '{}' targets model '{}' on unknown peer '{}' (configured peers: {})",
+                        a.name,
+                        t,
+                        peer,
+                        if peer_names.is_empty() {
+                            "none".into()
+                        } else {
+                            peer_names.iter().cloned().collect::<Vec<_>>().join(", ")
+                        }
+                    )));
+                }
+            }
+        }
+
+        // --- node_name / peers ---
+        if let Some(ref node) = self.node_name
+            && !valid_node_name(node)
+        {
+            return Err(ConfigError::Validation(format!(
+                "node_name '{}' is invalid: must be non-empty and only [a-z0-9-]",
+                node
+            )));
+        }
+        let mut seen_peers = HashSet::new();
+        for p in &self.peers {
+            if !valid_node_name(&p.name) {
+                return Err(ConfigError::Validation(format!(
+                    "peers: name '{}' is invalid: must be non-empty and only [a-z0-9-]",
+                    p.name
+                )));
+            }
+            if !seen_peers.insert(p.name.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "peers: duplicate peer name '{}'",
+                    p.name
+                )));
+            }
+            if Some(p.name.as_str()) == self.node_name.as_deref() {
+                return Err(ConfigError::Validation(format!(
+                    "peers: peer name '{}' collides with this instance's node_name",
+                    p.name
+                )));
+            }
+            if !valid_peer_url(&p.url) {
+                return Err(ConfigError::Validation(format!(
+                    "peers: '{}' has an invalid url '{}' (expected http(s)://host[:port])",
+                    p.name, p.url
+                )));
+            }
+            if p.catalog_ttl_secs == 0 {
+                return Err(ConfigError::Validation(format!(
+                    "peers: '{}' catalog_ttl_secs must be > 0",
+                    p.name
+                )));
+            }
+            if p.max_concurrent == 0 {
+                return Err(ConfigError::Validation(format!(
+                    "peers: '{}' max_concurrent must be > 0",
+                    p.name
+                )));
+            }
+            if p.remote_auth.as_ref().is_some_and(|a| a.trim().is_empty()) {
+                return Err(ConfigError::Validation(format!(
+                    "peers: '{}' remote_auth must not be empty",
+                    p.name
+                )));
+            }
+            // The qualified form of a local model is `<node_name>/<model>`;
+            // a peer named identically to a local model would make
+            // `<name>/...` ambiguous between the two.
+            if model_names.contains(p.name.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "peers: peer name '{}' collides with a local model name",
+                    p.name
+                )));
             }
         }
 
@@ -1017,6 +1124,18 @@ pub struct ModelConfig {
     /// Must be at least 15 s (the serialized first-poll window).
     #[serde(default)]
     pub spawn_timeout_secs: Option<u64>,
+
+    /// Leaf-side model name for cluster-peering virtual models: the name
+    /// the owning peer expects in request bodies (the master-side name
+    /// minus its node qualification).  `None` for local models — never
+    /// set from YAML; materialized by the peer registry at runtime.
+    #[serde(skip)]
+    pub upstream_model: Option<String>,
+
+    /// Owning peer name for cluster-peering virtual models.
+    /// `None` for local (YAML-configured) models — never set from YAML.
+    #[serde(skip)]
+    pub peer: Option<String>,
 }
 
 impl ModelConfig {
@@ -1526,6 +1645,93 @@ pub struct AliasConfig {
     /// `make_room: drain_surplus`.
     #[serde(default = "default_drain_timeout")]
     pub drain_timeout: u64,
+
+    /// Owning peer name for cluster-peering virtual bare-name aliases.
+    /// `None` for user-configured aliases — never set from YAML.
+    #[serde(skip)]
+    pub peer: Option<String>,
+}
+
+// ── Cluster peering ─────────────────────────────────────────────────────────
+
+/// A cluster peer: another llm-orch instance whose models this instance
+/// re-exports (see `docs/006-cluster-peering.md`).  Peer models surface as
+/// remote models qualified with the peer's name (`<peer>/<model>`) plus a
+/// bare-name alias when the name is unique and does not collide with a
+/// local model.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PeerConfig {
+    /// Peer node name — becomes part of re-exported model names
+    /// (`<name>/<model>`).  Restricted to `[a-z0-9-]+`.
+    pub name: String,
+
+    /// Base URL of the peer's llm-orch HTTP endpoint
+    /// (`http://host:port` or `https://host:port`).
+    pub url: String,
+
+    /// Authorization header value sent on every peer request, e.g.
+    /// `"Bearer {peer_key}"` where `peer_key` comes from `key_files`.
+    #[serde(default)]
+    pub remote_auth: Option<String>,
+
+    /// Age (seconds) after which the peer's model catalog is re-fetched
+    /// before it is used again (lazy refresh; no background poller).
+    #[serde(default = "default_catalog_ttl")]
+    pub catalog_ttl_secs: u64,
+
+    /// Shim-side cap on concurrent forwarded requests to this peer.
+    /// A circuit breaker only — real admission control happens on the
+    /// peer itself.
+    #[serde(default = "default_peer_max_concurrent")]
+    pub max_concurrent: usize,
+
+    /// Optional `*`-glob patterns; when non-empty, only matching peer
+    /// model names are re-exported.
+    #[serde(default)]
+    pub include: Option<Vec<String>>,
+
+    /// Optional `*`-glob patterns; matching peer model names are never
+    /// re-exported.  Applied after `include`.
+    #[serde(default)]
+    pub exclude: Option<Vec<String>>,
+}
+
+impl PeerConfig {
+    /// Resolve `remote_auth` against the current key-file contents.
+    pub fn resolved_auth(&self, key_files: &HashMap<String, String>) -> Option<String> {
+        self.remote_auth
+            .as_ref()
+            .map(|template| resolve_remote_auth(key_files, template))
+    }
+}
+
+fn default_catalog_ttl() -> u64 {
+    60
+}
+fn default_peer_max_concurrent() -> usize {
+    64
+}
+
+/// Check a peer base URL: `http://host[:port]` or `https://host[:port]`
+/// with a non-empty host.  No path component — paths are appended by the
+/// forwarding layer (`{base}/v1/...`).
+fn valid_peer_url(url: &str) -> bool {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or("");
+    let host = rest.split('/').next().unwrap_or("");
+    !host.is_empty()
+}
+
+/// Check a node or peer name: non-empty, `[a-z0-9-]+` — it becomes part
+/// of model identifiers and must survive round-trips through client
+/// provider namespaces.
+pub fn valid_node_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 fn default_drain_timeout() -> u64 {
@@ -2541,6 +2747,8 @@ models:
                 autoscale: None,
                 spawn_timeout_secs: None,
                 remote_auth: None,
+                upstream_model: None,
+                peer: None,
             }
         }
     }
@@ -2713,5 +2921,115 @@ key_files:
             resolve_remote_auth(&keys, "Bearer {known} {missing}"),
             "Bearer value {missing}"
         );
+    }
+
+    // ── Cluster peering ─────────────────────────────────────────────
+
+    fn peer_yaml(peers: &str) -> String {
+        format!(
+            r#"
+server: {{}}
+apikeys_file: apikeys.txt
+node_name: cheyenne
+{peers}
+models:
+  - name: m
+    context_length: 4096
+    cmd: "sleep 3600"
+"#
+        )
+    }
+
+    #[test]
+    fn accepts_valid_peer_config() {
+        let yaml = peer_yaml(
+            r#"
+peers:
+  - name: cortana
+    url: "http://cortana.lan:8080"
+    remote_auth: "Bearer {peer_key_cortana}"
+"#,
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.node_name.as_deref(), Some("cheyenne"));
+        assert_eq!(cfg.peers.len(), 1);
+        assert_eq!(cfg.peers[0].catalog_ttl_secs, 60);
+        assert_eq!(cfg.peers[0].max_concurrent, 64);
+    }
+
+    #[test]
+    fn rejects_invalid_peer_names() {
+        for bad in ["Cortana", "cor_tana", "", "cor tana"] {
+            let yaml = peer_yaml(&format!("peers:\n  - name: {bad}\n    url: \"http://x:1\""));
+            expect_validation_error(&yaml, "only [a-z0-9-]");
+        }
+    }
+
+    #[test]
+    fn rejects_peer_colliding_with_node_name() {
+        let yaml = peer_yaml("peers:\n  - name: cheyenne\n    url: \"http://x:1\"");
+        expect_validation_error(&yaml, "node_name");
+    }
+
+    #[test]
+    fn rejects_invalid_peer_url() {
+        for bad in ["ftp://x", "http://", "x"] {
+            let yaml = peer_yaml(&format!("peers:\n  - name: cortana\n    url: \"{bad}\""));
+            expect_validation_error(&yaml, "invalid url");
+        }
+    }
+
+    #[test]
+    fn rejects_model_names_with_slash() {
+        let yaml = peer_yaml("").replace("name: m", "name: a/b");
+        expect_validation_error(&yaml, "must not contain '/'");
+    }
+
+    #[test]
+    fn alias_may_target_peer_qualified_model() {
+        let yaml = peer_yaml(
+            r#"
+peers:
+  - name: cortana
+    url: "http://cortana.lan:8080"
+aliases:
+  - name: flash
+    targets: [cortana/qwen-flash]
+"#,
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(
+            cfg.aliases[0].targets,
+            vec!["cortana/qwen-flash".to_string()]
+        );
+    }
+
+    #[test]
+    fn alias_rejects_unknown_peer_target() {
+        let yaml = peer_yaml(
+            r#"
+aliases:
+  - name: flash
+    targets: [nowhere/qwen-flash]
+"#,
+        );
+        expect_validation_error(&yaml, "unknown peer 'nowhere'");
+    }
+
+    #[test]
+    fn alias_rejects_unknown_bare_target_with_peers_configured() {
+        // A bare name is only valid as a local model; peer models must be
+        // referenced in qualified form so `--check-config` stays offline.
+        let yaml = peer_yaml(
+            r#"
+peers:
+  - name: cortana
+    url: "http://cortana.lan:8080"
+aliases:
+  - name: flash
+    targets: [qwen-flash]
+"#,
+        );
+        expect_validation_error(&yaml, "unknown model");
     }
 }

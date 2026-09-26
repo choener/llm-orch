@@ -1,6 +1,6 @@
 use clap::Parser;
 use llm_orch::{
-    apikeys, config, debug_log, gpu, keepalive, reload, scheduler, server, stats, watcher,
+    apikeys, config, debug_log, gpu, keepalive, peers, reload, scheduler, server, stats, watcher,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -168,6 +168,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let last_reload_mtime = Arc::new(Mutex::new(None::<std::time::SystemTime>));
     let last_apikeys_mtime = Arc::new(Mutex::new(None::<std::time::SystemTime>));
 
+    // ── Cluster peering (docs/006) ────────────────────────────────
+    // The registry owns peer catalogs and materializes peer models as
+    // remote ModelConfig entries in the effective (shared) config.  No
+    // peers configured ⇒ inert.
+    let peers = Arc::new(peers::PeerRegistry::new(manager.client().clone()));
+    peers.install_runtime(Arc::clone(&shared_cfg), Arc::clone(&manager));
+    if !shared_cfg.read().await.peers.is_empty() {
+        info!(
+            peers = ?shared_cfg.read().await.peers.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+            "cluster peers configured — fetching initial catalogs"
+        );
+        peers.reconcile(&shared_cfg.read().await.clone());
+        peers.refresh_all_catalogs().await;
+        peers.rematerialize().await;
+    }
+
     // TODO §7: start HTTP server.
 
     // ── Start HTTP server §7 ───────────────────────────────────────────
@@ -189,6 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gpu: gpu_snapshot,
         debug_loggers,
         stats: Arc::clone(&stats),
+        peers: Arc::clone(&peers),
     };
     let mut server_task = tokio::spawn(server::serve(app_state, shutdown_rx));
 
@@ -220,6 +237,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cfg = Arc::clone(&shared_cfg);
         let apikeys = Arc::clone(&shared_apikeys);
         let manager = Arc::clone(&manager);
+        let peers = Arc::clone(&peers);
         let last_mtime = Arc::clone(&last_reload_mtime);
         let last_ak_mtime = Arc::clone(&last_apikeys_mtime);
         let watch_handle = Arc::clone(&watch_handle);
@@ -249,6 +267,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &apikeys,
                             &manager,
                             &stats,
+                            &peers,
                             &last_mtime,
                         )
                         .await;
@@ -273,6 +292,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &apikeys,
                             &manager,
                             &stats,
+                            &peers,
                             &last_mtime,
                         )
                         .await;

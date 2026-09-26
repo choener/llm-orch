@@ -53,6 +53,7 @@ struct TestServer {
     config: Arc<RwLock<config::Config>>,
     apikeys: Arc<RwLock<apikeys::ApikeysStore>>,
     stats: Arc<stats::StatsStore>,
+    peers: Arc<llm_orch::peers::PeerRegistry>,
     _shutdown: oneshot::Sender<()>,
     _dir: PathBuf,
 }
@@ -111,6 +112,16 @@ async fn boot_from_config_path(
     let stats_store = Arc::new(stats::StatsStore::new(
         shared_cfg.read().await.stats.as_ref().map(|s| &s.file),
     ));
+    // Cluster peering: mirror main.rs wiring (registry + runtime
+    // handles + initial materialization).
+    let peers = Arc::new(llm_orch::peers::PeerRegistry::new(manager.client().clone()));
+    peers.install_runtime(Arc::clone(&shared_cfg), Arc::clone(&manager));
+    peers.reconcile(&shared_cfg.read().await.clone());
+    // Mirror main.rs: fetch initial catalogs when peers are configured.
+    if !shared_cfg.read().await.peers.is_empty() {
+        peers.refresh_all_catalogs().await;
+    }
+    peers.rematerialize().await;
     let state = server::AppState {
         config: Arc::clone(&shared_cfg),
         apikeys: Arc::clone(&shared_keys),
@@ -119,6 +130,7 @@ async fn boot_from_config_path(
         gpu: gpu_snapshot,
         debug_loggers: Arc::new(debug_log::DebugLoggers::new()),
         stats: Arc::clone(&stats_store),
+        peers: Arc::clone(&peers),
     };
     let (tx, rx) = oneshot::channel();
     let server_task = tokio::spawn(server::serve(state, rx));
@@ -135,6 +147,7 @@ async fn boot_from_config_path(
         config: shared_cfg,
         stats: stats_store,
         apikeys: shared_keys,
+        peers,
         _shutdown: tx,
         _dir: dir.to_path_buf(),
     }
@@ -214,6 +227,10 @@ async fn queued_stream_emits_sse_comment_before_assignment() {
     let manager = Arc::new(manager);
     let config_state = Arc::new(RwLock::new(cfg));
     let apikeys_state = Arc::new(RwLock::new(keys));
+    let peers = Arc::new(llm_orch::peers::PeerRegistry::new(manager.client().clone()));
+    peers.install_runtime(Arc::clone(&config_state), Arc::clone(&manager));
+    peers.reconcile(&config_state.read().await.clone());
+    peers.rematerialize().await;
     let state = server::AppState {
         config: Arc::clone(&config_state),
         apikeys: Arc::clone(&apikeys_state),
@@ -222,6 +239,7 @@ async fn queued_stream_emits_sse_comment_before_assignment() {
         gpu: gpu_snapshot,
         debug_loggers: Arc::new(debug_log::DebugLoggers::new()),
         stats: Arc::new(stats::StatsStore::default()),
+        peers: Arc::clone(&peers),
     };
     tokio::spawn({
         let manager = Arc::clone(&manager);
@@ -612,6 +630,7 @@ async fn reload_rejects_bad_config_and_keeps_serving_old() {
         &srv.apikeys,
         &srv.manager,
         &srv.stats,
+        &srv.peers,
         &last_mtime,
     )
     .await;
@@ -644,6 +663,7 @@ async fn reload_rejects_bad_config_and_keeps_serving_old() {
         &srv.apikeys,
         &srv.manager,
         &srv.stats,
+        &srv.peers,
         &last_mtime,
     )
     .await;
@@ -665,6 +685,7 @@ async fn reload_rejects_bad_config_and_keeps_serving_old() {
         &srv.apikeys,
         &srv.manager,
         &srv.stats,
+        &srv.peers,
         &last_mtime,
     )
     .await;
@@ -1302,6 +1323,7 @@ async fn alias_targets_hot_reloaded() {
         &srv.apikeys,
         &srv.manager,
         &srv.stats,
+        &srv.peers,
         &last_mtime,
     )
     .await;
@@ -2276,6 +2298,7 @@ async fn stats_hot_reload_retargers_file() {
         &srv.apikeys,
         &srv.manager,
         &srv.stats,
+        &srv.peers,
         &last_mtime,
     )
     .await;
@@ -2313,4 +2336,304 @@ async fn stats_config_validation() {
         config::Config::load(&bad_path).is_err(),
         "stats.file with a missing parent directory must be rejected"
     );
+}
+
+// ── Cluster peering (docs/006) ───────────────────────────────────────────────
+
+/// Boot a server on a *fixed* listen port — needed so a master's `peers:`
+/// config can point at a leaf before the master boots.
+async fn boot_on_port(
+    dir: &Path,
+    listen_port: u16,
+    apikeys_contents: &str,
+    yaml: &str,
+) -> TestServer {
+    let config_path = write_config(dir, listen_port, yaml);
+    boot_from_config_path(dir, &config_path, apikeys_contents).await
+}
+
+/// A standalone stub backend process on a fixed port (the leaf's remote
+/// model target).  Killed when the guard drops.
+struct StubProcess(std::process::Child);
+
+impl Drop for StubProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+async fn spawn_stub_on(port: u16) -> StubProcess {
+    let child = std::process::Command::new(STUB_BIN)
+        .arg("--port")
+        .arg(port.to_string())
+        .spawn()
+        .expect("stub backend spawns");
+    let guard = StubProcess(child);
+    // Wait for readiness (health endpoint).
+    let client = reqwest::Client::new();
+    for _ in 0..100 {
+        if client
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .send()
+            .await
+            .is_ok()
+        {
+            return guard;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("stub backend on port {port} never became healthy");
+}
+
+/// Boot the two-node peering topology used by the tests below:
+/// master `cheyenne` (local stub-backed `local-dense` model + peer
+/// `cortana`) and leaf `cortana` (remote `qwen-flash` model on a
+/// standalone stub).  Both have stats enabled.
+struct PeeringTopology {
+    master: TestServer,
+    #[allow(dead_code)]
+    leaf: TestServer,
+    #[allow(dead_code)]
+    _stub: StubProcess,
+}
+
+async fn boot_peering() -> PeeringTopology {
+    let leaf_port = free_port();
+    let stub_port = free_port();
+    let _stub = spawn_stub_on(stub_port).await;
+
+    // Leaf: node `cortana`, one remote model served by the stub.
+    let leaf_dir = temp_dir("peering-leaf");
+    let leaf_yaml = format!(
+        "node_name: cortana\n\
+stats:\n  file: \"stats.json\"\n\
+models:\n  - name: qwen-flash\n    context_length: 8192\n    cmd: \"http://127.0.0.1:{stub_port}\"\n    idle_ttl: 3600\n"
+    );
+    let leaf = boot_on_port(&leaf_dir, leaf_port, "tester: secret-key\n", &leaf_yaml).await;
+
+    // Master: node `cheyenne`, local model + the leaf as its only peer.
+    let master_dir = temp_dir("peering-master");
+    let master_yaml = format!(
+        "node_name: cheyenne\n\
+peers:\n  - name: cortana\n    url: \"http://127.0.0.1:{leaf_port}\"\n    remote_auth: \"Bearer secret-key\"\n    catalog_ttl_secs: 1\n\
+stats:\n  file: \"stats.json\"\n\
+models:\n  - name: local-dense\n    context_length: 4096\n    cmd: \"{STUB_BIN} --port {{port}}\"\n    idle_ttl: 3600\n"
+    );
+    let master = boot(&master_dir, "tester: secret-key\n", &master_yaml).await;
+    PeeringTopology {
+        master,
+        leaf,
+        _stub,
+    }
+}
+
+/// The union model listing: bare local, node-qualified local, bare peer
+/// alias, and peer-qualified names — and never a client provider prefix.
+#[tokio::test]
+async fn peering_models_listing_shows_union() {
+    let topo = boot_peering().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{}/v1/models", topo.master.url))
+        .bearer_auth("secret-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    for expected in [
+        "local-dense",
+        "cheyenne/local-dense",
+        "qwen-flash",
+        "cortana/qwen-flash",
+    ] {
+        assert!(
+            ids.contains(&expected),
+            "model listing must contain '{expected}', got {ids:?}"
+        );
+    }
+    assert!(!ids.iter().any(|id| id.starts_with("llm/")));
+}
+
+/// End-to-end chat through all naming forms: pinned peer model, bare
+/// peer alias, client provider prefix, and node-qualified local model.
+/// The stub echoes the model name it received, so the response's `model`
+/// proves the full rewrite chain (master → leaf-side name → back).
+#[tokio::test]
+async fn peering_chat_routes_all_naming_forms() {
+    let topo = boot_peering().await;
+    let client = reqwest::Client::new();
+
+    for model in [
+        "cortana/qwen-flash",
+        "qwen-flash",
+        "llm/cortana/qwen-flash",
+        "llm/qwen-flash",
+        "local-dense",
+        "cheyenne/local-dense",
+    ] {
+        let resp = authed(&client, &format!("{}/v1/chat/completions", topo.master.url))
+            .json(&chat_body(model))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "request for {model} failed");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let returned = body["model"].as_str().unwrap_or_default();
+        // The response carries the *resolved* model name (existing alias
+        // semantics): bare requests resolve to the qualified peer model.
+        match model {
+            "qwen-flash" | "llm/qwen-flash" => assert_eq!(returned, "cortana/qwen-flash"),
+            "local-dense" | "cheyenne/local-dense" => assert_eq!(returned, "local-dense"),
+            // The provider prefix is stripped during resolution.
+            "llm/cortana/qwen-flash" => assert_eq!(returned, "cortana/qwen-flash"),
+            _ => assert_eq!(returned, model, "model name must round-trip"),
+        }
+        assert!(
+            !body["choices"][0]["message"]["content"].is_null(),
+            "stub must produce content for {model}"
+        );
+    }
+}
+
+/// The request-ID mapping: a forwarded request is answerable through the
+/// master's `/v1/requests/{id}` (proxied from the leaf).
+#[tokio::test]
+async fn peering_request_status_proxies_leaf() {
+    let topo = boot_peering().await;
+    let client = reqwest::Client::new();
+
+    let resp = authed(&client, &format!("{}/v1/chat/completions", topo.master.url))
+        .json(&chat_body("cortana/qwen-flash"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let request_id = resp
+        .headers()
+        .get("x-llm-orch-request-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("master sets x-llm-orch-request-id")
+        .to_string();
+
+    let status = client
+        .get(format!("{}/v1/requests/{request_id}", topo.master.url))
+        .bearer_auth("secret-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status.status(), 200, "leaf status must be proxied");
+    let body: serde_json::Value = status.json().await.unwrap();
+    assert_eq!(body["request_id"].as_str(), Some(request_id.as_str()));
+}
+
+/// Admin actions on a peer model are forwarded to the owning leaf.
+#[tokio::test]
+async fn peering_admin_load_forwards_to_leaf() {
+    let topo = boot_peering().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/admin/load", topo.master.url))
+        .bearer_auth("secret-key")
+        .json(&serde_json::json!({"model": "cortana/qwen-flash"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["status"].as_str(),
+        Some("ok"),
+        "leaf must accept the load"
+    );
+
+    // The leaf actually provisioned its remote model (health-probed).
+    assert_eq!(
+        topo.leaf
+            .manager
+            .instance_counts()
+            .get("qwen-flash")
+            .copied(),
+        Some(1)
+    );
+}
+
+/// The stats union: node-qualified entries carry each node's numbers,
+/// bare names sum over every node serving the model.  The master never
+/// counts forwarded requests into its own stats.
+#[tokio::test]
+async fn peering_stats_union_sums_and_qualifies() {
+    let topo = boot_peering().await;
+    let client = reqwest::Client::new();
+
+    // One local + one forwarded request.
+    for model in ["local-dense", "cortana/qwen-flash"] {
+        let resp = authed(&client, &format!("{}/v1/chat/completions", topo.master.url))
+            .json(&chat_body(model))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    let resp = client
+        .get(format!("{}/v1/stats", topo.master.url))
+        .bearer_auth("secret-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let models = &body["models"];
+
+    // Qualified leaf entry: the leaf's numbers verbatim.
+    assert_eq!(models["cortana/qwen-flash"]["total"]["requests"], 1);
+    // Bare peer name: the union sum.
+    assert_eq!(models["qwen-flash"]["total"]["requests"], 1);
+    // Local: bare + node-qualified copies, NOT counting the forward.
+    assert_eq!(models["local-dense"]["total"]["requests"], 1);
+    assert_eq!(models["cheyenne/local-dense"]["total"]["requests"], 1);
+    // The master did not double-count the peer model locally.
+    let obj = models.as_object().unwrap();
+    assert!(
+        !obj.contains_key("cheyenne/cortana/qwen-flash"),
+        "no double qualification: {obj:?}"
+    );
+}
+
+/// An unreachable peer with no catalog yet: requests fail fast with a
+/// model-not-found instead of hanging (stale beats empty, empty 404s).
+#[tokio::test]
+async fn peering_unreachable_peer_fails_fast() {
+    let dead_port = free_port();
+    let dir = temp_dir("peering-dead");
+    let yaml = format!(
+        "node_name: cheyenne\n\
+peers:\n  - name: cortana\n    url: \"http://127.0.0.1:{dead_port}\"\n    remote_auth: \"Bearer secret-key\"\n    catalog_ttl_secs: 3600\n\
+models:\n  - name: local-dense\n    context_length: 4096\n    cmd: \"{STUB_BIN} --port {{port}}\"\n    idle_ttl: 3600\n"
+    );
+    let srv = boot(&dir, "tester: secret-key\n", &yaml).await;
+    let client = reqwest::Client::new();
+
+    let t0 = std::time::Instant::now();
+    let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&chat_body("cortana/qwen-flash"))
+        .send()
+        .await
+        .unwrap();
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "unreachable peer must fail fast (took {elapsed:?})"
+    );
+    assert_eq!(resp.status(), 404);
 }
