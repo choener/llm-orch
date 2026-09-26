@@ -3277,9 +3277,7 @@ pub async fn admin_unblock(
             }));
         }
 
-        state.manager.unblock_model(&body.model);
-
-        info!(model = %body.model, "model unblocked via admin");
+        state.manager.unblock_model(&body.model, "admin unblock");
         Ok(Json(AdminResponse {
             status: "ok".into(),
             message: format!("model '{}' unblocked", body.model),
@@ -3344,6 +3342,18 @@ fn acquire_error_for_request(
     model_name: &str,
     error: AcquireError,
 ) -> ApiError {
+    // Make every rejected request self-explanatory in the journal: the
+    // tower_http on_failure line carries only status code and latency, so
+    // this is where the 503/429/504 diagnosis lives.
+    warn!(
+        request_id = %request_id,
+        model = %model_name,
+        error = ?error,
+        blocked = manager.is_blocked(model_name),
+        instances = manager.instance_counts().get(model_name).copied().unwrap_or(0),
+        shutting_down = manager.is_shutting_down(),
+        "request rejected"
+    );
     manager.update_request_state(
         request_id,
         if matches!(error, AcquireError::QueueTimeout) {

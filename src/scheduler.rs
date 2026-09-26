@@ -1373,7 +1373,7 @@ impl InstanceManager {
         self.shutdown_requested.store(true, Ordering::Release);
     }
 
-    fn is_shutting_down(&self) -> bool {
+    pub fn is_shutting_down(&self) -> bool {
         self.shutdown_requested.load(Ordering::Acquire)
     }
 
@@ -4141,16 +4141,28 @@ impl InstanceManager {
             .unwrap_or(false)
     }
 
-    pub fn block_model(&self, model_name: &str) {
+    pub fn block_model(&self, model_name: &str, cause: &str) {
+        let was_blocked = self.is_blocked(model_name);
         self.blocked
             .write()
             .unwrap()
             .insert(model_name.to_owned(), true);
+        if !was_blocked {
+            warn!(
+                model = %model_name,
+                cause,
+                "model blocked — all requests for it will be rejected until unblocked"
+            );
+        }
     }
 
-    pub fn unblock_model(&self, model_name: &str) {
+    pub fn unblock_model(&self, model_name: &str, cause: &str) {
+        let was_blocked = self.is_blocked(model_name);
         self.blocked.write().unwrap().remove(model_name);
         self.crash_counts.lock().unwrap().remove(model_name);
+        if was_blocked {
+            info!(model = %model_name, cause, "model unblocked");
+        }
     }
 
     // ── instance removal ─────────────────────────────────────────────────
@@ -4458,7 +4470,7 @@ impl InstanceManager {
                 crashes = count,
                 "model blocked after repeated pre-output crashes"
             );
-            self.block_model(model_name);
+            self.block_model(model_name, "repeated pre-output crashes");
         } else {
             warn!(
                 model = %model_name,
@@ -4731,11 +4743,14 @@ impl InstanceManager {
         }
 
         // ── Clear crash blocks (§5) ──────────────────────────────────
-        let had_blocked = !self.blocked.read().unwrap().is_empty();
+        let cleared: Vec<String> = self.blocked.read().unwrap().keys().cloned().collect();
         self.blocked.write().unwrap().clear();
         self.crash_counts.lock().unwrap().clear();
-        if had_blocked {
-            info!("crash-blocked models cleared by config reload");
+        if !cleared.is_empty() {
+            info!(
+                models = ?cleared,
+                "crash-blocked models cleared by config reload"
+            );
         }
     }
 
@@ -6471,7 +6486,7 @@ models:
                 .push(handle.clone());
             mgr.handle_crash(handle).await;
         }
-        mgr.unblock_model("m");
+        mgr.unblock_model("m", "test");
         for _ in 0..2 {
             let handle = make_handle(InstanceState::Loading, 0, Duration::ZERO);
             mgr.instances
@@ -6510,7 +6525,7 @@ models:
             .entry("m".to_owned())
             .or_default()
             .push(handle);
-        mgr.block_model("m");
+        mgr.block_model("m", "test");
         mgr.reserve_placement(ReservationRequest {
             transition_id: 91,
             purpose: ReservationPurpose::LargeModelAdmission,
@@ -6759,7 +6774,7 @@ models:
     #[tokio::test]
     async fn get_or_spawn_reports_blocked_and_unknown_models() {
         let mgr = Arc::new(test_manager());
-        mgr.block_model("m");
+        mgr.block_model("m", "test");
         assert!(matches!(
             mgr.get_or_spawn("m").await,
             Err(AcquireError::Blocked)
@@ -6793,7 +6808,7 @@ models:
             .expect("ensure_instance must not park");
         assert!(matches!(result, Err(AcquireError::Unavailable)));
 
-        mgr.block_model("m");
+        mgr.block_model("m", "test");
         assert!(matches!(
             mgr.ensure_instance("m").await,
             Err(AcquireError::Blocked)
@@ -8424,7 +8439,7 @@ models:
         assert!(matches!(res, Err(AcquireError::Unavailable)));
 
         // All blocked → Blocked (single-model get_or_spawn semantics).
-        mgr.block_model("m2");
+        mgr.block_model("m2", "test");
         let res = mgr
             .acquire_for_candidates(
                 &cands(&["nope", "m2"]),
@@ -8463,7 +8478,7 @@ models:
         // (NoCapacity), rather than on m1, which would fail fast
         // (Unavailable).
         let mgr = Arc::new(two_model_manager());
-        mgr.block_model("m1");
+        mgr.block_model("m1", "test");
         register_inst(&mgr, "m2", vec![], 4, Duration::ZERO); // max_concurrent = 4
 
         let res = mgr
