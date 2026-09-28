@@ -149,7 +149,24 @@ async fn health() -> StatusCode {
 
 // ── Error type ───────────────────────────────────────────────────────────────
 
+/// Prefix prepended to every error message llm-orch generates itself.
+///
+/// Requests typically traverse a chain of services (reverse proxy, SDK,
+/// frontend).  Without attribution it is impossible to tell whether an error
+/// came from llm-orch or from one of the backends behind it, so *every*
+/// client-visible message produced here is prefixed with `llm-orch: `.
+/// Messages forwarded verbatim from a backend are left untouched.
+pub const ERROR_PREFIX: &str = "llm-orch: ";
+
+/// Format an llm-orch-generated error message with [`ERROR_PREFIX`].
+pub fn err_msg(msg: impl std::fmt::Display) -> String {
+    format!("{ERROR_PREFIX}{msg}")
+}
+
 /// Unified error type for HTTP responses.
+///
+/// The rendered message is prefixed with [`ERROR_PREFIX`]; the variants'
+/// `Display` text below stays free of it.
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     #[error("unauthorized")]
@@ -185,19 +202,19 @@ pub enum ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, message) = match &self {
-            ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
-            ApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-            ApiError::ModelNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
-            ApiError::ModelBlocked(_) => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
-            ApiError::ModelUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
-            ApiError::RequestNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
-            ApiError::NoCapacity(_) => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
-            ApiError::QueueTimeout(_) => (StatusCode::GATEWAY_TIMEOUT, self.to_string()),
-            ApiError::BackendTimeout(_) => (StatusCode::GATEWAY_TIMEOUT, self.to_string()),
-            ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+        let status = match &self {
+            ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
+            ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ApiError::ModelNotFound(_) => StatusCode::NOT_FOUND,
+            ApiError::ModelBlocked(_) => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::ModelUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::RequestNotFound(_) => StatusCode::NOT_FOUND,
+            ApiError::NoCapacity(_) => StatusCode::TOO_MANY_REQUESTS,
+            ApiError::QueueTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
+            ApiError::BackendTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
+            ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        let mut resp = (status, message).into_response();
+        let mut resp = (status, err_msg(&self)).into_response();
         // 429s ask the client to retry later — say when (plan §5).
         if matches!(self, ApiError::NoCapacity(_)) {
             resp.headers_mut()
@@ -250,6 +267,40 @@ impl FromRequestParts<AppState> for ApiKey {
                 label: label.to_owned(),
             }),
             None => Err(ApiError::Unauthorized),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every error llm-orch returns must say so — a client behind a proxy
+    /// chain cannot otherwise tell our errors from a backend's.
+    #[tokio::test]
+    async fn error_bodies_are_attributed_to_llm_orch() {
+        let errors = [
+            ApiError::Unauthorized,
+            ApiError::BadRequest("missing model".into()),
+            ApiError::ModelNotFound("gpt-x".into()),
+            ApiError::ModelBlocked("gpt-x".into()),
+            ApiError::NoCapacity("gpt-x".into()),
+            ApiError::QueueTimeout("gpt-x".into()),
+            ApiError::ModelUnavailable("gpt-x".into()),
+            ApiError::RequestNotFound("req-1".into()),
+            ApiError::BackendTimeout("gpt-x".into()),
+            ApiError::Internal("boom".into()),
+        ];
+        for err in errors {
+            let response = err.into_response();
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .expect("error body must be readable");
+            let body = String::from_utf8_lossy(&body).into_owned();
+            assert!(
+                body.starts_with(ERROR_PREFIX),
+                "body must start with {ERROR_PREFIX:?}, got: {body}"
+            );
         }
     }
 }

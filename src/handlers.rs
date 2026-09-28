@@ -49,7 +49,7 @@ use crate::config::{AliasPolicy, MakeRoomMode};
 use crate::debug_log::{DebugLogEntry, DebugStreamContext, ts_now};
 use crate::instance::SlotGuard;
 use crate::scheduler::{AcquireError, Admission, InstanceManager, PendingAssignment};
-use crate::server::{ApiError, ApiKey, AppState};
+use crate::server::{ApiError, ApiKey, AppState, err_msg};
 use crate::types::*;
 use tracing::Instrument;
 
@@ -3821,7 +3821,10 @@ async fn build_sse_stream(
                 let stream = futures_util::stream::once(async move {
                     let error_sse = serde_json::json!({
                         "error": {
-                            "message": format!("backend sent no response for {}s (idle timeout)", idle_timeout.as_secs()),
+                            "message": err_msg(format!(
+                                "backend sent no response for {}s (idle timeout)",
+                                idle_timeout.as_secs()
+                            )),
                             "type": "backend_idle_timeout",
                         }
                     });
@@ -3872,7 +3875,7 @@ async fn build_sse_stream(
         let stream = futures_util::stream::once(async move {
             let error_sse = serde_json::json!({
                 "error": {
-                    "message": format!("backend error: {}", error_text),
+                    "message": err_msg(format!("backend error: {}", error_text)),
                     "type": "backend_error",
                     "code": status.as_u16(),
                 }
@@ -4115,7 +4118,7 @@ fn queue_wait_error_event(error: AcquireError) -> Event {
     Event::default().event("error").data(
         serde_json::json!({
             "error": {
-                "message": format!("request could not be assigned: {error:?}"),
+                "message": err_msg(format!("request could not be assigned: {error:?}")),
                 "type": "queue_error"
             }
         })
@@ -4252,7 +4255,7 @@ async fn build_assigned_sse_stream(
             Ok(Event::default().event("error").data(
                 serde_json::json!({
                     "error": {
-                        "message": format!("backend request failed: {error}"),
+                        "message": err_msg(format!("backend request failed: {error}")),
                         "type": "backend_error"
                     }
                 })
@@ -4424,7 +4427,7 @@ where
                     self.inner = None;
                     let error_sse = serde_json::json!({
                         "error": {
-                            "message": format!("backend stream error: {}", e),
+                            "message": err_msg(format!("backend stream error: {}", e)),
                             "type": "backend_stream_error",
                         }
                     });
@@ -4463,7 +4466,9 @@ where
                     );
                     let error_sse = serde_json::json!({
                         "error": {
-                            "message": "backend stream ended without completing (truncated response)",
+                            "message": err_msg(
+                                "backend stream ended without completing (truncated response)",
+                            ),
                             "type": "stream_truncated",
                         }
                     });
@@ -4490,7 +4495,10 @@ where
                         self.inner = None;
                         let error_sse = serde_json::json!({
                             "error": {
-                                "message": format!("backend sent no data for {}s (idle timeout)", idle_timeout.as_secs()),
+                                "message": err_msg(format!(
+                                    "backend sent no data for {}s (idle timeout)",
+                                    idle_timeout.as_secs()
+                                )),
                                 "type": "backend_idle_timeout",
                             }
                         });
@@ -4943,6 +4951,11 @@ true\r\n\
         }
         assert_eq!(events.len(), 2, "content chunk + truncation error");
         assert!(events[1].contains("stream_truncated"));
+        assert!(
+            events[1].contains("llm-orch: backend stream ended without completing"),
+            "truncation error must be attributed to llm-orch: {}",
+            events[1]
+        );
         assert!(!events[1].contains("[DONE]"));
         assert!(!stream.saw_done);
 
@@ -5028,6 +5041,11 @@ true\r\n\
         // Paused time auto-advances past the idle deadline while we await.
         let second = stream.next().await.unwrap().unwrap();
         assert!(event_text(&second).contains("backend_idle_timeout"));
+        assert!(
+            event_text(&second).contains("llm-orch: backend sent no data"),
+            "idle-timeout error must be attributed to llm-orch: {}",
+            event_text(&second)
+        );
         assert!(
             stream.next().await.is_none(),
             "stream must end after the idle error"

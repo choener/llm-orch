@@ -279,6 +279,20 @@ only—never prompts or API keys. Valid config reloads preserve accepted queue
 route snapshots; a migration rolls back before handoff if its placement becomes
 stale, while a completed victim handoff is not undone.
 
+### Error attribution
+
+Every error message llm-orch generates itself — HTTP error bodies and the
+`error` events it injects into streams — is prefixed with `llm-orch: `:
+
+```
+llm-orch: backend sent no data for 300s (idle timeout)
+llm-orch: no capacity: my-model
+```
+
+Responses forwarded verbatim from a backend keep their original body, so the
+prefix tells you which hop in the chain (client, proxy, llm-orch, backend)
+produced a failure.
+
 ### ROCm (AMD) devices
 ROCm models use a separate llama.cpp backend namespace from Vulkan. This is
 important when `llama-server` was built with both backends: an AMD GPU may be
