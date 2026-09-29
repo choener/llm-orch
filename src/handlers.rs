@@ -3495,10 +3495,11 @@ fn log_completion(
 
 // ── Statistics ───────────────────────────────────────────────────────────────
 
-/// Record one served request in the stats store — only when the
-/// backend reported usage (so uninstrumented responses do not pollute
-/// the counters).  No-op when stats are not configured; the store is
-/// best-effort and never fails the request.
+/// Record one served request in the stats store.  Requests whose
+/// backend reported no usage are still counted (requests/duration
+/// only); the store warns about the missing usage.  No-op when stats
+/// are not configured; the store is best-effort and never fails the
+/// request.
 fn record_stats(
     state: &AppState,
     model_name: &str,
@@ -3515,16 +3516,18 @@ fn record_stats(
     if state.manager.is_peer_model(model_name) {
         return;
     }
-    if prompt_tokens.is_some() || completion_tokens.is_some() {
-        state.stats.record(
-            model_name,
-            prompt_tokens,
-            cached_tokens,
-            completion_tokens,
-            duration_ms,
-            ttft_ms,
-        );
-    }
+    // Every served request counts, even when the backend reported no
+    // usage (some OpenAI-compatible providers omit it): the token
+    // fields stay absent and the request/duration counters still
+    // advance (the store warns about the missing usage).
+    state.stats.record(
+        model_name,
+        prompt_tokens,
+        cached_tokens,
+        completion_tokens,
+        duration_ms,
+        ttft_ms,
+    );
 }
 
 // ── Backend forwarding ───────────────────────────────────────────────────────
@@ -4570,11 +4573,16 @@ impl<S> Drop for SseForwarder<S> {
                 }
             }
             // Statistics (opt-in) — clean completions only, same rule
-            // as the ring buffer above.
-            if prompt_opt.is_some() || gen_opt.is_some() {
-                let ttft_ms = self
-                    .first_chunk_at
-                    .map(|t| t.saturating_duration_since(self.t0).as_millis() as u64);
+            // as the ring buffer above.  Recorded even when the stream
+            // carried no usage chunk: the token fields stay absent and
+            // only the request/duration counters advance.  Peer
+            // models are skipped — the leaf's numbers are
+            // authoritative (docs/006, decision 9; mirrors
+            // `record_stats` for the non-streaming path).
+            let ttft_ms = self
+                .first_chunk_at
+                .map(|t| t.saturating_duration_since(self.t0).as_millis() as u64);
+            if !self.manager.is_peer_model(&self.model_name) {
                 self.stats.record(
                     &self.model_name,
                     prompt_opt,

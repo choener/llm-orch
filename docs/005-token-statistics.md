@@ -25,9 +25,12 @@ available to external systems (Home Assistant) without scraping logs.
   `stats:` section is absent — so pollers never handle error states.
 - **Two counter sets per model.**  `total` is restored from the JSON file at
   startup (survives restarts); `boot` is zeroed at every startup.  Both are
-  updated after every served request that reported usage.  Requests without
-  usage (uninstrumented backends, failures) are not counted, so counters
-  never mix measured and unmeasured traffic.
+  updated after every served request.  Requests whose backend reported no
+  usage (uninstrumented providers — e.g. some OpenAI-compatible embedding
+  servers) are still counted as requests and duration, with zero token
+  contributions; a `tracing::warn!` flags the missing usage so token
+  counters are never silently short.  Failed requests (backend error
+  responses, truncated streams) are not counted.
 - **Best-effort persistence.**  File-write failures are `tracing::warn!`ed and
   swallowed — statistics must never fail or slow down a request.
 
@@ -83,9 +86,10 @@ published immediately with the existing state.
   `*_tokens_details/cached_tokens`.
 - **Streaming**: `SseForwarder` (chat, responses, completions) timestamps the
   first non-empty SSE data chunk (TTFT proxy) and records on clean stream
-  end (`[DONE]`) with the trailing usage chunk — truncated streams and
-  client disconnects are not recorded, matching the completion ring-buffer
-  rule.  Only successful completions with usage are counted.
+  end (`[DONE]`) — with the trailing usage chunk when present, otherwise
+  request/duration only.  Truncated streams and client disconnects are not
+  recorded, matching the completion ring-buffer rule.  Only successful
+  completions are counted.
 
 ## Code layout
 

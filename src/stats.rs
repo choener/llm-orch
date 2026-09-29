@@ -7,7 +7,8 @@
 //   survives restarts (the "bragging" total).
 // - `boot`  — zeroed at every startup (ephemeral since-boot view).
 //
-// Both are updated after every served request that reported usage.  The
+// Both are updated after every served request — requests whose backend
+// reported no usage count without token totals (warned).  The
 // JSON file is rewritten (atomic temp + rename) on each update, following
 // the project's atomic-file-replace convention so external readers (e.g.
 // Home Assistant polling `/v1/stats`, or the file directly) never see a
@@ -28,7 +29,8 @@ use tracing::warn;
 /// One model's counters for one set (`total` or `boot`).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCounters {
-    /// Served requests that reported usage.
+    /// Served requests (token totals may be zero when the backend
+    /// reported no usage).
     pub requests: u64,
     /// Prompt (input) tokens.
     pub prompt_tokens: u64,
@@ -380,6 +382,27 @@ mod tests {
         assert_eq!(a.boot, a.total);
         assert_eq!(doc.models["model-b"].total.completion_tokens, 7);
         assert_eq!(doc.models["model-b"].total.ttft_count, 0);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn request_without_usage_still_counts() {
+        // Backends that report no usage (some OpenAI-compatible
+        // embedding providers) must still advance requests/duration —
+        // they just contribute no token totals.
+        let path = temp_path("no-usage");
+        let store = StatsStore::new(Some(&path));
+        store.record("embedder", None, None, None, 42, None);
+        store.record("embedder", Some(7), None, None, 8, None);
+
+        let doc: StatsFile =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let m = &doc.models["embedder"];
+        assert_eq!(m.total.requests, 2);
+        assert_eq!(m.total.prompt_tokens, 7);
+        assert_eq!(m.total.completion_tokens, 0);
+        assert_eq!(m.total.duration_sum_ms, 50);
+        assert_eq!(m.total.duration_avg_ms, 25);
         std::fs::remove_file(&path).ok();
     }
 
