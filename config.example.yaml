@@ -152,6 +152,10 @@ devices:
   #   1: "0000:7b:00.0"
 
   # Optional per-GPU VRAM limits (MB), shared by Vulkan and ROCm indices.
+  # Caps the sysfs-reported total; for GPUs with no metrics reader at all
+  # (e.g. an Intel iGPU on Vulkan) an explicit limit is also the declared
+  # total that makes the device placeable.  Without metrics and without a
+  # limit, a Vulkan/ROCm device is unusable for VRAM-aware placement.
   # vram_limit_mb:
   #   0: 24576
 

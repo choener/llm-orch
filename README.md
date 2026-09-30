@@ -363,6 +363,7 @@ models:
 - `nvidia-smi` must be on llm-orch's PATH for live metrics. Under the NixOS module: `services.llm-orch.extraPackages = [ config.hardware.nvidia.package ];`.
 - You need a CUDA-enabled llama.cpp build (e.g. `pkgs.llama-cpp.override { cudaSupport = true; }` as the module's `llamaPackage`, or an absolute store path in your `cmd`).
 - GPU keep-alive is AMD-only and applies to both Vulkan and ROCm instances; NVIDIA GPUs don't need it — enable persistence mode instead (`nvidia-smi -pm 1`).
+- GPUs that neither metrics reader can see (e.g. an Intel iGPU on Vulkan — no AMD sysfs, no `nvidia-smi`) become placeable when `devices.vram_limit_mb` declares their size: the limit is then the total capacity and usage is tracked purely from declared `vram` reservations. Without a limit such a device stays unusable for placement.
 
 ### Aliases
 Aliases allow you to expose the same model under different names with different personas:

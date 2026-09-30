@@ -3957,15 +3957,21 @@ impl InstanceManager {
             let gpu = gpus.iter().find(|g| g.pci_slot == pci_slot);
             // Capacity rule: with metrics, the configured value
             // (Vulkan/ROCm vram_limit_mb or CUDA vram_mb) caps the
-            // reported total.  Without metrics, only CUDA devices may
-            // fall back to their static vram_mb — NVIDIA exposes no sysfs
-            // VRAM, so a missing nvidia-smi must not make the device
-            // unusable.
+            // reported total.  Without metrics, a device may fall back to
+            // its configured static value: CUDA always has one via
+            // vram_mb (NVIDIA exposes no sysfs VRAM, so a missing
+            // nvidia-smi must not make the device unusable), and
+            // Vulkan/ROCm devices fall back only when vram_limit_mb
+            // explicitly declares a size for them — this covers GPUs the
+            // metrics readers cannot see at all (e.g. an Intel iGPU on
+            // Vulkan, which has neither AMD sysfs nor nvidia-smi
+            // metrics).  Without such a declaration the device stays
+            // unusable so a typo cannot become silent oversubscription.
             let capacity = match (gpu, static_vram.get(&idx)) {
                 (Some(g), Some(&configured)) => configured.min(g.vram_total_bytes),
                 (Some(g), None) => g.vram_total_bytes,
-                (None, Some(&configured)) if kind == DeviceKind::Cuda => configured,
-                (None, _) => {
+                (None, Some(&configured)) => configured,
+                (None, None) => {
                     debug!(model = %model_cfg.name, device = idx, slot = pci_slot, "GPU not in metrics snapshot");
                     continue;
                 }
@@ -8057,6 +8063,90 @@ models:
     cmd: "sleep 3600"
     vram: 1000
     cuda_devices: [0]
+"#;
+        let config: crate::config::Config = serde_yaml_ng::from_str(yaml).unwrap();
+        let snapshot = Arc::new(tokio::sync::RwLock::new(vec![]));
+        let (mgr, _r, _c) = InstanceManager::new(&config, snapshot, None);
+
+        let cfg = mgr.model_configs.read().unwrap().get("m").cloned().unwrap();
+        assert!(mgr.select_gpus_for_model(&cfg).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn vulkan_static_vram_limit_is_fallback_without_metrics() {
+        // Intel iGPU on Vulkan: the AMD sysfs and nvidia-smi readers both
+        // miss the device, so the metrics snapshot is empty.  An
+        // explicit vram_limit_mb must act as the declared total and
+        // enable placement.
+        let yaml = r#"
+server: {}
+apikeys_file: apikeys.txt
+devices:
+  vulkan:
+    0: "0000:00:02.0"
+  vram_limit_mb:
+    0: 16000
+models:
+  - name: fits
+    context_length: 4096
+    cmd: "sleep 3600"
+    vram: 12000
+    vulkan_devices: [0]
+  - name: toobig
+    context_length: 4096
+    cmd: "sleep 3600"
+    vram: 20000
+    vulkan_devices: [0]
+"#;
+        let config: crate::config::Config = serde_yaml_ng::from_str(yaml).unwrap();
+        let snapshot = Arc::new(tokio::sync::RwLock::new(vec![]));
+        let (mgr, _r, _c) = InstanceManager::new(&config, snapshot, None);
+
+        let fits = mgr
+            .model_configs
+            .read()
+            .unwrap()
+            .get("fits")
+            .cloned()
+            .unwrap();
+        let placement = mgr.select_gpus_for_model(&fits).await;
+        assert_eq!(
+            placement.len(),
+            1,
+            "vram_limit_mb must enable placement without a metrics snapshot"
+        );
+        assert_eq!(placement[0], 0);
+
+        let toobig = mgr
+            .model_configs
+            .read()
+            .unwrap()
+            .get("toobig")
+            .cloned()
+            .unwrap();
+        assert!(
+            mgr.select_gpus_for_model(&toobig).await.is_empty(),
+            "model exceeding the declared limit must find no placement"
+        );
+    }
+
+    #[tokio::test]
+    async fn vulkan_device_without_metrics_or_vram_limit_is_unusable() {
+        // No metrics and no declared vram_limit_mb: the device stays
+        // unusable (unchanged behavior) so an unmeasurable GPU cannot be
+        // silently oversubscribed.
+        let yaml = r#"
+server: {}
+apikeys_file: apikeys.txt
+devices:
+  vulkan:
+    0: "0000:00:02.0"
+models:
+  - name: m
+    context_length: 4096
+    cmd: "sleep 3600"
+    vram: 1000
+    vulkan_devices: [0]
 "#;
         let config: crate::config::Config = serde_yaml_ng::from_str(yaml).unwrap();
         let snapshot = Arc::new(tokio::sync::RwLock::new(vec![]));
