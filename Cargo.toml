@@ -51,6 +51,7 @@ tokio-stream = "0.1"
 
 # Shell-style command splitting
 shlex = "1"
+rumqttc = "0.24"
 
 # Unix process control (PR_SET_PDEATHSIG)
 [target.'cfg(unix)'.dependencies]

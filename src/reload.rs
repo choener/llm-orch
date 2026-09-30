@@ -4,7 +4,7 @@
 // swap only on success, record the file mtime only after a successful swap
 // so rejected or failed reloads are retried on the next file event.
 
-use crate::{apikeys, config, peers, scheduler, stats};
+use crate::{apikeys, config, mqtt, peers, scheduler, stats};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, warn};
@@ -18,6 +18,7 @@ pub async fn handle_config_reload(
     manager: &Arc<scheduler::InstanceManager>,
     stats: &Arc<stats::StatsStore>,
     peers: &Arc<peers::PeerRegistry>,
+    mqtt: &Arc<mqtt::MqttController>,
     last_mtime: &Arc<Mutex<Option<std::time::SystemTime>>>,
 ) {
     // Skip if the file's mtime hasn't changed since our last reload.
@@ -89,6 +90,11 @@ pub async fn handle_config_reload(
             // Atomic swap.
             let model_count = effective.models.len();
             *cfg.write().await = effective;
+            // Bring the MQTT publisher in line with the new config
+            // (start/stop/respawn on `mqtt:` / `node_name` changes).
+            // Identity-only work: never waits on the broker beyond the
+            // bounded shutdown handshake of a replaced task.
+            mqtt.apply(&new_cfg).await;
             // Record the mtime only on success — a rejected or failed
             // reload must be retried on the next file event, not consumed.
             *last_mtime.lock().await = Some(mtime);

@@ -13,6 +13,7 @@ pub mod handlers;
 pub mod http_client;
 pub mod instance;
 pub mod keepalive;
+pub mod mqtt;
 pub mod nvidia;
 pub mod peers;
 pub mod port_alloc;

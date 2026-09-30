@@ -63,6 +63,10 @@ exports `nixosModules.llm-orch` (module source in `nix/nixos.nix`).
 - `src/keepalive.rs` — GPU keep-alive manager (AMD-only; NVIDIA should use
   persistence mode instead).
 - `src/apikeys.rs` — API key file parsing/validation (hot-reloadable).
+- `src/mqtt.rs` — optional MQTT publisher for the `/v1/stats` documents
+  (change-only retained topics; see `docs/007-mqtt-stats.md`).
+  `src/bin/llm-orch-stub-mqtt.rs` is the minimal stub broker used by
+  its integration tests (`tests/mqtt.rs`).
 - `src/watcher.rs` + `src/reload.rs` — file watching and atomic hot-reload.
 - `src/debug_log.rs` — per-model JSONL debug logging.
 - `src/http_client.rs` — shared `reqwest::Client` tuned for backend forwarding.

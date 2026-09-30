@@ -347,142 +347,18 @@ async fn merge_peer_info(state: &AppState, mut response: InfoResponse) -> InfoRe
 
 // ── /v1/stats ─────────────────────────────────────────────────────────────────
 
-/// `GET /v1/stats` response: per-model token counters plus the latest
-/// GPU metrics snapshot.
-#[derive(Debug, serde::Serialize)]
-pub struct StatsResponse {
-    /// `true` when the `stats:` config section is set.
-    pub enabled: bool,
-    /// Schema version (currently 1).
-    pub version: u32,
-    /// Unix seconds of the first startup (restored from the stats file
-    /// if present; 0 when disabled).
-    pub started_at: u64,
-    /// Unix seconds of the most recent recorded request (0 when
-    /// disabled).
-    pub updated_at: u64,
-    /// Per-model counters: `total` (across restarts) and `boot` (since
-    /// this process started).
-    pub models: std::collections::HashMap<String, crate::stats::StatsModel>,
-    /// Latest GPU metrics snapshot (empty on CPU-only hosts).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub gpus: Vec<GpuStatus>,
-}
-
 /// `GET /v1/stats` — token / model statistics, auth-gated.
 ///
 /// Designed for external polling (e.g. Home Assistant's HTTP
 /// integration): always returns 200 — `enabled: false` when stats are
 /// not configured — so pollers never have to handle error states.
-pub async fn stats_endpoint(State(state): State<AppState>, _key: ApiKey) -> Json<StatsResponse> {
-    let gpu_metrics = state.gpu.read().await.clone();
-    let mut gpus: Vec<GpuStatus> = gpu_metrics
-        .iter()
-        .map(|g| {
-            let vram_util_pct = if g.vram_total_bytes > 0 {
-                (g.vram_used_bytes as f64 / g.vram_total_bytes as f64) * 100.0
-            } else {
-                0.0
-            };
-            GpuStatus {
-                index: g.index,
-                pci_slot: g.pci_slot.clone(),
-                vram_vendor: g.vram_vendor.clone(),
-                node: None,
-                vram_used_bytes: g.vram_used_bytes,
-                vram_total_bytes: g.vram_total_bytes,
-                vram_util_pct,
-                temperature_c: g.temperature_c,
-                power_w: g.power_w,
-                gpu_busy_pct: g.gpu_busy_pct,
-                sclk_mhz: g.sclk_mhz,
-                mclk_mhz: g.mclk_mhz,
-            }
-        })
-        .collect();
-    let doc = state.stats.snapshot();
-    let (version, started_at) = doc
-        .as_ref()
-        .map(|d| (d.version, d.started_at))
-        .unwrap_or((1, 0));
-    let mut updated_at = doc.as_ref().map(|d| d.updated_at).unwrap_or(0);
-    // ── Cluster peering: on-demand union with the peers' stats ────────
-    // (docs/006, decision 9: fetched concurrently when this endpoint is
-    // queried — 10 s per-peer timeout, last-known fallback, singleflight
-    // per peer; the master never counts forwarded requests itself, the
-    // leaves' numbers are authoritative for their models).
-    let peer_names = state.peers.peer_names();
-    let mut peer_models: Vec<(
-        String,
-        std::collections::HashMap<String, crate::stats::StatsModel>,
-    )> = Vec::new();
-    if !peer_names.is_empty() {
-        let fetched =
-            futures_util::future::join_all(peer_names.iter().map(|p| state.peers.peer_stats(p)))
-                .await;
-        for (peer, result) in peer_names.iter().zip(fetched) {
-            let Some((value, _fetched_at)) = result else {
-                continue;
-            };
-            if let Some(ts) = value.get("updated_at").and_then(|v| v.as_u64()) {
-                updated_at = updated_at.max(ts);
-            }
-            if let Ok(mut peer_gpus) =
-                serde_json::from_value::<Vec<GpuStatus>>(value["gpus"].clone())
-            {
-                for gpu in &mut peer_gpus {
-                    gpu.node = Some(peer.clone());
-                }
-                gpus.extend(peer_gpus);
-            }
-            if let Ok(models) = serde_json::from_value::<
-                std::collections::HashMap<String, crate::stats::StatsModel>,
-            >(value["models"].clone())
-            {
-                peer_models.push((peer.clone(), models));
-            }
-        }
-    }
-
-    // ── Union model map ───────────────────────────────────────────────
-    // - node-qualified entries (`<node>/<model>` for local models,
-    //   `<peer>/<model>` for leaf models) carry that node's numbers;
-    // - bare entries are the sum over every node serving the name.
-    let mut models: std::collections::HashMap<String, crate::stats::StatsModel> =
-        doc.map(|d| d.models).unwrap_or_default();
-    // Self-qualification (`<node>/<model>` copies of local entries) is a
-    // gateway feature: a node without peers emits bare-only stats so a
-    // consuming master re-exports each entry exactly once (no nested
-    // `cortana/cortana/...` qualification).
-    let is_gateway = !peer_names.is_empty();
-    if is_gateway && let Some(node) = state.peers.node_name() {
-        let qualified: Vec<(String, crate::stats::StatsModel)> = models
-            .iter()
-            .map(|(name, m)| (format!("{node}/{name}"), *m))
-            .collect();
-        for (name, m) in qualified {
-            models.insert(name, m);
-        }
-    }
-    for (peer, pmodels) in peer_models {
-        for (leaf_name, m) in pmodels {
-            // Qualified leaf entry: the leaf's numbers verbatim.
-            models.insert(format!("{peer}/{leaf_name}"), m);
-            // Bare entry: sum over every node serving the name.
-            let bare = models.entry(leaf_name).or_default();
-            bare.merge(&m);
-        }
-    }
-    let enabled = state.stats.snapshot().is_some() || !models.is_empty();
-
-    Json(StatsResponse {
-        enabled,
-        version,
-        started_at,
-        updated_at,
-        models,
-        gpus,
-    })
+/// The response assembly lives in `stats::build_response` (shared with
+/// the MQTT publisher).
+pub async fn stats_endpoint(
+    State(state): State<AppState>,
+    _key: ApiKey,
+) -> Json<crate::stats::StatsResponse> {
+    Json(crate::stats::build_response(&state.stats, &state.gpu, &state.peers).await)
 }
 
 /// `GET /v1/requests/{request_id}` — authenticated request lifecycle status.

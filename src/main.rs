@@ -1,6 +1,7 @@
 use clap::Parser;
 use llm_orch::{
-    apikeys, config, debug_log, gpu, keepalive, peers, reload, scheduler, server, stats, watcher,
+    apikeys, config, debug_log, gpu, keepalive, mqtt, peers, reload, scheduler, server, stats,
+    watcher,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -197,6 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if stats.path().is_some() {
         info!(path = %stats.path().unwrap().display(), "statistics enabled");
     }
+    let gpu_rw = Arc::clone(&gpu_snapshot);
     let app_state = server::AppState {
         config: Arc::clone(&shared_cfg),
         apikeys: Arc::clone(&shared_apikeys),
@@ -208,6 +210,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         peers: Arc::clone(&peers),
     };
     let mut server_task = tokio::spawn(server::serve(app_state, shutdown_rx));
+
+    // ── MQTT stats publisher (docs/007) ─────────────────────────────
+    // Inert unless the `mqtt:` config section is set.  A dead broker
+    // never affects request serving; hot-reload reconfigures via the
+    // controller shared with the reload task below.
+    let mqtt_ctl = mqtt::MqttController::new(mqtt::MqttDeps {
+        stats: Arc::clone(&stats),
+        gpu: gpu_rw,
+        peers: Arc::clone(&peers),
+        config: Arc::clone(&shared_cfg),
+    });
+    mqtt_ctl.apply(&shared_cfg.read().await.clone()).await;
 
     // ── File watchers + reload loop §6 ───────────────────────────────────
     let config_path = cli.config.clone();
@@ -238,6 +252,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let apikeys = Arc::clone(&shared_apikeys);
         let manager = Arc::clone(&manager);
         let peers = Arc::clone(&peers);
+        let mqtt_ctl = Arc::clone(&mqtt_ctl);
         let last_mtime = Arc::clone(&last_reload_mtime);
         let last_ak_mtime = Arc::clone(&last_apikeys_mtime);
         let watch_handle = Arc::clone(&watch_handle);
@@ -268,6 +283,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &manager,
                             &stats,
                             &peers,
+                            &mqtt_ctl,
                             &last_mtime,
                         )
                         .await;
@@ -293,6 +309,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &manager,
                             &stats,
                             &peers,
+                            &mqtt_ctl,
                             &last_mtime,
                         )
                         .await;
@@ -324,6 +341,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     let c = cfg.read().await;
                     manager.refresh_key_files(&c);
+                    // The MQTT password may reference the rotated key
+                    // file — re-resolve and respawn the publisher if it
+                    // changed.
+                    mqtt_ctl.apply(&c).await;
                 }
 
                 // If a config reload changed the apikeys path or the key
@@ -432,6 +453,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("shutting down backends...");
     manager.shutdown_all().await;
     info!("backends shut down");
+    // Final MQTT publish + retained "offline" (bounded).
+    mqtt_ctl.shutdown().await;
     info!("stopped");
 
     Ok(())

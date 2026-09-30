@@ -18,11 +18,14 @@ available to external systems (Home Assistant) without scraping logs.
   convention so readers never see a partial write.  Per-request history is
   already available via the optional `debug_log` JSONL; SQLite is deferred
   until a real query use case appears.
-- **No MQTT.**  `GET /v1/stats` is polled instead: Home Assistant's built-in
-  HTTP/REST integration polls any URL (with an `Authorization` header, so it
-  works behind the nginx TLS proxy) and maps JSON fields to sensors via
-  templates.  The endpoint always returns 200 — `enabled: false` when the
-  `stats:` section is absent — so pollers never handle error states.
+- **MQTT is opt-in, polling stays the default.**  `GET /v1/stats` is
+  polled by Home Assistant's built-in HTTP/REST integration (with an
+  `Authorization` header, so it works behind the nginx TLS proxy), which
+  maps JSON fields to sensors via templates.  The endpoint always returns
+  200 — `enabled: false` when the `stats:` section is absent — so pollers
+  never handle error states.  An optional `mqtt:` section additionally
+  *pushes* the same document (plus delta-derived rates) to an MQTT
+  broker; see `docs/007-mqtt-stats.md`.
 - **Two counter sets per model.**  `total` is restored from the JSON file at
   startup (survives restarts); `boot` is zeroed at every startup.  Both are
   updated after every served request.  Requests whose backend reported no

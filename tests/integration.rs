@@ -54,6 +54,7 @@ struct TestServer {
     apikeys: Arc<RwLock<apikeys::ApikeysStore>>,
     stats: Arc<stats::StatsStore>,
     peers: Arc<llm_orch::peers::PeerRegistry>,
+    mqtt: Arc<llm_orch::mqtt::MqttController>,
     _shutdown: oneshot::Sender<()>,
     _dir: PathBuf,
 }
@@ -127,11 +128,19 @@ async fn boot_from_config_path(
         apikeys: Arc::clone(&shared_keys),
         manager: Arc::clone(&manager),
         client: manager.client().clone(),
-        gpu: gpu_snapshot,
+        gpu: Arc::clone(&gpu_snapshot),
         debug_loggers: Arc::new(debug_log::DebugLoggers::new()),
         stats: Arc::clone(&stats_store),
         peers: Arc::clone(&peers),
     };
+    // Mirror main.rs: inert MQTT publisher unless the config enables it.
+    let mqtt_ctl = llm_orch::mqtt::MqttController::new(llm_orch::mqtt::MqttDeps {
+        stats: Arc::clone(&stats_store),
+        gpu: gpu_snapshot,
+        peers: Arc::clone(&peers),
+        config: Arc::clone(&shared_cfg),
+    });
+    mqtt_ctl.apply(&shared_cfg.read().await.clone()).await;
     let (tx, rx) = oneshot::channel();
     let server_task = tokio::spawn(server::serve(state, rx));
     // The server binds immediately on a fresh port; give it a moment.
@@ -148,6 +157,7 @@ async fn boot_from_config_path(
         stats: stats_store,
         apikeys: shared_keys,
         peers,
+        mqtt: mqtt_ctl,
         _shutdown: tx,
         _dir: dir.to_path_buf(),
     }
@@ -631,6 +641,7 @@ async fn reload_rejects_bad_config_and_keeps_serving_old() {
         &srv.manager,
         &srv.stats,
         &srv.peers,
+        &srv.mqtt,
         &last_mtime,
     )
     .await;
@@ -664,6 +675,7 @@ async fn reload_rejects_bad_config_and_keeps_serving_old() {
         &srv.manager,
         &srv.stats,
         &srv.peers,
+        &srv.mqtt,
         &last_mtime,
     )
     .await;
@@ -686,6 +698,7 @@ async fn reload_rejects_bad_config_and_keeps_serving_old() {
         &srv.manager,
         &srv.stats,
         &srv.peers,
+        &srv.mqtt,
         &last_mtime,
     )
     .await;
@@ -1324,6 +1337,7 @@ async fn alias_targets_hot_reloaded() {
         &srv.manager,
         &srv.stats,
         &srv.peers,
+        &srv.mqtt,
         &last_mtime,
     )
     .await;
@@ -2299,6 +2313,7 @@ async fn stats_hot_reload_retargers_file() {
         &srv.manager,
         &srv.stats,
         &srv.peers,
+        &srv.mqtt,
         &last_mtime,
     )
     .await;

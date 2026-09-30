@@ -263,6 +263,31 @@ cmd_aliases:
 #   file: /var/lib/llm-orch/stats.json
 
 # ---------------------------------------------------------------------------
+# MQTT publishing (optional) — see docs/007-mqtt-stats.md
+# ---------------------------------------------------------------------------
+# Pushes the same documents as GET /v1/stats to an MQTT broker in addition
+# to (or instead of) polling.  Topics (retained by default):
+#   {prefix}/{node}/status   "online" / "offline" (LWT covers crashes)
+#   {prefix}/{node}/stats    counters + GPU metrics + delta-derived rates
+#   {prefix}/{node}/models   catalog discovery doc
+#   {prefix}/{node}/gpus     GPU inventory (static fields)
+#   {prefix}/{peer}/stats    gateway re-export of each leaf's cached doc
+# Publishing is change-only: every tick rebuilds the docs and publishes a
+# topic only when its content differs from the last publish; every broker
+# reconnect force-republishes everything.  Requires node_name.  A dead
+# broker never affects request serving.
+#
+# mqtt:
+#   broker: "mqtt.home.lan:1883"   # or mqtts://host, host:port
+#   prefix: llmorch                # topic prefix before /{node}/…
+#   interval: 60                   # seconds between change checks
+#   qos: 1                         # 0 or 1
+#   retain: true
+#   username: llm-orch             # optional
+#   key: "{mqtt_password}"         # {name} resolved from key_files (0400)
+#   tls: false                     # force TLS for plain host:port addresses
+
+# ---------------------------------------------------------------------------
 # Model definitions
 # ---------------------------------------------------------------------------
 models:

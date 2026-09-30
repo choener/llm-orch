@@ -68,6 +68,11 @@ pub struct Config {
     /// Token / model statistics (opt-in).  Absent = disabled.
     #[serde(default)]
     pub stats: Option<StatsConfig>,
+
+    /// MQTT stats publishing (opt-in).  Absent = disabled.
+    /// See `docs/007-mqtt-stats.md`.
+    #[serde(default)]
+    pub mqtt: Option<MqttConfig>,
 }
 
 impl Config {
@@ -473,6 +478,57 @@ impl Config {
                     name,
                     path.display()
                 )));
+            }
+        }
+
+        // --- mqtt ---
+        if let Some(mqtt) = &self.mqtt {
+            if self.node_name.is_none() {
+                return Err(ConfigError::Validation(
+                    "mqtt: requires node_name — topic naming must be unambiguous".into(),
+                ));
+            }
+            mqtt.parse_broker()?;
+            if mqtt.prefix.is_empty()
+                || mqtt.prefix.split('/').any(|s| {
+                    s.is_empty()
+                        || s.contains('+')
+                        || s.contains('#')
+                        || s.contains(char::is_whitespace)
+                })
+            {
+                return Err(ConfigError::Validation(format!(
+                    "mqtt: invalid prefix {:?} — non-empty MQTT path segments without '+', '#' or whitespace",
+                    mqtt.prefix
+                )));
+            }
+            if mqtt.qos > 1 {
+                return Err(ConfigError::Validation("mqtt: qos must be 0 or 1".into()));
+            }
+            if mqtt.interval == 0 {
+                return Err(ConfigError::Validation(
+                    "mqtt: interval must be > 0 seconds".into(),
+                ));
+            }
+            if mqtt.key.as_ref().is_some_and(|k| k.trim().is_empty()) {
+                return Err(ConfigError::Validation(
+                    "mqtt: key must not be empty when set".into(),
+                ));
+            }
+            if mqtt.username.as_ref().is_some_and(|u| u.trim().is_empty()) {
+                return Err(ConfigError::Validation(
+                    "mqtt: username must not be empty when set".into(),
+                ));
+            }
+            // Placeholders resolve like `remote_auth`: unknown names are
+            // left as-is at runtime, but the braces must be balanced.
+            if let Some(key) = &mqtt.key
+                && key.contains('{')
+                && !key.contains('}')
+            {
+                return Err(ConfigError::Validation(
+                    "mqtt: key has an unclosed '{' placeholder".into(),
+                ));
             }
         }
 
@@ -1530,6 +1586,94 @@ pub struct StatsConfig {
     /// Path of the JSON counter file, updated on every served request
     /// (atomic temp + rename, so readers never see partial files).
     pub file: PathBuf,
+}
+
+/// MQTT publishing of the `/v1/stats` documents (opt-in).
+///
+/// Topics published (retained by default): `{prefix}/{node}/status`,
+/// `{prefix}/{node}/stats`, `{prefix}/{node}/models`,
+/// `{prefix}/{node}/gpus`.  `node_name` is required so topic naming is
+/// unambiguous.  Credentials follow the peer-key convention: `key` may
+/// contain `{name}` placeholders resolved from [`Config::key_files`].
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct MqttConfig {
+    /// Broker address: `host:port`, `mqtt://host:port`, or
+    /// `mqtts://host:port`.  Default port: 1883 (8883 for `mqtts://`).
+    pub broker: String,
+    /// Topic prefix (before `/{node}/…`).  May contain `/` separators.
+    #[serde(default = "default_mqtt_prefix")]
+    pub prefix: String,
+    /// Seconds between publish ticks; a tick only publishes documents
+    /// whose content changed since the last publish.
+    #[serde(default = "default_mqtt_interval")]
+    pub interval: u64,
+    /// MQTT QoS for data topics: 0 (at most once) or 1 (at least once).
+    #[serde(default = "default_mqtt_qos")]
+    pub qos: u8,
+    /// Retain published messages (last value served to new subscribers).
+    #[serde(default = "default_mqtt_retain")]
+    pub retain: bool,
+    /// Optional MQTT username.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// MQTT password template; `{name}` placeholders resolve from
+    /// `key_files` (same mechanism as `peers[].remote_auth`).
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Force TLS for plain `host:port` addresses (`mqtts://` implies it).
+    #[serde(default)]
+    pub tls: bool,
+}
+
+impl MqttConfig {
+    /// Split `broker` into `(host, port, tls)`.
+    ///
+    /// Accepted forms: `host:port`, `mqtt://host[:port]`,
+    /// `mqtts://host[:port]` (default port 1883, or 8883 with TLS).
+    pub fn parse_broker(&self) -> Result<(String, u16, bool), ConfigError> {
+        let raw = self.broker.trim();
+        let (schemeless, tls_scheme) = match raw
+            .strip_prefix("mqtts://")
+            .or_else(|| raw.strip_prefix("mqtt://"))
+        {
+            Some(rest) => (rest, raw.starts_with("mqtts://")),
+            None => (raw, false),
+        };
+        if schemeless.is_empty() || schemeless.split('/').count() > 1 {
+            return Err(ConfigError::Validation(format!(
+                "mqtt: invalid broker address: {raw:?}"
+            )));
+        }
+        let tls = tls_scheme || self.tls;
+        let (host, port) = match schemeless.rsplit_once(':') {
+            Some((h, p)) => {
+                let port: u16 = p.parse().map_err(|_| {
+                    ConfigError::Validation(format!("mqtt: invalid broker port in {raw:?}"))
+                })?;
+                (h.to_string(), port)
+            }
+            None => (schemeless.to_string(), if tls { 8883 } else { 1883 }),
+        };
+        if host.is_empty() || host.contains(char::is_whitespace) {
+            return Err(ConfigError::Validation(format!(
+                "mqtt: invalid broker host in {raw:?}"
+            )));
+        }
+        Ok((host, port, tls))
+    }
+}
+
+fn default_mqtt_prefix() -> String {
+    "llmorch".to_string()
+}
+fn default_mqtt_interval() -> u64 {
+    60
+}
+fn default_mqtt_qos() -> u8 {
+    1
+}
+fn default_mqtt_retain() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]

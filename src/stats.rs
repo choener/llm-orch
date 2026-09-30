@@ -346,6 +346,161 @@ pub fn from_config(stats: &Option<crate::config::StatsConfig>) -> Arc<StatsStore
     Arc::new(StatsStore::new(stats.as_ref().map(|s| &s.file)))
 }
 
+// ── Shared response assembly ──────────────────────────────────────────────
+
+/// `GET /v1/stats` response (also the MQTT `{prefix}/{node}/stats`
+/// payload): per-model token counters plus the latest GPU metrics
+/// snapshot.
+#[derive(Debug, serde::Serialize)]
+pub struct StatsResponse {
+    /// `true` when the `stats:` config section is set.
+    pub enabled: bool,
+    /// Schema version (currently 1).
+    pub version: u32,
+    /// Unix seconds of the first startup (restored from the stats file
+    /// if present; 0 when disabled).
+    pub started_at: u64,
+    /// Unix seconds of the most recent recorded request (0 when
+    /// disabled).
+    pub updated_at: u64,
+    /// Per-model counters: `total` (across restarts) and `boot` (since
+    /// this process started).
+    pub models: HashMap<String, StatsModel>,
+    /// Latest GPU metrics snapshot (empty on CPU-only hosts).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub gpus: Vec<crate::types::GpuStatus>,
+}
+
+/// Build the full stats response: local counters + GPU snapshot + the
+/// concurrent cluster-peer union.
+///
+/// Single code path shared by the HTTP endpoint
+/// (`handlers::stats_endpoint`) and the MQTT publisher (`mqtt.rs`) so
+/// the wire payload can never drift from the endpoint.
+///
+/// Cluster peering (docs/006, decision 9): peers' stats are fetched
+/// concurrently — 10 s per-peer timeout, last-known fallback,
+/// singleflight per peer; the master never counts forwarded requests
+/// itself, the leaves' numbers are authoritative for their models.
+pub async fn build_response(
+    stats: &StatsStore,
+    gpu: &tokio::sync::RwLock<Vec<crate::gpu::GpuMetrics>>,
+    peers: &crate::peers::PeerRegistry,
+) -> StatsResponse {
+    let gpu_metrics = gpu.read().await.clone();
+    let mut gpus: Vec<crate::types::GpuStatus> = gpu_metrics
+        .iter()
+        .map(|g| {
+            let vram_util_pct = if g.vram_total_bytes > 0 {
+                (g.vram_used_bytes as f64 / g.vram_total_bytes as f64) * 100.0
+            } else {
+                0.0
+            };
+            crate::types::GpuStatus {
+                index: g.index,
+                pci_slot: g.pci_slot.clone(),
+                vram_vendor: g.vram_vendor.clone(),
+                node: None,
+                vram_used_bytes: g.vram_used_bytes,
+                vram_total_bytes: g.vram_total_bytes,
+                vram_util_pct,
+                temperature_c: g.temperature_c,
+                power_w: g.power_w,
+                gpu_busy_pct: g.gpu_busy_pct,
+                sclk_mhz: g.sclk_mhz,
+                mclk_mhz: g.mclk_mhz,
+            }
+        })
+        .collect();
+    let doc = stats.snapshot();
+    let (version, started_at) = doc
+        .as_ref()
+        .map(|d| (d.version, d.started_at))
+        .unwrap_or((1, 0));
+    let mut updated_at = doc.as_ref().map(|d| d.updated_at).unwrap_or(0);
+    let peer_names = peers.peer_names();
+    let mut peer_models: Vec<(String, HashMap<String, StatsModel>)> = Vec::new();
+    if !peer_names.is_empty() {
+        let fetched =
+            futures_util::future::join_all(peer_names.iter().map(|p| peers.peer_stats(p))).await;
+        for (peer, result) in peer_names.iter().zip(fetched) {
+            let Some((value, _fetched_at)) = result else {
+                continue;
+            };
+            if let Some(ts) = value.get("updated_at").and_then(|v| v.as_u64()) {
+                updated_at = updated_at.max(ts);
+            }
+            if let Ok(mut peer_gpus) =
+                serde_json::from_value::<Vec<crate::types::GpuStatus>>(value["gpus"].clone())
+            {
+                for gpu in &mut peer_gpus {
+                    gpu.node = Some(peer.clone());
+                }
+                gpus.extend(peer_gpus);
+            }
+            if let Ok(models) =
+                serde_json::from_value::<HashMap<String, StatsModel>>(value["models"].clone())
+            {
+                peer_models.push((peer.clone(), models));
+            }
+        }
+    }
+
+    // ── Union model map ───────────────────────────────────────────────
+    // - node-qualified entries (`<node>/<model>` for local models,
+    //   `<peer>/<model>` for leaf models) carry that node's numbers;
+    // - bare entries are the sum over every node serving the name.
+    let mut models: HashMap<String, StatsModel> = doc.map(|d| d.models).unwrap_or_default();
+    // Self-qualification (`<node>/<model>` copies of local entries) is a
+    // gateway feature: a node without peers emits bare-only stats so a
+    // consuming master re-exports each entry exactly once (no nested
+    // `cortana/cortana/...` qualification).
+    let is_gateway = !peer_names.is_empty();
+    if is_gateway && let Some(node) = peers.node_name() {
+        let qualified: Vec<(String, StatsModel)> = models
+            .iter()
+            .map(|(name, m)| (format!("{node}/{name}"), *m))
+            .collect();
+        for (name, m) in qualified {
+            models.insert(name, m);
+        }
+    }
+    for (peer, pmodels) in peer_models {
+        for (leaf_name, m) in pmodels {
+            // Qualified leaf entry: the leaf's numbers verbatim.
+            models.insert(format!("{peer}/{leaf_name}"), m);
+            // Bare entry: sum over every node serving the name.
+            let bare = models.entry(leaf_name).or_default();
+            bare.merge(&m);
+        }
+    }
+    let enabled = stats.snapshot().is_some() || !models.is_empty();
+
+    StatsResponse {
+        enabled,
+        version,
+        started_at,
+        updated_at,
+        models,
+        gpus,
+    }
+}
+
+/// The peers' raw `StatsResponse` documents currently cached by the
+/// registry (`(peer_name, doc)`), used by the MQTT publisher to
+/// re-export leaf stats without extra fetches.
+pub async fn peer_stat_docs(
+    peers: &crate::peers::PeerRegistry,
+) -> Vec<(String, serde_json::Value)> {
+    let mut out = Vec::new();
+    for peer in peers.peer_names() {
+        if let Some((value, _)) = peers.peer_stats(&peer).await {
+            out.push((peer, value));
+        }
+    }
+    out
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
