@@ -624,7 +624,7 @@ pub async fn chat_completions(
                 Some(Arc::clone(&state.peers)),
             )
             .await
-            .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
+            .map_err(|e| ApiError::BackendError(format!("backend request failed: {}", e)))?;
 
             Ok(sse_response(stream, &request_id))
         } else {
@@ -929,7 +929,7 @@ pub async fn responses(
                 Some(Arc::clone(&state.peers)),
             )
             .await
-            .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
+            .map_err(|e| ApiError::BackendError(format!("backend request failed: {}", e)))?;
 
             Ok(sse_response(stream, &request_id))
         } else {
@@ -1327,7 +1327,7 @@ pub async fn completions(
                 Some(Arc::clone(&state.peers)),
             )
             .await
-            .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
+            .map_err(|e| ApiError::BackendError(format!("backend request failed: {}", e)))?;
 
             Ok(sse_response(stream, &request_id))
         } else {
@@ -1451,7 +1451,7 @@ pub async fn embeddings(
         drop(guard);
 
         let resp: EmbeddingResponse = serde_json::from_value(response_body).map_err(|e| {
-            ApiError::Internal(format!("failed to parse backend embedding response: {}", e))
+            ApiError::BackendError(format!("failed to parse backend embedding response: {}", e))
         })?;
 
         info!(
@@ -1895,7 +1895,7 @@ async fn forward_audio_post(
             }
         }
     }
-    .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
+    .map_err(|e| ApiError::BackendError(format!("backend request failed: {}", e)))?;
 
     let status = resp.status();
     note_peer_from_response(state, &target.model_name, request_id, &resp, status);
@@ -1927,7 +1927,7 @@ async fn forward_audio_post(
                 },
             );
         }
-        return Err(ApiError::Internal(format!(
+        return Err(ApiError::BackendError(format!(
             "backend returned {}: {}",
             status, text
         )));
@@ -1970,7 +1970,7 @@ async fn forward_audio_post(
             }
         }
     }
-    .map_err(|e| ApiError::Internal(format!("failed to read backend response: {}", e)))?;
+    .map_err(|e| ApiError::BackendError(format!("failed to read backend response: {}", e)))?;
 
     if let Some(ref log_path) = target.debug_log_path {
         state.debug_loggers.write_line(
@@ -2222,20 +2222,19 @@ pub async fn audio_voices(
                 }
             }
         }
-        .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
+        .map_err(|e| ApiError::BackendError(format!("backend request failed: {}", e)))?;
 
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_else(|_| "unknown error".into());
-            return Err(ApiError::Internal(format!(
+            return Err(ApiError::BackendError(format!(
                 "backend returned {}: {}",
                 status, text
             )));
         }
-        let body = resp
-            .json::<serde_json::Value>()
-            .await
-            .map_err(|e| ApiError::Internal(format!("failed to parse backend response: {}", e)))?;
+        let body = resp.json::<serde_json::Value>().await.map_err(|e| {
+            ApiError::BackendError(format!("failed to parse backend response: {}", e))
+        })?;
         Ok(Json(body).into_response())
     }
     .instrument(span)
@@ -2342,6 +2341,106 @@ async fn build_diffusion_target(
     })
 }
 
+/// Aggregated reply from one sd-server backend call.
+struct DiffusionResponse {
+    status: axum::http::StatusCode,
+    content_type: String,
+    bytes: Bytes,
+}
+
+/// Send one diffusion request and aggregate the whole backend exchange.
+///
+/// `total_timeout` bounds response headers *and* body together: sd-server
+/// only starts answering once generation finished, and a body that stalls
+/// mid-transfer would otherwise hold the instance slot (and its VRAM) forever.
+/// `total_timeout == 0` disables the bound.
+///
+/// Every failure is logged with the backend URL — the tower-http trace layer
+/// only reports the status code, so an unlogged backend fault leaves nothing
+/// but "500" in the journal — and maps to [`ApiError::BackendError`] (502),
+/// keeping "the backend broke" distinct from "llm-orch is broken" (500).
+async fn send_diffusion_request(
+    state: &AppState,
+    target: &DiffusionTarget,
+    backend_url: &str,
+    request_id: &str,
+    default_content_type: &str,
+    req: reqwest::RequestBuilder,
+) -> Result<DiffusionResponse, ApiError> {
+    let exchange = async {
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ApiError::BackendError(format!("backend request failed: {}", e)))?;
+        let status = resp.status();
+        note_peer_from_response(state, &target.model_name, request_id, &resp, status);
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(default_content_type)
+            .to_string();
+        // A torn body is an error, not an empty success: swallowing it turns a
+        // dead backend into a silent 200 with no image (or a 500 that says
+        // nothing).
+        let bytes = resp.bytes().await.map_err(|e| {
+            ApiError::BackendError(format!("failed to read backend response: {}", e))
+        })?;
+        Ok(DiffusionResponse {
+            status,
+            content_type,
+            bytes,
+        })
+    };
+
+    let result: Result<DiffusionResponse, ApiError> = if target.total_timeout.is_zero() {
+        exchange.await
+    } else {
+        tokio::time::timeout(target.total_timeout, exchange)
+            .await
+            .map_err(|_| {
+                ApiError::BackendTimeout(format!(
+                    "backend did not respond within {}s",
+                    target.total_timeout.as_secs()
+                ))
+            })?
+    };
+
+    match &result {
+        Ok(ok) if ok.status.is_success() => {}
+        Ok(ok) => warn!(
+            url = %backend_url,
+            inst = %target.instance_id,
+            backend_status = %ok.status,
+            error = %String::from_utf8_lossy(&ok.bytes),
+            "diffusion backend returned non-success"
+        ),
+        Err(e) => {
+            warn!(url = %backend_url, inst = %target.instance_id, error = %e, "diffusion backend request failed");
+            if let Some(ref log_path) = target.debug_log_path {
+                state.debug_loggers.write_line(
+                    log_path,
+                    &DebugLogEntry {
+                        ts: ts_now(),
+                        request_id: request_id.to_owned(),
+                        model: target.model_name.clone(),
+                        alias: Some(target.request_model.clone()),
+                        instance_id: Some(target.instance_id.clone()),
+                        dir: "response".into(),
+                        stream: None,
+                        body: None,
+                        usage: None,
+                        duration_ms: None,
+                        error: Some(e.to_string()),
+                    },
+                );
+            }
+        }
+    }
+
+    result
+}
+
 /// Forward a JSON POST to an sd-server backend endpoint.
 ///
 /// Sends the request body to `http://127.0.0.1:{port}{path}`, aggregates
@@ -2380,41 +2479,25 @@ async fn forward_diffusion_json(
 
     // Cluster peering: rewrite the body's model to the leaf-side name.
     let body = rewrite_raw_model(state, &target.model_name, body, "application/json");
-    let send = with_auth(
-        state
-            .client
-            .post(&backend_url)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(body),
-        &target.auth,
+    let resp = send_diffusion_request(
+        state,
+        &target,
+        &backend_url,
+        request_id,
+        "application/json",
+        with_auth(
+            state
+                .client
+                .post(&backend_url)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body),
+            &target.auth,
+        ),
     )
-    .send();
-
-    let resp = if target.total_timeout.is_zero() {
-        send.await
-    } else {
-        match tokio::time::timeout(target.total_timeout, send).await {
-            Ok(r) => r,
-            Err(_) => {
-                warn!(url = %backend_url, "diffusion backend timeout");
-                return Err(ApiError::BackendTimeout(format!(
-                    "backend did not respond within {}s",
-                    target.total_timeout.as_secs()
-                )));
-            }
-        }
-    }
-    .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
-
-    let status = resp.status();
-    note_peer_from_response(state, &target.model_name, request_id, &resp, status);
-    let content_type = resp
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
-        .to_string();
-    let bytes = resp.bytes().await.unwrap_or_default();
+    .await?;
+    let status = resp.status;
+    let content_type = resp.content_type;
+    let bytes = resp.bytes;
 
     // Debug log: response
     if let Some(ref log_path) = target.debug_log_path {
@@ -2449,7 +2532,7 @@ async fn forward_diffusion_json(
     }
 
     if !status.is_success() {
-        return Err(ApiError::Internal(format!(
+        return Err(ApiError::BackendError(format!(
             "backend returned {}: {}",
             status,
             String::from_utf8_lossy(&bytes)
@@ -2579,44 +2662,28 @@ async fn forward_diffusion_post_raw(
     let backend_url = format!("{}{}", target.base, path);
 
     let body = rewrite_raw_model(state, &target.model_name, body, content_type);
-    let send = with_auth(
-        state
-            .client
-            .post(&backend_url)
-            .header(header::CONTENT_TYPE, content_type)
-            .body(body),
-        &target.auth,
+    let resp = send_diffusion_request(
+        state,
+        &target,
+        &backend_url,
+        _request_id,
+        "application/octet-stream",
+        with_auth(
+            state
+                .client
+                .post(&backend_url)
+                .header(header::CONTENT_TYPE, content_type)
+                .body(body),
+            &target.auth,
+        ),
     )
-    .send();
-
-    let resp = if target.total_timeout.is_zero() {
-        send.await
-    } else {
-        match tokio::time::timeout(target.total_timeout, send).await {
-            Ok(r) => r,
-            Err(_) => {
-                warn!(url = %backend_url, "diffusion backend (raw) timeout");
-                return Err(ApiError::BackendTimeout(format!(
-                    "backend did not respond within {}s",
-                    target.total_timeout.as_secs()
-                )));
-            }
-        }
-    }
-    .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
-
-    let status = resp.status();
-    note_peer_from_response(state, &target.model_name, _request_id, &resp, status);
-    let resp_ct = resp
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
-    let bytes = resp.bytes().await.unwrap_or_default();
+    .await?;
+    let status = resp.status;
+    let resp_ct = resp.content_type;
+    let bytes = resp.bytes;
 
     if !status.is_success() {
-        return Err(ApiError::Internal(format!(
+        return Err(ApiError::BackendError(format!(
             "backend returned {}: {}",
             status,
             String::from_utf8_lossy(&bytes)
@@ -2693,16 +2760,20 @@ pub async fn video_generations(
     )
     .send()
     .await
-    .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
+    .map_err(|e| {
+        warn!(url = %backend_url, error = %e, "diffusion backend request failed");
+        ApiError::BackendError(format!("backend request failed: {}", e))
+    })?;
 
     let submit_status = submit_resp.status();
-    let submit_body: serde_json::Value = submit_resp
-        .json()
-        .await
-        .map_err(|e| ApiError::Internal(format!("failed to parse submit response: {}", e)))?;
+    let submit_body: serde_json::Value = submit_resp.json().await.map_err(|e| {
+        warn!(url = %backend_url, error = %e, "failed to parse video job submit response");
+        ApiError::BackendError(format!("failed to parse submit response: {}", e))
+    })?;
 
     if !submit_status.is_success() && submit_status != 202 {
-        return Err(ApiError::Internal(format!(
+        warn!(url = %backend_url, backend_status = %submit_status, error = %submit_body, "video job submission failed");
+        return Err(ApiError::BackendError(format!(
             "video job submission failed ({}): {}",
             submit_status, submit_body
         )));
@@ -2712,7 +2783,7 @@ pub async fn video_generations(
     let job_id = submit_body["id"]
         .as_str()
         .map(String::from)
-        .ok_or_else(|| ApiError::Internal("no job id in submit response".into()))?;
+        .ok_or_else(|| ApiError::BackendError("no job id in submit response".into()))?;
 
     // Poll until completed or timeout.
     let poll_base = format!("{}/sdcpp/v1/jobs/{}", target.base, job_id);
@@ -2732,27 +2803,31 @@ pub async fn video_generations(
         let poll_resp = with_auth(state.client.get(&poll_base), &target.auth)
             .send()
             .await
-            .map_err(|e| ApiError::Internal(format!("poll failed: {}", e)))?;
+            .map_err(|e| {
+                warn!(url = %poll_base, error = %e, "diffusion job poll failed");
+                ApiError::BackendError(format!("poll failed: {}", e))
+            })?;
         let poll_status = poll_resp.status();
-        let poll_body: serde_json::Value = poll_resp
-            .json()
-            .await
-            .map_err(|e| ApiError::Internal(format!("failed to parse poll response: {}", e)))?;
+        let poll_body: serde_json::Value = poll_resp.json().await.map_err(|e| {
+            warn!(url = %poll_base, error = %e, "failed to parse poll response");
+            ApiError::BackendError(format!("failed to parse poll response: {}", e))
+        })?;
 
         if poll_status == 404 {
-            return Err(ApiError::Internal("video job not found".into()));
+            warn!(url = %poll_base, "video job not found");
+            return Err(ApiError::BackendError("video job not found".into()));
         }
 
         let job_status = poll_body["status"].as_str().unwrap_or("unknown");
         match job_status {
             "completed" => {
                 // Extract the result payload.
-                let result = poll_body["result"]
-                    .as_object()
-                    .ok_or_else(|| ApiError::Internal("missing result in completed job".into()))?;
+                let result = poll_body["result"].as_object().ok_or_else(|| {
+                    ApiError::BackendError("missing result in completed job".into())
+                })?;
                 let b64 = result["b64_json"]
                     .as_str()
-                    .ok_or_else(|| ApiError::Internal("missing b64_json in result".into()))?;
+                    .ok_or_else(|| ApiError::BackendError("missing b64_json in result".into()))?;
                 let mime_type = result["mime_type"]
                     .as_str()
                     .unwrap_or("video/webm")
@@ -2761,7 +2836,7 @@ pub async fn video_generations(
                 use base64::Engine;
                 let decoded = base64::engine::general_purpose::STANDARD
                     .decode(b64)
-                    .map_err(|e| ApiError::Internal(format!("base64 decode error: {}", e)))?;
+                    .map_err(|e| ApiError::BackendError(format!("base64 decode error: {}", e)))?;
 
                 let mut response = (decoded).into_response();
                 if let Ok(ct) = header::HeaderValue::from_str(&mime_type) {
@@ -2774,13 +2849,15 @@ pub async fn video_generations(
                     .as_object()
                     .map(|e| format!("{}", serde_json::json!(e)))
                     .unwrap_or_else(|| "unknown error".into());
-                return Err(ApiError::Internal(format!(
+                warn!(url = %poll_base, inst = %target.instance_id, error = %err, "video job failed");
+                return Err(ApiError::BackendError(format!(
                     "video generation failed: {}",
                     err
                 )));
             }
             "cancelled" => {
-                return Err(ApiError::Internal("video generation cancelled".into()));
+                warn!(url = %poll_base, inst = %target.instance_id, "video job cancelled");
+                return Err(ApiError::BackendError("video generation cancelled".into()));
             }
             _ => {
                 // queued or generating → continue polling
@@ -2898,22 +2975,21 @@ pub async fn passthrough_sdcpp_get(
     let target = acquire_passthrough_target(&state, &headers, &request_id).await?;
     let backend_url = format!("{}/sdcpp/v1/{}", target.base, path);
 
-    let resp = with_auth(state.client.get(&backend_url), &target.auth)
-        .send()
-        .await
-        .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
-
-    let status = resp.status();
-    let content_type = resp
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
-        .to_string();
-    let bytes = resp.bytes().await.unwrap_or_default();
+    let resp = send_diffusion_request(
+        &state,
+        &target,
+        &backend_url,
+        &request_id,
+        "application/json",
+        with_auth(state.client.get(&backend_url), &target.auth),
+    )
+    .await?;
+    let status = resp.status;
+    let content_type = resp.content_type;
+    let bytes = resp.bytes;
 
     if !status.is_success() {
-        return Err(ApiError::Internal(format!(
+        return Err(ApiError::BackendError(format!(
             "backend returned {}: {}",
             status,
             String::from_utf8_lossy(&bytes)
@@ -3195,18 +3271,18 @@ async fn forward_admin_action(
     let resp = builder
         .send()
         .await
-        .map_err(|e| ApiError::Internal(format!("peer request failed: {e}")))?;
+        .map_err(|e| ApiError::BackendError(format!("peer request failed: {e}")))?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_else(|_| "unknown error".into());
-        return Err(ApiError::Internal(format!(
+        return Err(ApiError::BackendError(format!(
             "peer returned {status}: {text}"
         )));
     }
     let answer: AdminResponse = resp
         .json()
         .await
-        .map_err(|e| ApiError::Internal(format!("invalid peer response: {e}")))?;
+        .map_err(|e| ApiError::BackendError(format!("invalid peer response: {e}")))?;
     info!(peer = %peer, path = %path, model = %body.model, "admin action forwarded to peer");
     Ok(Some(Json(answer)))
 }
@@ -3574,7 +3650,7 @@ async fn forward_request_aggregate(
         let resp = with_auth(client.post(backend_url).json(body), auth)
             .send()
             .await
-            .map_err(|e| ApiError::Internal(format!("backend request failed: {}", e)))?;
+            .map_err(|e| ApiError::BackendError(format!("backend request failed: {}", e)))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -3583,7 +3659,7 @@ async fn forward_request_aggregate(
             }
             let text = resp.text().await.unwrap_or_else(|_| "unknown error".into());
             warn!(backend_status = %status, error = %text, "backend returned non-success");
-            return Err(ApiError::Internal(format!(
+            return Err(ApiError::BackendError(format!(
                 "backend returned {}: {}",
                 status, text
             )));
@@ -3593,10 +3669,9 @@ async fn forward_request_aggregate(
             note_leaf_request(p, &resp);
         }
 
-        let mut value: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| ApiError::Internal(format!("failed to parse backend response: {}", e)))?;
+        let mut value: serde_json::Value = resp.json().await.map_err(|e| {
+            ApiError::BackendError(format!("failed to parse backend response: {}", e))
+        })?;
 
         // Restore the master-side model name in the response body.
         if let Some(p) = &peer

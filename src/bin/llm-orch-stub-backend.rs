@@ -24,6 +24,10 @@
 //   GET  /test/last-auth          → test support: Authorization header of
 //                                   the most recent request (JSON)
 //                                   (`{"authorization": "…" | null}`)
+//   --fail-status N               → test support: every generation request
+//                                   answers with status N and a JSON error
+//                                   body (`/health` stays healthy), so
+//                                   upstream-fault handling is testable
 //
 // Flags control the canned response: number of chunks, per-chunk delay
 // (slow streaming for drain/timeout tests).  audiocpp_server-style flags
@@ -127,6 +131,13 @@ struct Cli {
     w: Option<u32>,
     #[arg(long)]
     h: Option<u32>,
+
+    // ── test support ────────────────────────────────────────────────────
+    /// Respond to every generation request (everything except `/health` and
+    /// `/test/*`) with this HTTP status and a JSON error body, simulating a
+    /// broken backend.  0 (default) disables the injection.
+    #[arg(long, default_value_t = 0)]
+    fail_status: u16,
 }
 
 #[derive(Clone)]
@@ -137,6 +148,9 @@ struct StubConfig {
     /// (recorded by middleware for every endpoint), exposed via
     /// `GET /test/last-auth`.
     last_auth: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Test support: when non-zero, every generation request fails with this
+    /// status code (see `--fail-status`).
+    fail_status: u16,
 }
 
 #[tokio::main]
@@ -152,6 +166,7 @@ async fn main() {
         chunks: cli.chunks,
         chunk_delay: Duration::from_millis(cli.chunk_delay_ms),
         last_auth: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        fail_status: cli.fail_status,
     };
 
     let app = Router::new()
@@ -212,6 +227,20 @@ async fn record_auth_middleware(
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    // Injected backend failure: answers every generation endpoint with an
+    // error so llm-orch's upstream-fault handling can be tested.  Readiness
+    // (`/health`) stays healthy so the instance still spawns normally.
+    if cfg.fail_status != 0 && req.uri().path() != "/health" {
+        let status = axum::http::StatusCode::from_u16(cfg.fail_status)
+            .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        return (
+            status,
+            Json(serde_json::json!({
+                "error": format!("injected stub failure ({})", cfg.fail_status)
+            })),
+        )
+            .into_response();
+    }
     next.run(req).await
 }
 

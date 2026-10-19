@@ -293,6 +293,28 @@ Responses forwarded verbatim from a backend keep their original body, so the
 prefix tells you which hop in the chain (client, proxy, llm-orch, backend)
 produced a failure.
 
+Failed responses are classified by the hop at fault:
+
+| status | meaning |
+| ------ | ------- |
+| 400/401/404/429 | the request itself was rejected (bad input, no/unknown key, no capacity) |
+| 502 | the backend (or a peered llm-orch) failed: unreachable, a non-success answer, or a response torn off mid-transfer |
+| 503 | model not loadable right now, or the request was queued and blocked |
+| 504 | a timeout: a backend silent past `backend_total_timeout_secs` / `backend_idle_timeout_secs`, or a queue wait past `queue_wait_timeout_secs` |
+| 500 | an llm-orch bug — everything else is an upstream or client fault |
+
+Every failed response is logged with its reason, not just its status code, so
+the journal is diagnosable on its own (the `tower-http` trace line only reports
+the status):
+
+```
+WARN llm_orch::server: request failed status=502 Bad Gateway error=backend error: backend returned 500 Internal Server Error: out of memory
+WARN llm_orch::handlers: diffusion backend returned non-success url=http://127.0.0.1:9003/v1/images/generations inst=… backend_status=500 error=…
+```
+
+Run with `RUST_LOG=info` (the default) to see them; 4xx rejections are logged
+at `debug`.
+
 ### ROCm (AMD) devices
 ROCm models use a separate llama.cpp backend namespace from Vulkan. This is
 important when `llama-server` was built with both backends: an AMD GPU may be

@@ -1186,6 +1186,38 @@ fn chat_body(model: &str) -> serde_json::Value {
     serde_json::json!({"model": model, "messages": [{"role": "user", "content": "hi"}]})
 }
 
+/// Rule proven by this test for **every** forwarding endpoint: a backend fault
+/// is a 502 whose body carries the backend's own message, never a bare 500 —
+/// both so a client can tell "retry the backend" from "llm-orch is broken",
+/// and because the reason is what gets logged.
+#[tokio::test]
+async fn chat_backend_failure_is_bad_gateway() {
+    let dir = temp_dir("chat-fail");
+    let srv = boot(
+        &dir,
+        "tester: secret-key\n",
+        &models_yaml(" --fail-status 503", 60),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+        .json(&chat_body("m"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("backend returned 503"),
+        "body must carry the backend's status, got: {body}"
+    );
+    assert!(
+        body.contains("injected stub failure"),
+        "body must carry the backend's own error message, got: {body}"
+    );
+}
+
 #[tokio::test]
 async fn alias_make_room_evicts_stale_idle_model() {
     let Some(slot) = real_pci_slot() else { return };
@@ -1619,8 +1651,14 @@ async fn spawn_pins_cuda_model_with_device_selector() {
 
 /// Build a YAML snippet for a single sd-server model.
 fn sd_models_yaml(idle_ttl: u64) -> String {
+    sd_models_yaml_flags(idle_ttl, "")
+}
+
+/// Like [`sd_models_yaml`] but with extra stub-backend flags appended to the
+/// model command (e.g. `--fail-status 503`).
+fn sd_models_yaml_flags(idle_ttl: u64, flags: &str) -> String {
     format!(
-        "models:\n  - name: sd-m\n    context_length: 0\n    cmd: \"{STUB_BIN} --port {{port}} --diffusion-model /models/test.safetensors --backend vulkan\"\n    idle_ttl: {idle_ttl}\n    max_instances: 1\n"
+        "models:\n  - name: sd-m\n    context_length: 0\n    cmd: \"{STUB_BIN} --port {{port}} --diffusion-model /models/test.safetensors --backend vulkan{flags}\"\n    idle_ttl: {idle_ttl}\n    max_instances: 1\n"
     )
 }
 
@@ -1664,6 +1702,108 @@ async fn sd_image_generation_unknown_model_404() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
+}
+
+/// A diffusion backend that answers with an error must surface as **502 Bad
+/// Gateway carrying the backend's own message**.  It used to be a bare 500
+/// whose reason only existed in the response body — indistinguishable from an
+/// llm-orch bug, and invisible in the journal.
+#[tokio::test]
+async fn sd_image_generation_backend_failure_is_bad_gateway() {
+    let dir = temp_dir("sd-img-fail");
+    let srv = boot(
+        &dir,
+        "tester: secret-key\n",
+        &sd_models_yaml_flags(60, " --fail-status 503"),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let resp = authed(&client, &format!("{}/v1/images/generations", srv.url))
+        .json(&serde_json::json!({
+            "model": "sd-m",
+            "prompt": "a cat",
+            "size": "512x512"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        502,
+        "an upstream fault must be 502, not a generic 500"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("backend error"),
+        "body must attribute the fault to the backend, got: {body}"
+    );
+    assert!(
+        body.contains("503"),
+        "body must carry the backend's status code, got: {body}"
+    );
+    assert!(
+        body.contains("injected stub failure"),
+        "body must carry the backend's own error message, got: {body}"
+    );
+}
+
+/// The raw passthrough path (`/sdapi/*`, multipart-capable forwarding) must
+/// report upstream faults the same way.
+#[tokio::test]
+async fn sd_passthrough_backend_failure_is_bad_gateway() {
+    let dir = temp_dir("sd-sdapi-fail");
+    let listen_port = free_port();
+    let models = sd_models_yaml_flags(60, " --fail-status 500");
+    let cfg_yaml = format!(
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  default_diffusion_model: \"sd-m\"\napikeys_file: \"apikeys.txt\"\n{models}",
+    );
+    let config_path = dir.join("config.yaml");
+    std::fs::write(&config_path, cfg_yaml).unwrap();
+    let srv = boot_from_config_path(&dir, &config_path, "tester: secret-key\n").await;
+    let client = reqwest::Client::new();
+
+    let resp = authed(&client, &format!("{}/sdapi/v1/txt2img", srv.url))
+        .json(&serde_json::json!({ "prompt": "a cat", "steps": 20 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("injected stub failure"),
+        "body must carry the backend's own error message, got: {body}"
+    );
+}
+
+/// A rejected async video job must report the backend's failure too
+/// (submit path: sd-server refuses the job outright).
+#[tokio::test]
+async fn sd_video_generation_backend_failure_is_bad_gateway() {
+    let dir = temp_dir("sd-vid-fail");
+    let srv = boot(
+        &dir,
+        "tester: secret-key\n",
+        &sd_models_yaml_flags(60, " --fail-status 503"),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let resp = authed(&client, &format!("{}/v1/video/generations", srv.url))
+        .json(&serde_json::json!({
+            "model": "sd-m",
+            "prompt": "a cat walking",
+            "video_frames": 33
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("video job submission failed"),
+        "body must say the job submission failed, got: {body}"
+    );
 }
 
 #[tokio::test]

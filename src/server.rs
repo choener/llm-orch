@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::compression::CompressionLayer;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{debug, info, warn};
 
 // ── Application state ───────────────────────────────────────────────────────
 
@@ -196,6 +196,12 @@ pub enum ApiError {
     #[error("backend timeout: {0}")]
     BackendTimeout(String),
 
+    /// The backend was unreachable, answered with a non-success status, or
+    /// broke mid-response.  Rendered as 502 so a broken upstream is never
+    /// confused with an llm-orch bug (500).
+    #[error("backend error: {0}")]
+    BackendError(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -212,8 +218,17 @@ impl IntoResponse for ApiError {
             ApiError::NoCapacity(_) => StatusCode::TOO_MANY_REQUESTS,
             ApiError::QueueTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
             ApiError::BackendTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
+            ApiError::BackendError(_) => StatusCode::BAD_GATEWAY,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
+        // The tower-http TraceLayer only reports the *status code*, so without
+        // this the reason for a failed request never reaches the log — a 500 in
+        // the journal carries no explanation at all.
+        if status.is_server_error() {
+            warn!(status = %status, error = %self, "request failed");
+        } else if status.is_client_error() {
+            debug!(status = %status, error = %self, "request rejected");
+        }
         let mut resp = (status, err_msg(&self)).into_response();
         // 429s ask the client to retry later — say when (plan §5).
         if matches!(self, ApiError::NoCapacity(_)) {
@@ -289,6 +304,7 @@ mod tests {
             ApiError::ModelUnavailable("gpt-x".into()),
             ApiError::RequestNotFound("req-1".into()),
             ApiError::BackendTimeout("gpt-x".into()),
+            ApiError::BackendError("backend returned 500".into()),
             ApiError::Internal("boom".into()),
         ];
         for err in errors {
@@ -302,5 +318,45 @@ mod tests {
                 "body must start with {ERROR_PREFIX:?}, got: {body}"
             );
         }
+    }
+
+    /// A broken backend must be distinguishable from an llm-orch bug: the
+    /// upstream's fault is a 502 (bad gateway), our own is a 500.
+    #[test]
+    fn backend_faults_are_bad_gateway_not_internal() {
+        assert_eq!(
+            ApiError::BackendError("backend returned 500".into())
+                .into_response()
+                .status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            ApiError::BackendTimeout("slow".into())
+                .into_response()
+                .status(),
+            StatusCode::GATEWAY_TIMEOUT
+        );
+        assert_eq!(
+            ApiError::Internal("bug".into()).into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// Every failed response must be logged with its reason: the tower-http
+    /// trace layer only logs the status code, and a bare "500" in the journal
+    /// is undiagnosable.
+    #[test]
+    fn server_error_responses_are_logged_with_their_reason() {
+        let captured = crate::test_log::Capture::install();
+        let err = ApiError::BackendError("backend returned 500: out of memory".into());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let lines = captured.lines();
+        assert!(
+            lines.iter().any(|l| l.contains("request failed")
+                && l.contains("backend returned 500: out of memory")),
+            "expected a warn log carrying the error reason, got: {lines:?}"
+        );
     }
 }
