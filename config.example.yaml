@@ -559,7 +559,10 @@ models:
   # Use `/v1/video/generations` (JSON) to generate or `/sdcpp/v1/vid_gen`
   # (passthrough, 202 + job id) for native async control.
   #
-  # See also: scripts/generate-video.sh for a CLI wrapper.
+  # See also: scripts/generate-video.sh for a CLI wrapper.  For renders
+  # that can exceed server.backend_total_timeout_secs, use
+  # scripts/generate-video-async.sh instead: it submits through the native
+  # async API and polls, so no single request has to survive the whole render.
   # - name: "minimax-h3"
   #   context_length: 0
   #   max_instances: 1

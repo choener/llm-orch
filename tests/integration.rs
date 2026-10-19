@@ -1806,6 +1806,95 @@ async fn sd_video_generation_backend_failure_is_bad_gateway() {
     );
 }
 
+/// A backend that stops answering HTTP while its process keeps running (a
+/// busy sd-server) must not cost the client its job: llm-orch keeps polling
+/// until the total timeout instead of failing at the first unreachable poll.
+#[tokio::test]
+async fn sd_video_generation_polls_through_an_unreachable_but_alive_backend() {
+    let dir = temp_dir("sd-vid-deaf");
+    let listen_port = free_port();
+    // The stub closes its listener 1s after the job is created; the job stays
+    // pending, so llm-orch is mid-poll when the backend goes deaf.
+    let models = sd_models_yaml_flags(60, " --job-pending-secs 30 --stop-serving-after 1");
+    let cfg_yaml = format!(
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\n  backend_total_timeout_secs: 4\napikeys_file: \"apikeys.txt\"\n{models}",
+    );
+    let config_path = dir.join("config.yaml");
+    std::fs::write(&config_path, cfg_yaml).unwrap();
+    let srv = boot_from_config_path(&dir, &config_path, "tester: secret-key\n").await;
+    let client = reqwest::Client::new();
+
+    let started = std::time::Instant::now();
+    let resp = authed(&client, &format!("{}/v1/video/generations", srv.url))
+        .json(&serde_json::json!({
+            "model": "sd-m",
+            "prompt": "a cat walking",
+            "video_frames": 33
+        }))
+        .send()
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    // The listener dies ~1s in, well before the 4s total timeout: the request
+    // must be decided by the deadline, not by the first failed poll.
+    assert_eq!(
+        status, 504,
+        "a deaf-but-alive backend must be polled until the deadline, got {status}: {body}"
+    );
+    assert!(
+        body.contains("did not complete within 4s"),
+        "expected a timeout answer, got: {body}"
+    );
+    assert!(
+        elapsed.as_secs() >= 3,
+        "polling gave up after {elapsed:?}, before the total timeout"
+    );
+}
+
+/// When the backend process itself exits, the job can never complete, so
+/// llm-orch stops polling at once instead of burning the whole total timeout.
+#[tokio::test]
+async fn sd_video_generation_aborts_when_backend_process_exits() {
+    let dir = temp_dir("sd-vid-exit");
+    let listen_port = free_port();
+    let models = sd_models_yaml_flags(60, " --job-pending-secs 30 --exit-after 1");
+    let cfg_yaml = format!(
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\n  backend_total_timeout_secs: 120\napikeys_file: \"apikeys.txt\"\n{models}",
+    );
+    let config_path = dir.join("config.yaml");
+    std::fs::write(&config_path, cfg_yaml).unwrap();
+    let srv = boot_from_config_path(&dir, &config_path, "tester: secret-key\n").await;
+    let client = reqwest::Client::new();
+
+    let started = std::time::Instant::now();
+    let resp = authed(&client, &format!("{}/v1/video/generations", srv.url))
+        .json(&serde_json::json!({
+            "model": "sd-m",
+            "prompt": "a cat walking",
+            "video_frames": 33
+        }))
+        .send()
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert_eq!(
+        status, 502,
+        "a dead backend must fail as a bad gateway, got {status}: {body}"
+    );
+    assert!(
+        body.contains("can no longer complete"),
+        "expected the job to be reported as unrecoverable, got: {body}"
+    );
+    assert!(
+        elapsed.as_secs() < 30,
+        "a dead backend must be detected early, waited {elapsed:?}"
+    );
+}
+
 #[tokio::test]
 async fn sd_image_edits_sync() {
     let dir = temp_dir("sd-edit");

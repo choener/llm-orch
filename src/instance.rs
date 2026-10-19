@@ -127,7 +127,51 @@ pub struct Instance {
     pub config_fingerprint: u64,
 }
 
+/// Whether the process behind an instance is still running.
+///
+/// Long-polling request paths (async diffusion jobs) need to tell a backend
+/// that is *busy* (still generating, refusing connections) from one that is
+/// *gone* (its job can never complete) before deciding whether to keep waiting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Liveness {
+    /// Process is running — or the instance is a remote endpoint, which has no
+    /// local process to watch.
+    Running,
+    /// Process is gone; the payload is a short reason for the log.
+    Gone(String),
+}
+
+impl std::fmt::Display for Liveness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Liveness::Running => write!(f, "running"),
+            Liveness::Gone(reason) => write!(f, "gone: {reason}"),
+        }
+    }
+}
+
 impl Instance {
+    /// Whether the backing process is still running.
+    ///
+    /// Calls `try_wait`, so an exited child is reaped here — the crash monitor
+    /// polls the same handle and reports the exit as usual.
+    pub fn liveness(&mut self) -> Liveness {
+        if self.remote_base_url.is_some() {
+            return Liveness::Running;
+        }
+        if matches!(self.state, InstanceState::Failed | InstanceState::Retired) {
+            return Liveness::Gone(format!("process is gone (instance {:?})", self.state));
+        }
+        match self.child.as_mut() {
+            None => Liveness::Gone("has no child process".into()),
+            Some(child) => match child.try_wait() {
+                Ok(None) => Liveness::Running,
+                Ok(Some(status)) => Liveness::Gone(format!("exited ({status})")),
+                Err(e) => Liveness::Gone(format!("could not be waited on ({e})")),
+            },
+        }
+    }
+
     /// Create a new instance descriptor.  The subprocess has not been spawned yet.
     pub fn new(
         model_name: &str,
@@ -318,6 +362,12 @@ impl InstanceHandle {
     /// Unique identifier of this instance (e.g. `"qwen3-32b@0,1"`).
     pub fn id(&self) -> String {
         self.inner.lock().unwrap().id.clone()
+    }
+
+    /// Whether the backend process behind this instance is still running
+    /// (see [`Instance::liveness`]).
+    pub fn liveness(&self) -> Liveness {
+        self.inner.lock().unwrap().liveness()
     }
 
     /// Backend base (no path) — `http://127.0.0.1:{port}` for spawned

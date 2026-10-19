@@ -3250,20 +3250,12 @@ impl InstanceManager {
             _ => None,
         };
 
-        // Select the backend implementation based on the program basename.
-        // sd.cpp models use `StableDiffusionCppBackend` (no --device flag,
-        // only the visibility env var); containers use `ContainerBackend`
-        // (GPU passthrough via --device flags, no env-var / selector
-        // injection); everything else uses the standard llama.cpp backend.
-        let prog_basename = prog.rsplit('/').next().unwrap_or(prog);
+        // Select the backend implementation from the program basename
+        // (see `backend_for_prog`); a URL never reaches the spawn path.
         let is_container = cfg.runner(&self.cmd_aliases.read().unwrap()) == Runner::Container;
-        let model_backend: Box<dyn Backend> = if is_container {
-            Box::new(ContainerBackend)
-        } else if prog_basename.starts_with("sd-server") {
-            Box::new(StableDiffusionCppBackend::new(cfg.device_kind()))
-        } else {
-            Box::new(LlamaCppBackend::new(cfg.device_kind()))
-        };
+        let model_backend: Box<dyn Backend> = self
+            .backend_for_prog(prog, cfg)
+            .unwrap_or_else(|| Box::new(LlamaCppBackend::new(cfg.device_kind())));
         let mut args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
         let mut container_name: Option<String> = None;
         if is_container {
@@ -3510,11 +3502,21 @@ impl InstanceManager {
         // `resolve_cmd` skips the `{port}` substitution for remote models
         // (see `resolve_model_cmd`), so the marker port 0 is safe.
         let base_url = self.resolve_cmd(cfg, 0);
-        let health_url = format!("{}/health", base_url.trim_end_matches('/'));
-
-        let healthy =
-            match tokio::time::timeout(REMOTE_PROBE_TIMEOUT, self.client.get(&health_url).send())
-                .await
+        // Readiness probe: remote endpoints differ.  llama.cpp serves
+        // `/health`; sd-server has no `/health` and serves `/`.  A remote
+        // model's cmd is only a URL, so the server behind it cannot be
+        // inferred — probe the llama.cpp path first, then the root.
+        let base = base_url.trim_end_matches('/');
+        let mut healthy = false;
+        let mut probed: Vec<String> = Vec::new();
+        for path in ["/health", "/"] {
+            let health_url = format!("{base}{path}");
+            probed.push(health_url.clone());
+            healthy = match tokio::time::timeout(
+                REMOTE_PROBE_TIMEOUT,
+                self.client.get(&health_url).send(),
+            )
+            .await
             {
                 Ok(Ok(resp)) => resp.status().is_success(),
                 other => {
@@ -3527,7 +3529,12 @@ impl InstanceManager {
                     false
                 }
             };
+            if healthy {
+                break;
+            }
+        }
         if !healthy {
+            warn!(model = %model_name, urls = ?probed, "remote endpoint provisioning failed");
             return None;
         }
 
@@ -3679,6 +3686,28 @@ impl InstanceManager {
     /// `audiocpp_server --config /etc/llm-orch/audio/{name}.json …`.
     fn resolve_cmd(&self, cfg: &ModelConfig, port: u16) -> String {
         crate::config::resolve_model_cmd(&self.cmd_aliases.read().unwrap(), cfg, port)
+    }
+
+    /// The [`Backend`] implementation a program belongs to, chosen from the
+    /// program basename: `sd-server*` is stable-diffusion.cpp, anything else
+    /// is llama.cpp; a container runner always uses [`ContainerBackend`].
+    ///
+    /// Returns `None` when the program is an `http(s)` URL — a remote model's
+    /// endpoint says nothing about which server binary answers on the other
+    /// side, so nothing can be inferred.
+    fn backend_for_prog(&self, prog: &str, cfg: &ModelConfig) -> Option<Box<dyn Backend>> {
+        if cfg.runner(&self.cmd_aliases.read().unwrap()) == Runner::Container {
+            return Some(Box::new(ContainerBackend));
+        }
+        if prog.starts_with("http://") || prog.starts_with("https://") {
+            return None;
+        }
+        let basename = prog.rsplit('/').next().unwrap_or(prog);
+        if basename.starts_with("sd-server") {
+            Some(Box::new(StableDiffusionCppBackend::new(cfg.device_kind())))
+        } else {
+            Some(Box::new(LlamaCppBackend::new(cfg.device_kind())))
+        }
     }
 
     /// Pick the devices for a new instance from the model's device pool

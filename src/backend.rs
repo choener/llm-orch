@@ -19,9 +19,19 @@ pub trait Backend: Send + Sync {
     /// `[("GGML_VK_VISIBLE_DEVICES", "0,1")]`
     fn gpu_env(&self, indices: &[usize]) -> Vec<(String, String)>;
 
+    /// Readiness probe path, relative to the backend base.
+    ///
+    /// Local instances are probed at `http://127.0.0.1:{port}{path}`, remote
+    /// endpoints at `{base}{path}` — so a backend whose probe path differs from
+    /// the llama.cpp convention must override this (not `health_url`) to keep
+    /// both probe paths consistent.
+    fn health_path(&self) -> &'static str {
+        "/health"
+    }
+
     /// Health-check URL for a backend listening on `port`.
     fn health_url(&self, port: u16) -> String {
-        format!("http://127.0.0.1:{port}/health")
+        format!("http://127.0.0.1:{port}{}", self.health_path())
     }
 }
 
@@ -358,10 +368,10 @@ impl Backend for StableDiffusionCppBackend {
         vec![(var.into(), list)]
     }
 
-    /// sd-server has no `/health` endpoint — use `GET /` which returns 200
+    /// sd-server has no `/health` endpoint — probe `GET /`, which returns 200
     /// once the server is ready.
-    fn health_url(&self, port: u16) -> String {
-        format!("http://127.0.0.1:{port}/")
+    fn health_path(&self) -> &'static str {
+        "/"
     }
 }
 

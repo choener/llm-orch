@@ -28,6 +28,16 @@
 //                                   answers with status N and a JSON error
 //                                   body (`/health` stays healthy), so
 //                                   upstream-fault handling is testable
+//   --job-pending-secs N          → test support: async sdcpp jobs report
+//                                   `generating` (no result) for the first N
+//                                   seconds after creation, so polling
+//                                   clients really poll
+//   --stop-serving-after N        → test support: stop answering HTTP N seconds
+//                                   after the first job is created while the
+//                                   process stays alive — an "alive but deaf"
+//                                   backend (busy generator, dead listener)
+//   --exit-after N                → test support: exit the process N seconds
+//                                   after the first job is created
 //
 // Flags control the canned response: number of chunks, per-chunk delay
 // (slow streaming for drain/timeout tests).  audiocpp_server-style flags
@@ -138,6 +148,20 @@ struct Cli {
     /// broken backend.  0 (default) disables the injection.
     #[arg(long, default_value_t = 0)]
     fail_status: u16,
+    /// Test support: async sdcpp jobs report `generating` (no result) for this
+    /// many seconds after the job is created instead of completing immediately,
+    /// so polling clients really poll.
+    #[arg(long, default_value_t = 0)]
+    job_pending_secs: u64,
+    /// Test support: stop serving HTTP this many seconds after the first sdcpp
+    /// job is created, while the process keeps running — a backend that is alive
+    /// but deaf.  Never fires if no job is created.
+    #[arg(long, default_value_t = 0)]
+    stop_serving_after: u64,
+    /// Test support: exit the process this many seconds after the first sdcpp
+    /// job is created.  Never fires if no job is created.
+    #[arg(long, default_value_t = 0)]
+    exit_after: u64,
 }
 
 #[derive(Clone)]
@@ -151,6 +175,45 @@ struct StubConfig {
     /// Test support: when non-zero, every generation request fails with this
     /// status code (see `--fail-status`).
     fail_status: u16,
+    /// Test support: async jobs stay `generating` this long (see
+    /// `--job-pending-secs`); 0 means they complete immediately.
+    job_pending_secs: u64,
+    /// Test support: set once the first sdcpp job is created, and the reference
+    /// point of `--job-pending-secs`, `--stop-serving-after` and `--exit-after`
+    /// (so a failure always lands in the middle of polling, never during
+    /// startup).
+    job_created: tokio::sync::watch::Sender<Option<std::time::Instant>>,
+}
+
+impl StubConfig {
+    /// When the first sdcpp job was created, if any.
+    fn job_created_at(&self) -> Option<std::time::Instant> {
+        *self.job_created.borrow()
+    }
+
+    /// Record that an sdcpp job was just created (first one wins).
+    fn mark_job_created(&self) {
+        if self.job_created_at().is_none() {
+            let _ = self.job_created.send(Some(std::time::Instant::now()));
+        }
+    }
+
+    /// Wait until the first sdcpp job is created.
+    async fn wait_for_job(&self) {
+        if self.job_created_at().is_some() {
+            return;
+        }
+        let mut rx = self.job_created.subscribe();
+        let _ = rx.wait_for(Option::is_some).await;
+    }
+
+    /// Whether an async sdcpp job should still report `generating`.
+    fn job_is_pending(&self) -> bool {
+        self.job_pending_secs > 0
+            && self
+                .job_created_at()
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(self.job_pending_secs))
+    }
 }
 
 #[tokio::main]
@@ -167,8 +230,20 @@ async fn main() {
         chunk_delay: Duration::from_millis(cli.chunk_delay_ms),
         last_auth: std::sync::Arc::new(std::sync::Mutex::new(None)),
         fail_status: cli.fail_status,
+        job_pending_secs: cli.job_pending_secs,
+        job_created: tokio::sync::watch::channel(None).0,
     };
 
+    if cli.exit_after > 0 {
+        let cfg_exit = cfg.clone();
+        tokio::spawn(async move {
+            cfg_exit.wait_for_job().await;
+            tokio::time::sleep(Duration::from_secs(cli.exit_after)).await;
+            std::process::exit(0);
+        });
+    }
+
+    let cfg_shutdown = cfg.clone();
     let app = Router::new()
         .route("/test/last-auth", get(test_last_auth))
         .route("/health", get(health))
@@ -196,7 +271,24 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", cli.port))
         .await
         .expect("bind failed");
-    axum::serve(listener, app).await.unwrap();
+    // `--stop-serving-after` closes the listener but leaves the process
+    // running, which is how a busy-but-alive backend looks from the outside.
+    // The timer starts when the first job is created, so the deafness lands
+    // while a client is polling, not while the server is starting up.
+    let stop_after = cli.stop_serving_after;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            if stop_after == 0 {
+                std::future::pending::<()>().await;
+            }
+            cfg_shutdown.wait_for_job().await;
+            tokio::time::sleep(Duration::from_secs(stop_after)).await;
+        })
+        .await
+        .unwrap();
+    if cli.stop_serving_after > 0 {
+        std::future::pending::<()>().await;
+    }
 }
 
 async fn health() -> &'static str {
@@ -658,8 +750,10 @@ async fn images_edits(
 }
 
 async fn sdcpp_vid_gen(
+    axum::extract::State(cfg): axum::extract::State<StubConfig>,
     Json(_body): Json<serde_json::Value>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    cfg.mark_job_created();
     let id = format!(
         "job_stub_vid_{}",
         SDCPP_JOB_SEQ.fetch_add(1, Ordering::Relaxed)
@@ -679,8 +773,10 @@ async fn sdcpp_vid_gen(
 }
 
 async fn sdcpp_img_gen(
+    axum::extract::State(cfg): axum::extract::State<StubConfig>,
     Json(_body): Json<serde_json::Value>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    cfg.mark_job_created();
     let id = format!(
         "job_stub_img_{}",
         SDCPP_JOB_SEQ.fetch_add(1, Ordering::Relaxed)
@@ -701,6 +797,7 @@ async fn sdcpp_img_gen(
 
 async fn sdcpp_job_status(
     axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::State(cfg): axum::extract::State<StubConfig>,
 ) -> Json<serde_json::Value> {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -711,6 +808,17 @@ async fn sdcpp_job_status(
     } else {
         "img_gen"
     };
+    if cfg.job_is_pending() {
+        return Json(serde_json::json!({
+            "id": id,
+            "kind": kind,
+            "status": "generating",
+            "created": now - 10,
+            "started": now - 8,
+            "queue_position": 0,
+            "error": null
+        }));
+    }
     Json(serde_json::json!({
         "id": id,
         "kind": kind,

@@ -47,7 +47,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{AliasPolicy, MakeRoomMode};
 use crate::debug_log::{DebugLogEntry, DebugStreamContext, ts_now};
-use crate::instance::SlotGuard;
+use crate::instance::{Liveness, SlotGuard};
 use crate::scheduler::{AcquireError, Admission, InstanceManager, PendingAssignment};
 use crate::server::{ApiError, ApiKey, AppState, err_msg};
 use crate::types::*;
@@ -2416,7 +2416,16 @@ async fn send_diffusion_request(
             "diffusion backend returned non-success"
         ),
         Err(e) => {
-            warn!(url = %backend_url, inst = %target.instance_id, error = %e, "diffusion backend request failed");
+            // Include whether the backend process is still there: "the port
+            // stopped answering" and "the process exited" produce the same
+            // reqwest error, and the remedies are completely different.
+            warn!(
+                url = %backend_url,
+                inst = %target.instance_id,
+                backend_process = %target.guard.handle().liveness(),
+                error = %e,
+                "diffusion backend request failed"
+            );
             if let Some(ref log_path) = target.debug_log_path {
                 state.debug_loggers.write_line(
                     log_path,
@@ -2789,6 +2798,7 @@ pub async fn video_generations(
     let poll_base = format!("{}/sdcpp/v1/jobs/{}", target.base, job_id);
     let deadline = tokio::time::Instant::now() + target.total_timeout;
     let mut delay = std::time::Duration::from_millis(500);
+    let mut poll_transport_failures: u32 = 0;
 
     loop {
         if tokio::time::Instant::now() >= deadline {
@@ -2800,13 +2810,63 @@ pub async fn video_generations(
         tokio::time::sleep(delay).await;
         delay = std::cmp::min(delay * 2, std::time::Duration::from_secs(5));
 
-        let poll_resp = with_auth(state.client.get(&poll_base), &target.auth)
+        let poll_resp = match with_auth(state.client.get(&poll_base), &target.auth)
             .send()
             .await
-            .map_err(|e| {
-                warn!(url = %poll_base, error = %e, "diffusion job poll failed");
-                ApiError::BackendError(format!("poll failed: {}", e))
-            })?;
+        {
+            Ok(resp) => {
+                if poll_transport_failures > 0 {
+                    info!(
+                        url = %poll_base,
+                        inst = %target.instance_id,
+                        failed_polls = poll_transport_failures,
+                        "job poll is reachable again"
+                    );
+                    poll_transport_failures = 0;
+                }
+                resp
+            }
+            // A transport error means "no answer right now", not "the job
+            // failed": sd-server can stop answering while it generates, and one
+            // reset connection must not throw away minutes of GPU work.  Keep
+            // polling — but stop at once when the process is gone, because the
+            // job died with it and no retry can succeed.
+            Err(e) => {
+                poll_transport_failures += 1;
+                if let Liveness::Gone(reason) = target.guard.handle().liveness() {
+                    warn!(
+                        url = %poll_base,
+                        inst = %target.instance_id,
+                        job = %job_id,
+                        backend_process = %reason,
+                        error = %e,
+                        "video job poll failed and the backend process is gone"
+                    );
+                    return Err(ApiError::BackendError(format!(
+                        "poll failed: {}; the backend {reason}, so job {job_id} can no longer complete",
+                        e
+                    )));
+                }
+                if poll_transport_failures == 1 {
+                    warn!(
+                        url = %poll_base,
+                        inst = %target.instance_id,
+                        job = %job_id,
+                        error = %e,
+                        "diffusion job poll failed; backend process is alive, continuing to poll"
+                    );
+                } else {
+                    debug!(
+                        url = %poll_base,
+                        job = %job_id,
+                        failed_polls = poll_transport_failures,
+                        error = %e,
+                        "diffusion job poll still unreachable"
+                    );
+                }
+                continue;
+            }
+        };
         let poll_status = poll_resp.status();
         let poll_body: serde_json::Value = poll_resp.json().await.map_err(|e| {
             warn!(url = %poll_base, error = %e, "failed to parse poll response");

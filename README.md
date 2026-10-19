@@ -315,6 +315,14 @@ WARN llm_orch::handlers: diffusion backend returned non-success url=http://127.0
 Run with `RUST_LOG=info` (the default) to see them; 4xx rejections are logged
 at `debug`.
 
+Video generation is asynchronous inside the backend: llm-orch submits the job,
+then polls it. A poll that cannot reach the backend is retried for as long as
+the backend process is alive — a busy sd-server can stop answering HTTP while
+it generates, and one unreachable poll must not throw away minutes of GPU work.
+Polling stops early only when the process itself is gone (502: the job died with
+it); otherwise the request is answered when `backend_total_timeout_secs`
+expires (504).
+
 ### ROCm (AMD) devices
 ROCm models use a separate llama.cpp backend namespace from Vulkan. This is
 important when `llama-server` was built with both backends: an AMD GPU may be
