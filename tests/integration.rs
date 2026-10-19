@@ -2108,10 +2108,81 @@ async fn sd_endpoints_require_auth() {
             .send()
             .await
             .unwrap();
-        assert!(
-            resp.status() == 401 || resp.status() == 403,
-            "endpoint {path} without auth should be denied, got {}",
-            resp.status()
+        // llm-orch only ever denies with 401 (see ApiError::Unauthorized);
+        // accepting anything else would hide a route that never reaches auth.
+        assert_eq!(
+            resp.status(),
+            401,
+            "endpoint {path} without auth should be denied"
+        );
+    }
+}
+
+/// The native sd-server passthrough catch-alls are default-deny too.  This
+/// covers the two routes that the OpenAI-compatible tests above do not:
+/// the POST catch-alls (`passthrough_sdcpp`/`passthrough_sdapi`) and,
+/// importantly, the GET catch-all (`passthrough_sdcpp_get`) that carries the
+/// async job polling (`GET /sdcpp/v1/jobs/{id}`) and job cancellation.
+#[tokio::test]
+async fn sd_native_passthrough_routes_require_auth() {
+    let dir = temp_dir("sd-native-auth");
+    let srv = boot(&dir, "tester: secret-key\n", &sd_models_yaml(60)).await;
+    let client = reqwest::Client::new();
+
+    // Note there is no GET route under /sdapi/v1, so only /sdcpp has both.
+    let routes = [
+        ("POST", "/sdcpp/v1/vid_gen"),
+        ("POST", "/sdcpp/v1/jobs/job_probe/cancel"),
+        ("POST", "/sdapi/v1/txt2img"),
+        ("GET", "/sdcpp/v1/jobs/job_probe"),
+        ("GET", "/sdcpp/v1/capabilities"),
+    ];
+
+    for (method, path) in routes {
+        let url = format!("{}{}", srv.url, path);
+        let make = || {
+            client.request(
+                reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+                &url,
+            )
+        };
+
+        let resp = make().send().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "{method} {path}: missing credentials must be denied"
+        );
+
+        let resp = make()
+            .header("Authorization", "Bearer wrong-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "{method} {path}: wrong key must be denied"
+        );
+
+        let resp = make()
+            .header("Authorization", "secret-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "{method} {path}: key without the Bearer scheme must be denied"
+        );
+
+        // A valid key must clear auth; the model target or the backend then
+        // decides the final status, so any non-401 proves the point.
+        let resp = make().bearer_auth("secret-key").send().await.unwrap();
+        assert_ne!(
+            resp.status(),
+            401,
+            "{method} {path}: valid key must not be denied by auth"
         );
     }
 }
