@@ -586,6 +586,48 @@ models:
   #       --rng cpu
   #       --fps 24
 
+  # --- Example 7b: MOSS-Image-Base (text-to-image) ---------------------------
+  # MOSS-Image is a 5B diffusion transformer that reuses the FLUX.2 VAE and
+  # Qwen3.5-9B as its text encoder, so one instance needs four files (see
+  # docs/moss_image.md in stable-diffusion.cpp):
+  #   transformer   leejet/MOSS-Image-Base-GGUF          Q4_K 3.3 GB … Q8_0 5.7 GB
+  #   text encoder  unsloth/Qwen3.5-9B-GGUF             Q4_K_M ~5.7 GB
+  #   vae           Comfy-Org/MOSS-Image vae/flux2-vae.safetensors
+  #   tokenizer     OpenMOSS-Team/MOSS-Image-Base  tokenizer/tokenizer.json
+  # The `--tokenizer` file is required — Qwen3.5's vocabulary differs from the
+  # Qwen tokenizer embedded in the encoder GGUF.  sd-server must be built from
+  # a 2026-10-16 or newer tree, which is when MOSS support landed.
+  # MOSS house style: cfg 3, 20 steps, 1024x1024, euler, flow shift 5, and
+  # dimensions divisible by 16.  These CLI values are the *defaults* a request
+  # inherits; a request may override any of them.
+  # - name: "moss"
+  #   context_length: 0
+  #   max_instances: 1
+  #   max_concurrent: 1           # sd-server serialises requests internally
+  #   vram: 12000                 # DiT + Qwen3.5 encoder + VAE + working memory
+  #   idle_ttl: 600
+  #   queue_depth: 5
+  #   vulkan_devices: [0]
+  #   cmd: |
+  #     sd-server
+  #       --host 127.0.0.1
+  #       --port {port}
+  #       --diffusion-model /data/llama/stable-diffusion/MOSS-Image/MOSS-Image-Base-Q4_K.gguf
+  #       --llm /data/llama/stable-diffusion/MOSS-Image/Qwen3.5-9B-Q4_K_M.gguf
+  #       --vae /data/llama/stable-diffusion/MOSS-Image/flux2-vae.safetensors
+  #       --tokenizer /data/llama/stable-diffusion/MOSS-Image/tokenizer_qwen3.5.json
+  #       --backend vulkan
+  #       --diffusion-fa
+  #       --cfg-scale 3.0
+  #       --steps 20
+  #       --width 1024
+  #       --height 1024
+  #
+  # Render through /v1/images/generations; scripts/generate-image.sh wraps it
+  # with MOSS-matching defaults and smuggles native sd-server controls
+  # (seed, sampler, negative prompt, lora, …) into the request via the
+  # `<sd_cpp_extra_args>` prompt extension.
+
   # --- Example 8: a remote http(s) endpoint (pure passthrough) -----------
   # A model whose `cmd` is an `http://` / `https://` URL is detected
   # automatically as a *remote* model: llm-orch spawns no process and
