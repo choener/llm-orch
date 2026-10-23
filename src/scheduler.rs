@@ -4,7 +4,7 @@
 // spawning, slot acquisition, queueing, idle eviction, and shutdown.
 
 use crate::backend::{
-    Backend, ContainerBackend, DeviceKind, LlamaCppBackend, ReadyOutcome,
+    Backend, ContainerBackend, DeviceKind, LlamaCppBackend, RadianceBackend, ReadyOutcome,
     StableDiffusionCppBackend, inject_container_args, output_lines, poll_readiness, shutdown_child,
     shutdown_container, spawn_process,
 };
@@ -3689,8 +3689,9 @@ impl InstanceManager {
     }
 
     /// The [`Backend`] implementation a program belongs to, chosen from the
-    /// program basename: `sd-server*` is stable-diffusion.cpp, anything else
-    /// is llama.cpp; a container runner always uses [`ContainerBackend`].
+    /// program basename: `sd-server*` is stable-diffusion.cpp, `radiance*`
+    /// is the radiance engine, anything else is llama.cpp; a container
+    /// runner always uses [`ContainerBackend`].
     ///
     /// Returns `None` when the program is an `http(s)` URL — a remote model's
     /// endpoint says nothing about which server binary answers on the other
@@ -3705,6 +3706,8 @@ impl InstanceManager {
         let basename = prog.rsplit('/').next().unwrap_or(prog);
         if basename.starts_with("sd-server") {
             Some(Box::new(StableDiffusionCppBackend::new(cfg.device_kind())))
+        } else if crate::backend::is_radiance_program(prog) {
+            Some(Box::new(RadianceBackend))
         } else {
             Some(Box::new(LlamaCppBackend::new(cfg.device_kind())))
         }
@@ -5382,6 +5385,25 @@ models:
         let gpu_snapshot = Arc::new(tokio::sync::RwLock::new(Vec::new()));
         let (mgr, _release_rx, _crash_rx) = InstanceManager::new(&config, gpu_snapshot, None);
         mgr
+    }
+
+    #[test]
+    fn backend_for_prog_detects_radiance() {
+        // radiance must not be classified as llama.cpp — llama would get a
+        // `--device ROCm0,ROCm1` append that the radiance CLI rejects.
+        let mgr = test_manager();
+        let cfg: ModelConfig = serde_yaml_ng::from_str(
+            "name: r\ncmd: \"radiance --model m.rad\"\nrocm_devices: [0, 1]\ngpus: 2\n",
+        )
+        .unwrap();
+        let backend = mgr.backend_for_prog("radiance", &cfg).unwrap();
+        // The ROCm llama backend would append `--device ROCm0,ROCm1` here;
+        // radiance pins through HIP_VISIBLE_DEVICES alone.
+        assert!(backend.gpu_args(&[0, 1]).is_empty());
+        assert_eq!(
+            backend.gpu_env(&[0, 1]),
+            vec![("HIP_VISIBLE_DEVICES".to_string(), "0,1".to_string())]
+        );
     }
 
     /// Manager for a model with autoscale enabled under the integral

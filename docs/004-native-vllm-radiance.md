@@ -1,5 +1,11 @@
 # 004 — Native vLLM-radiance on NixOS (no containers)
 
+> **Superseded.** The vLLM-radiance Python stack was replaced upstream by
+> *radiance*, a self-contained C++/HIP engine with no Python and ROCm
+> userspace linked in — now integrated natively; see
+> `008-native-radiance.md`. This document is kept for the (hard-won)
+> NixOS/ROCm packaging findings, which still apply to any HIP build.
+
 Issue #2 follow-through: run the [vllm-radiance](https://github.com/magiccodingman/vllm-radiance)
 stack (vLLM 0.28.0 + libr4d RDNA4 kernels, pinned for gfx1201: RX 9070 XT,
 Radeon AI PRO R9700, Strix Halo) directly on NixOS — no docker/podman, no ROCm

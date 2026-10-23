@@ -628,6 +628,50 @@ models:
   # (seed, sampler, negative prompt, lora, …) into the request via the
   # `<sd_cpp_extra_args>` prompt extension.
 
+  # --- Example 7c: native radiance engine (AMD HIP) ------------------------
+  # radiance (https://codeberg.org/StillDeadcode/radiance) is a native AMD
+  # inference engine serving `.rad` model containers (OpenAI-compatible
+  # API, llama-server native, Anthropic Messages).  Backend selection is
+  # automatic: llm-orch detects the `radiance` command basename and uses
+  # `RadianceBackend` — see docs/008-native-radiance.md.
+  #
+  # Unlike llama.cpp, radiance has no `--device` selector: llm-orch pins
+  # the instance purely through HIP_VISIBLE_DEVICES, and radiance
+  # tensor-splits across every visible card with its own `--tp N` flag.
+  # `gpus:` must therefore match the declared `--tp` (llm-orch never
+  # invents `--tp` — it interacts with --tp-wire / --p2p and stays
+  # operator-declared).  Only rocm_devices is a valid pool; a
+  # vulkan_devices/cuda_devices pool is a config error.
+  #
+  # Loading a `.rad` reads the whole container into VRAM/pinned RAM — the
+  # 120 s default readiness budget is tight on a cold page cache, so raise
+  # `spawn_timeout_secs`.  The engine claims its cards eagerly
+  # (--gpu-headroom-mib aside), so declare a per-card `vram` and keep the
+  # cards to itself (`max_instances: 1` for a full-pool TP deployment).
+  #
+  # Serve on 127.0.0.1 without `--api-key`: llm-orch's own key is the
+  # public-side auth.
+  # - name: "qwen3.8-27b"
+  #   context_length: 262144
+  #   max_instances: 1
+  #   max_concurrent: 8
+  #   vram: 16000               # per card (~15 GiB FP8 weights + KV pool)
+  #   idle_ttl: 900
+  #   queue_depth: 16
+  #   gpus: 2                   # must match --tp below
+  #   rocm_devices: [0, 1]
+  #   spawn_timeout_secs: 600
+  #   cmd: |
+  #     radiance
+  #       --model /data/models/qwen3.8-27b-fp8.rad
+  #       --tp 2 --tp-wire wht6
+  #       --max-model-len {context_length}
+  #       --max-num-seqs {max_concurrent}
+  #       --kv-cache-dtype fp8
+  #       --num-speculative-tokens 7
+  #       --gpu-headroom-mib 96
+  #       --host 127.0.0.1 --port {port}
+
   # --- Example 8: a remote http(s) endpoint (pure passthrough) -----------
   # A model whose `cmd` is an `http://` / `https://` URL is detected
   # automatically as a *remote* model: llm-orch spawns no process and

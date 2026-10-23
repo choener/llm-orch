@@ -375,6 +375,52 @@ impl Backend for StableDiffusionCppBackend {
     }
 }
 
+// ── radiance backend ───────────────────────────────────────────────────────
+
+/// True when a program path/name refers to the radiance engine (basename
+/// starting with `radiance`; the aux tools — `rad-info`, `rad-convert`, … —
+/// carry other names).  Shared by backend resolution and config validation
+/// so both classify a program identically.
+pub fn is_radiance_program(program: &str) -> bool {
+    let basename = program.rsplit('/').next().unwrap_or(program);
+    basename.starts_with("radiance")
+}
+
+/// Backend for [radiance](https://codeberg.org/StillDeadcode/radiance), the
+/// native AMD (HIP) inference engine.
+///
+/// radiance has *no* device-selector CLI flag — devices are pinned purely
+/// through the standard ROCm visibility env var `HIP_VISIBLE_DEVICES`
+/// (which, like the other visibility vars, renumbers the visible cards
+/// from 0 in list order), so [`Backend::gpu_args`] returns an empty vector.
+/// The engine tensor-splits across *all* visible cards under its own
+/// `--tp N` flag; that count interacts with `--tp-wire`/`--p2p` and stays
+/// operator-declared in `cmd` — llm-orch never invents it, so `gpus:` must
+/// match the declared `--tp`.
+///
+/// Readiness is the default `GET /health`: radiance keeps `/health`,
+/// `/v1/health` and `/ping` unauthenticated even when `--api-key` is set.
+pub struct RadianceBackend;
+
+impl Backend for RadianceBackend {
+    fn gpu_args(&self, _indices: &[usize]) -> Vec<String> {
+        // radiance has no --device-style selector — see struct docs.
+        Vec::new()
+    }
+
+    fn gpu_env(&self, indices: &[usize]) -> Vec<(String, String)> {
+        if indices.is_empty() {
+            return Vec::new();
+        }
+        let list = indices
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        vec![("HIP_VISIBLE_DEVICES".to_string(), list)]
+    }
+}
+
 // ── Container backend (podman) ─────────────────────────────────────────────
 
 /// Backend for models running inside a container.
@@ -775,6 +821,33 @@ mod tests {
             assert!(backend.gpu_args(&[]).is_empty());
             assert!(backend.gpu_env(&[]).is_empty());
         }
+    }
+
+    #[test]
+    fn radiance_backend_pins_hip_via_env_only() {
+        // radiance has no --device-style selector; the whole device pin
+        // is HIP_VISIBLE_DEVICES with the host indices in list order.
+        let backend = RadianceBackend;
+        assert!(backend.gpu_args(&[0, 1]).is_empty());
+        assert_eq!(
+            backend.gpu_env(&[0, 1]),
+            vec![("HIP_VISIBLE_DEVICES".to_string(), "0,1".to_string())]
+        );
+        assert!(backend.gpu_env(&[]).is_empty());
+        assert_eq!(backend.health_path(), "/health");
+    }
+
+    #[test]
+    fn is_radiance_program_matches_the_basename() {
+        assert!(is_radiance_program("radiance"));
+        assert!(is_radiance_program(
+            "/nix/store/xyz-radiance-1.10.0/bin/radiance"
+        ));
+        // The aux tools carry different names; other engines are not radiance.
+        assert!(!is_radiance_program("rad-info"));
+        assert!(!is_radiance_program("rad-convert"));
+        assert!(!is_radiance_program("llama-server"));
+        assert!(!is_radiance_program("sd-server"));
     }
 
     fn s(values: &[&str]) -> Vec<String> {

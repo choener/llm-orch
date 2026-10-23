@@ -238,6 +238,18 @@ impl Config {
                     m.name
                 )));
             }
+            // radiance is a HIP-only engine: it understands no other
+            // device namespace, so a Vulkan/CUDA pool would pin nothing
+            // (RadianceBackend only ever injects HIP_VISIBLE_DEVICES).
+            // Its CPU fallback (libavx kernels, empty pool) stays valid.
+            if cmd_is_radiance(&self.cmd_aliases, m)
+                && (!m.vulkan_devices.is_empty() || !m.cuda_devices.is_empty())
+            {
+                return Err(ConfigError::Validation(format!(
+                    "model '{}': radiance is a HIP-only engine — use rocm_devices (vulkan_devices/cuda_devices are not understood by it)",
+                    m.name
+                )));
+            }
             let (pool, ns) = if !m.cuda_devices.is_empty() {
                 (&m.cuda_devices, "cuda_devices")
             } else if !m.rocm_devices.is_empty() {
@@ -1298,6 +1310,25 @@ fn cmd_device_flag_decl(cmd_aliases: &HashMap<String, String>, m: &ModelConfig) 
         );
     }
     None
+}
+
+/// True when the model's resolved command runs the radiance engine
+/// (`radiance` program basename; runner Process only — a container model
+/// naming a radiance image is not the native binary and is not checked).
+/// Shared basis for the HIP-only pool restriction in validation; backend
+/// resolution uses the same predicate via `backend::is_radiance_program`.
+fn cmd_is_radiance(cmd_aliases: &HashMap<String, String>, m: &ModelConfig) -> bool {
+    if m.runner(cmd_aliases) == Runner::Container {
+        return false;
+    }
+    let resolved = resolve_model_cmd(cmd_aliases, m, 0);
+    let parts = match shlex::split(&resolved) {
+        Some(p) => p,
+        None => return false,
+    };
+    parts
+        .first()
+        .is_some_and(|p| crate::backend::is_radiance_program(p))
 }
 
 /// Detect a GPU-offload request in a CPU-only model's resolved command
@@ -2431,6 +2462,54 @@ models:
             "cmd: \"sleep 3600\"\n    vulkan_devices: [0]\n    rocm_devices: [0]",
         );
         expect_validation_error(&yaml, "mutually exclusive");
+    }
+
+    #[test]
+    fn rejects_radiance_with_vulkan_pool() {
+        // radiance only understands HIP_VISIBLE_DEVICES; a Vulkan pool
+        // would pin nothing, so it is a config error.
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"radiance --model m.rad\"\n    vulkan_devices: [0]",
+        );
+        expect_validation_error(&yaml, "radiance is a HIP-only engine");
+    }
+
+    #[test]
+    fn rejects_radiance_with_cuda_pool() {
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"radiance --model m.rad\"\n    cuda_devices: [0]",
+        );
+        expect_validation_error(&yaml, "radiance is a HIP-only engine");
+    }
+
+    #[test]
+    fn accepts_radiance_cpu_only() {
+        // Empty pool stays valid: radiance falls back to its AVX host kernels.
+        let yaml = BASE.replace("cmd: \"sleep 3600\"", "cmd: \"radiance --model m.rad\"");
+        parse(&yaml).expect("CPU-only radiance must validate");
+    }
+
+    #[test]
+    fn accepts_radiance_with_rocm_pool() {
+        let slots = real_amd_slots();
+        if slots.is_empty() {
+            return;
+        }
+        let yaml = BASE
+            .replace(
+                "apikeys_file: apikeys.txt",
+                &format!(
+                    "apikeys_file: apikeys.txt\ndevices:\n  rocm:\n    0: \"{}\"",
+                    slots[0]
+                ),
+            )
+            .replace(
+                "cmd: \"sleep 3600\"",
+                "cmd: \"radiance --model m.rad\"\n    rocm_devices: [0]",
+            );
+        parse(&yaml).expect("radiance with a rocm pool must validate");
     }
 
     #[test]
