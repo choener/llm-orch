@@ -249,6 +249,7 @@ async fn main() {
         .route("/health", get(health))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(embeddings))
+        .route("/v1/systemone", post(systemone))
         .route("/v1/responses", post(responses))
         .route("/v1/responses/input_tokens", post(responses_input_tokens))
         .route("/v1/audio/speech", post(audio_speech))
@@ -685,6 +686,142 @@ async fn embeddings(Json(body): Json<serde_json::Value>) -> impl IntoResponse {
         "model": model,
         "usage": {"prompt_tokens": 3, "total_tokens": 3}
     }))
+}
+
+/// `POST /v1/systemone` — stub of the TypeSafe-compatible decision endpoint.
+///
+/// Mirrors the response shape llama.cpp / halogen use: `answers` keyed by
+/// question id, `usage.input_tokens` (no generation).  Answers are canned:
+/// the first option wins, the last level scores highest, `noul` is 0.75.
+/// Like the real endpoint the request shape is validated — a missing or
+/// empty `questions` object answers 400, an unsupported question type
+/// answers 501 — so status passthrough is testable.
+async fn systemone(Json(body): Json<serde_json::Value>) -> impl IntoResponse {
+    let model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("stub")
+        .to_string();
+
+    let questions = match body.get("questions").and_then(|v| v.as_object()) {
+        Some(q) if !q.is_empty() => q.clone(),
+        _ => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {"message": "questions must be a non-empty object"}
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut answers = serde_json::Map::new();
+    for (id, question) in &questions {
+        let kind = question.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let criteria = question.get("criteria");
+        let answer = match kind {
+            "noul" => serde_json::json!({"type": "noul", "noul": 0.75}),
+            "score" => {
+                let levels: Vec<String> = criteria
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .map(|l| l.as_str().unwrap_or_default().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if levels.is_empty() {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": {"message": format!("question '{id}': score needs levels")}
+                        })),
+                    )
+                        .into_response();
+                }
+                let n = levels.len();
+                let probabilities: serde_json::Map<String, serde_json::Value> = (0..n)
+                    .map(|i| {
+                        let p = if i == n - 1 {
+                            0.7
+                        } else {
+                            0.3 / (n - 1) as f64
+                        };
+                        (i.to_string(), serde_json::json!(p))
+                    })
+                    .collect();
+                let legend: serde_json::Map<String, serde_json::Value> = levels
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| (i.to_string(), serde_json::json!(l)))
+                    .collect();
+                serde_json::json!({
+                    "type": "score",
+                    "score": (n - 1) as f64,
+                    "legend": legend,
+                    "probabilities": probabilities,
+                    "confidence": 0.6,
+                })
+            }
+            "choice" => {
+                let options: Vec<String> = criteria
+                    .and_then(|v| v.as_object())
+                    .map(|o| o.keys().cloned().collect())
+                    .unwrap_or_default();
+                let Some(first) = options.first() else {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": {"message": format!("question '{id}': choice needs options")}
+                        })),
+                    )
+                        .into_response();
+                };
+                let probabilities: serde_json::Map<String, serde_json::Value> = options
+                    .iter()
+                    .map(|o| {
+                        let p = if o == first {
+                            0.7
+                        } else {
+                            0.3 / (options.len() - 1).max(1) as f64
+                        };
+                        (o.clone(), serde_json::json!(p))
+                    })
+                    .collect();
+                serde_json::json!({
+                    "type": "choice",
+                    "choice": first,
+                    "probabilities": probabilities,
+                    "confidence": 0.6,
+                })
+            }
+            other => {
+                return (
+                    axum::http::StatusCode::NOT_IMPLEMENTED,
+                    Json(serde_json::json!({
+                        "error": {"message": format!("question '{id}': unsupported type '{other}'")}
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        answers.insert(id.clone(), answer);
+    }
+
+    // A stand-in for the prompt cost, so token accounting is observable.
+    let state_words = body
+        .get("state")
+        .and_then(|v| v.as_str())
+        .map(|s| s.split_whitespace().count() as u64)
+        .unwrap_or(1);
+
+    Json(serde_json::json!({
+        "model": model,
+        "answers": answers,
+        "usage": {"input_tokens": state_words, "output_tokens": 0},
+    }))
+    .into_response()
 }
 
 // ── sd.cpp stub endpoints ────────────────────────────────────────────────────

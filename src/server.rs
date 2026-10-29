@@ -71,6 +71,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/completions", post(handlers::completions))
         .route("/v1/embeddings", post(handlers::embeddings))
         .route("/v1/rerank", post(handlers::rerank))
+        // TypeSafe-compatible decision-model endpoint (llama.cpp `decisions`
+        // models, halogen `decider`/`d3`).  Auth-gated like every /v1 route.
+        .route("/v1/systemone", post(handlers::systemone))
         // OpenAI-compatible audio endpoints (audio.cpp backends).
         .route("/v1/audio/speech", post(handlers::audio_speech))
         .route(

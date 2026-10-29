@@ -620,6 +620,120 @@ async fn embeddings_end_to_end() {
     );
 }
 
+// ── /v1/systemone (decision models) ─────────────────────────────────────────
+
+/// A decision request: one `state`, one question per supported type.
+fn systemone_body(model: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "state": "Customer: I was charged twice and nobody answers my emails.",
+        "questions": {
+            "team": {
+                "type": "choice",
+                "instructions": "Which team should handle this",
+                "criteria": {"billing": "Payment issues", "technical": "Bugs"}
+            },
+            "anger": {
+                "type": "score",
+                "instructions": "How frustrated does the customer appear",
+                "criteria": ["calm", "concerned", "furious"]
+            },
+            "refund": {"type": "noul", "instructions": "Does the customer request a refund?"}
+        }
+    })
+}
+
+#[tokio::test]
+async fn systemone_end_to_end() {
+    let dir = temp_dir("systemone");
+    let srv = boot(&dir, "tester: secret-key\n", &models_yaml("", 60)).await;
+    let client = reqwest::Client::new();
+
+    let resp = authed(&client, &format!("{}/v1/systemone", srv.url))
+        .json(&systemone_body("m"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    // The body is passthrough: every question is answered and the resolved
+    // model name comes back.
+    assert_eq!(body.get("model").and_then(|v| v.as_str()), Some("m"));
+    let answers = body.get("answers").and_then(|v| v.as_object()).unwrap();
+    assert_eq!(answers.len(), 3);
+    assert_eq!(
+        answers["team"].get("choice").and_then(|v| v.as_str()),
+        Some("billing")
+    );
+    assert_eq!(
+        answers["team"]["probabilities"]
+            .get("billing")
+            .and_then(|v| v.as_f64()),
+        Some(0.7)
+    );
+    assert_eq!(
+        answers["anger"]["legend"].get("2").and_then(|v| v.as_str()),
+        Some("furious")
+    );
+    assert!(
+        answers["refund"]["noul"]
+            .as_f64()
+            .is_some_and(|p| p > 0.0 && p < 1.0)
+    );
+    // The decision answered without generating anything.
+    assert_eq!(
+        body.pointer("/usage/output_tokens")
+            .and_then(|v| v.as_u64()),
+        Some(0)
+    );
+    assert!(body.pointer("/usage/input_tokens").is_some());
+}
+
+#[tokio::test]
+async fn systemone_requires_auth_and_spawns_nothing() {
+    let dir = temp_dir("systemone-auth");
+    let srv = boot(&dir, "tester: secret-key\n", &models_yaml("", 60)).await;
+    let client = reqwest::Client::new();
+
+    // No key, and a wrong key: rejected before any backend is spawned — the
+    // key check is the only gate in front of a decision model (neither
+    // llama.cpp nor halogen requires one).
+    for req in [
+        client
+            .post(format!("{}/v1/systemone", srv.url))
+            .json(&systemone_body("m")),
+        client
+            .post(format!("{}/v1/systemone", srv.url))
+            .bearer_auth("wrong-key")
+            .json(&systemone_body("m")),
+    ] {
+        let resp = req.send().await.unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+    assert_eq!(
+        srv.manager.instance_counts().get("m").copied().unwrap_or(0),
+        0,
+        "an unauthenticated decision request must not spawn an instance"
+    );
+}
+
+#[tokio::test]
+async fn systemone_needs_a_model_field() {
+    let dir = temp_dir("systemone-model");
+    let srv = boot(&dir, "tester: secret-key\n", &models_yaml("", 60)).await;
+    let client = reqwest::Client::new();
+
+    let mut body = systemone_body("m");
+    body.as_object_mut().unwrap().remove("model");
+    let resp = authed(&client, &format!("{}/v1/systemone", srv.url))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
 // ── Hot-reload ───────────────────────────────────────────────────────────────
 
 #[tokio::test]

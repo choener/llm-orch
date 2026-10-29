@@ -1663,6 +1663,198 @@ pub async fn rerank(
     .await
 }
 
+// ── /v1/systemone ───────────────────────────────────────────────────────────
+
+/// `POST /v1/systemone` — TypeSafe-compatible System One decision endpoint.
+///
+/// Decision models (llama.cpp's `decisions` models, halogen's `decider`/`d3`
+/// models) answer typed questions about a `state` in one forward pass and
+/// return a probability per option: no sampling, no generation.  Same alias
+/// resolution and instance lifecycle as the other endpoints; always
+/// non-streaming (streaming is not part of the upstream contract).
+///
+/// The body is opaque passthrough: only the top-level `model` field is read
+/// (and rewritten to the resolved name), `state` / `questions` /
+/// `files`/`images` are forwarded untouched, so the backend stays the
+/// authority on question validation — it answers 400 on a malformed request
+/// and 501 when the loaded model is not a decision model.
+///
+/// Auth note: neither llama.cpp nor halogen requires a key of its own for
+/// this endpoint, so llm-orch's API-key gate is the only thing in front of a
+/// decision model here — the key label is recorded with the request.
+pub async fn systemone(
+    State(state): State<AppState>,
+    key: ApiKey,
+    Json(mut request): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    // `model` is the only field llm-orch interprets.
+    let request_model = request
+        .get("model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("missing or empty \"model\" field".into()))?
+        .to_owned();
+    let span = tracing::info_span!(
+        "systemone",
+        id = %request_id,
+        model = %request_model,
+    );
+    async {
+        // ── 1. Resolve alias → candidates; read the backend timeout. ────────
+        let total_timeout = {
+            let cfg = state.config.read().await;
+            std::time::Duration::from_secs(cfg.server.backend_total_timeout_secs)
+        };
+        let (candidates, policy, make_room, drain_timeout) =
+            resolve_candidates(&state, &request_model).await?;
+
+        // ── 2. Acquire an instance slot on one of the candidates (or queue).
+        let (model_name, guard) = state
+            .manager
+            .acquire_for_candidates(&candidates, policy, make_room, drain_timeout)
+            .await
+            .map_err(|e| acquire_error(&request_model, e))?;
+
+        // ── 3. Per-model debug log for the *chosen* model. ──────────────────
+        let debug_log_path: Option<std::path::PathBuf> = {
+            let cfg = state.config.read().await;
+            cfg.models
+                .iter()
+                .find(|m| m.name == model_name)
+                .and_then(|m| m.debug_log.clone())
+        };
+
+        // Forward the *resolved* model name to the backend, not the alias.
+        // (Peer forwarding rewrites it once more to the leaf-side name, and
+        // restores the master-side name in the response, as elsewhere.)
+        request["model"] = serde_json::Value::String(model_name.clone());
+
+        let instance_id = {
+            let inst = guard.handle().inner().lock().unwrap();
+            inst.id.clone()
+        };
+
+        // ── 4. Read backend base + auth. ────────────────────────────────────
+        let base = guard.handle().backend_base();
+        let auth = state.manager.resolve_auth(guard.handle());
+
+        let backend_url = format!("{base}/v1/systemone");
+
+        // Debug log: request (exact body being forwarded).
+        if let Some(ref log_path) = debug_log_path {
+            state.debug_loggers.write_line(
+                log_path,
+                &DebugLogEntry {
+                    ts: ts_now(),
+                    request_id: request_id.clone(),
+                    model: model_name.clone(),
+                    alias: Some(request_model.clone()),
+                    instance_id: Some(instance_id.clone()),
+                    dir: "request".into(),
+                    stream: Some(false),
+                    body: Some(request.clone()),
+                    usage: None,
+                    duration_ms: None,
+                    error: None,
+                },
+            );
+        }
+
+        // ── 5. Forward request, aggregate, release. ─────────────────────────
+        let t0 = std::time::Instant::now();
+        let response_body = forward_request_aggregate(
+            &state.client,
+            &backend_url,
+            &request,
+            &auth,
+            total_timeout,
+            peer_forward(&state, &model_name, &request_id),
+        )
+        .await
+        .map_err(|e| {
+            warn!("systemone backend request failed: {}", e);
+            e
+        })?;
+        let elapsed = t0.elapsed();
+
+        // Debug log: response.
+        if let Some(ref log_path) = debug_log_path {
+            let usage = response_body.pointer("/usage").cloned();
+            state.debug_loggers.write_line(
+                log_path,
+                &DebugLogEntry {
+                    ts: ts_now(),
+                    request_id: request_id.clone(),
+                    model: model_name.clone(),
+                    alias: Some(request_model.clone()),
+                    instance_id: Some(instance_id.clone()),
+                    dir: "response".into(),
+                    stream: Some(false),
+                    body: Some(response_body.clone()),
+                    usage,
+                    duration_ms: Some(elapsed.as_millis() as u64),
+                    error: None,
+                },
+            );
+        }
+
+        // Statistics (opt-in): a decision answers without generation, and
+        // reports its token use as `usage.input_tokens`.
+        record_stats(
+            &state,
+            &model_name,
+            response_body
+                .pointer("/usage/input_tokens")
+                .and_then(|v| v.as_u64()),
+            None,
+            None,
+            elapsed.as_millis() as u64,
+            None,
+        );
+
+        // Record in per-model ring buffer for /admin/status.
+        {
+            let input_tokens = response_body
+                .pointer("/usage/input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            state.manager.record_completion(
+                &model_name,
+                crate::types::CompletionRecord {
+                    ts: ts_now(),
+                    request_id: request_id.clone(),
+                    instance_id: instance_id.clone(),
+                    api_user: key.label.clone(),
+                    prompt_tokens: input_tokens,
+                    generated_tokens: 0,
+                    cached_tokens: 0,
+                    duration_ms: elapsed.as_millis() as u64,
+                },
+            );
+        }
+
+        let n_answers = response_body
+            .pointer("/answers")
+            .and_then(|v| v.as_object())
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        info!(
+            "id={} model={} inst={} answers={} server_ms={}",
+            request_id,
+            model_name,
+            instance_id,
+            n_answers,
+            elapsed.as_millis()
+        );
+
+        Ok(Json(response_body))
+    }
+    .instrument(span)
+    .await
+}
+
 // ── /v1/audio/* ──────────────────────────────────────────────────────────────
 //
 // OpenAI-compatible audio endpoints (audio.cpp / `audiocpp_server`).
