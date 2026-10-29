@@ -60,6 +60,21 @@ use tracing::Instrument;
 /// # Send safety
 /// The `config` read guard is dropped before we build the response — no
 /// `.await` while the guard is alive.
+/// `/v1/models` capability advertisement for one model, mirroring
+/// llama.cpp's `architecture` object.
+///
+/// A model declared `capabilities: [decisions]` is advertised as a native
+/// decision model, so a client can find the System One lane *before*
+/// anything is loaded — llm-orch synthesizes `/v1/models` from config, and
+/// config is the only truth about an unloaded model.
+fn architecture_for(m: &crate::config::ModelConfig) -> crate::types::Architecture {
+    if m.is_decision_model() {
+        crate::types::Architecture::text_and_decisions()
+    } else {
+        crate::types::Architecture::text()
+    }
+}
+
 pub async fn list_models(
     State(state): State<AppState>,
     _key: ApiKey,
@@ -95,6 +110,7 @@ pub async fn list_models(
                 created: now,
                 owned_by: "llm-orch".into(),
                 context_length: Some(m.context_length),
+                architecture: architecture_for(m),
             })
             .collect();
 
@@ -113,6 +129,7 @@ pub async fn list_models(
                     created: now,
                     owned_by: "llm-orch".into(),
                     context_length: Some(m.context_length),
+                    architecture: architecture_for(m),
                 })
                 .collect();
             data.extend(qualified);
@@ -120,17 +137,20 @@ pub async fn list_models(
 
         // Aliases also appear as models.
         for a in &aliases {
-            let ctx = a
+            let target = a
                 .targets
                 .first()
-                .and_then(|t| models.iter().find(|m| &m.name == t))
-                .map(|m| m.context_length);
+                .and_then(|t| models.iter().find(|m| &m.name == t));
+            let ctx = target.map(|m| m.context_length);
             data.push(ModelEntry {
                 id: a.name.clone(),
                 object: "model".into(),
                 created: now,
                 owned_by: "llm-orch".into(),
                 context_length: ctx,
+                // An alias can only reach its first target's kind of model,
+                // so clients see the same capabilities through either name.
+                architecture: target.map(architecture_for).unwrap_or_default(),
             });
         }
 

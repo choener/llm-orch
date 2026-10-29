@@ -798,6 +798,57 @@ async fn systemone_needs_a_model_field() {
     assert_eq!(resp.status(), 400);
 }
 
+/// The decision lane must be discoverable *before* anything is loaded —
+/// that is the whole point of declaring the capability in config.
+#[tokio::test]
+async fn v1_models_advertises_decisions_while_unloaded() {
+    let dir = temp_dir("systemone-models");
+    let yaml = format!(
+        "models:\n  - name: kev\n    context_length: 4096\n    capabilities: [decisions]\n    cmd: \"{STUB_BIN} --port {{port}}\"\n    idle_ttl: 60\n    max_instances: 1\n  - name: plain\n    context_length: 4096\n    cmd: \"{STUB_BIN} --port {{port}}\"\n    idle_ttl: 60\n    max_instances: 1\naliases:\n  - name: triage\n    target: kev\n"
+    );
+    let srv = boot(&dir, "tester: secret-key\n", &yaml).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{}/v1/models", srv.url))
+        .bearer_auth("secret-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    let out_mods = |id: &str| {
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == serde_json::json!(id))
+            .unwrap_or_else(|| panic!("{id} missing from /v1/models"))
+            .pointer("/architecture/output_modalities")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let has_decisions = |id: &str| {
+        out_mods(id)
+            .iter()
+            .any(|m| m == &serde_json::json!("decisions"))
+    };
+
+    assert!(has_decisions("kev"), "declared decision model");
+    assert!(
+        has_decisions("triage"),
+        "the alias to it carries the same capability"
+    );
+    assert!(
+        !has_decisions("plain"),
+        "a text model must not advertise decisions"
+    );
+    // Discovery happened without spawning anything.
+    assert!(srv.manager.instance_counts().is_empty());
+}
+
 // ── Hot-reload ───────────────────────────────────────────────────────────────
 
 #[tokio::test]

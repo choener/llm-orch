@@ -102,6 +102,16 @@ impl Config {
         // --- models ---
         let mut seen_names = HashSet::new();
         for m in &self.models {
+            // Capability typos are silent failures (a client never finds the
+            // decision lane), so they are hard errors here.
+            for cap in &m.capabilities {
+                if cap != "decisions" {
+                    return Err(ConfigError::Validation(format!(
+                        "model '{}': unknown capability '{}' (known: decisions)",
+                        m.name, cap
+                    )));
+                }
+            }
             if m.name.is_empty() {
                 return Err(ConfigError::Validation(
                     "model name must not be empty".into(),
@@ -1088,6 +1098,20 @@ pub struct ModelConfig {
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
 
+    /// Capabilities advertised to clients in `/v1/models`, mirroring
+    /// llama.cpp's per-model `architecture` object.  The only value
+    /// llm-orch defines today is `decisions`: a native decision model
+    /// (System One / Jev style, llama.cpp's `decisions` models or a
+    /// halogen `decider`/`d3`) that answers `POST /v1/systemone` instead
+    /// of generating text.
+    ///
+    /// It is declared here rather than read off a running backend because
+    /// the marker has to be visible while the model is *not* loaded — that
+    /// is precisely when a client picks a lane — and because llm-orch
+    /// synthesizes `/v1/models` from config.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+
     /// Eviction priority — higher values are kept longer.
     /// Reserved for the deferred eviction policy (plan §Eviction);
     /// accepted in config today for forward compatibility.
@@ -1207,6 +1231,13 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
+    /// Whether this model was declared a native decision model
+    /// (`capabilities: [decisions]`) — the model that answers
+    /// `POST /v1/systemone`.
+    pub fn is_decision_model(&self) -> bool {
+        self.capabilities.iter().any(|c| c == "decisions")
+    }
+
     /// Whether any GPU device pool is configured (Vulkan, CUDA, or ROCm).
     pub fn has_device_pool(&self) -> bool {
         !self.vulkan_devices.is_empty()
@@ -2255,6 +2286,29 @@ models:
     }
 
     #[test]
+    fn accepts_decisions_capability() {
+        // A decision (System One) model: the capability must survive parsing
+        // so `/v1/models` can advertise it before anything is loaded.
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\n    capabilities: [decisions]",
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert!(cfg.models[0].is_decision_model());
+    }
+
+    #[test]
+    fn rejects_unknown_capability() {
+        // Typos in `capabilities` are otherwise silent: the client just never
+        // finds the decision lane.
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\n    capabilities: [decision]",
+        );
+        expect_validation_error(&yaml, "unknown capability 'decision'");
+    }
+
+    #[test]
     fn accepts_llama_model_with_draft_ngl_zero() {
         // The supported way to keep a draft model on the CPU.
         let yaml = BASE.replace(
@@ -2962,6 +3016,7 @@ models:
                 idle_ttl: 300,
                 queue_depth: 10,
                 cmd: String::new(),
+                capabilities: vec![],
                 vulkan_devices: DevicePool::default(),
                 cuda_devices: DevicePool::default(),
                 rocm_devices: DevicePool::default(),

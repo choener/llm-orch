@@ -295,6 +295,27 @@ cmd_aliases:
 # Model definitions
 # ---------------------------------------------------------------------------
 models:
+  # `capabilities` (optional, default: none) advertises what a model can do
+  # beyond plain text.  It is published in `/v1/models` as llama.cpp's
+  # `architecture` object, so a client detects it the same way it would
+  # against a single llama-server:
+  #
+  #   capabilities: [decisions]
+  #
+  # `decisions` marks a native decision model (System One / Jev style:
+  # llama.cpp's `decisions` GGUFs, or a halogen `decider`/`d3` model on the
+  # NPU): instead of generating text it answers `POST /v1/systemone` with a
+  # probability for every option you gave it, in one forward pass.  It is
+  # declared here, never probed, because a client has to be able to find the
+  # decision lane while the model is still unloaded.  Any other value is a
+  # config error.
+  #
+  # Decision models are otherwise ordinary models (same spawn, queue,
+  # autoscaling and eviction).  llama.cpp needs no special llm-orch support,
+  # but size `-c`, `--batch-size` and `--ubatch-size` for the whole prompt:
+  # several decision models evaluate state + question + options in a single
+  # batch, and llama.cpp defaults its prompt cache to 0 for decision models.
+  #
   # --- Example 1: a large GPU-resident model --------------------------------
   - name: "qwen3-32b"
     context_length: 32768

@@ -35,6 +35,9 @@ pub struct PeerModel {
     pub name: String,
     /// Declared context length, when the peer reports one.
     pub context_length: Option<usize>,
+    /// Capabilities the peer advertised (from its `architecture` object);
+    /// carried through so this node's `/v1/models` keeps advertising them.
+    pub capabilities: Vec<String>,
 }
 
 /// A peer's last successfully fetched model catalog.
@@ -354,6 +357,7 @@ impl PeerRegistry {
                     upstream_model: Some(model.name.clone()),
                     peer: Some(peer_name.clone()),
                     context_length: model.context_length.unwrap_or(4096),
+                    capabilities: model.capabilities.clone(),
                     max_instances: 1,
                     max_concurrent: state.config.max_concurrent,
                     // Remote instances are health-probe registry entries;
@@ -532,6 +536,7 @@ fn model_defaults() -> ModelConfig {
         idle_ttl: 300,
         queue_depth: 10,
         cmd: String::new(),
+        capabilities: Vec::new(),
         vulkan_devices: Default::default(),
         cuda_devices: Default::default(),
         rocm_devices: Default::default(),
@@ -580,8 +585,17 @@ async fn fetch_model_catalog(
         .pointer("/data")
         .and_then(|d| d.as_array())
         .ok_or_else(|| "response has no data array".to_string())?;
-    Ok(data
-        .iter()
+    Ok(parse_catalog_data(data, peer_node.as_deref()))
+}
+
+/// Turn a peer's `/v1/models` `data` array into catalog entries.
+///
+/// Besides the name and llm-orch's `context_length` extension, this is
+/// where a peer's capability advertisement (`architecture`, llama.cpp
+/// shape) becomes llm-orch's own `capabilities`, so this node keeps
+/// advertising a leaf's decision models.
+fn parse_catalog_data(data: &[serde_json::Value], peer_node: Option<&str>) -> Vec<PeerModel> {
+    data.iter()
         .filter_map(|entry| {
             let name = entry.get("id")?.as_str()?.to_string();
             // The peer's own node-qualified listing is a display alias
@@ -596,12 +610,28 @@ async fn fetch_model_catalog(
                 .get("context_length")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize);
+            // Capabilities ride along: the peer's `architecture` object is
+            // the only statement about a model the peer may never have
+            // loaded, and this node republishes it.  Values llm-orch does
+            // not model (`audio`, future ones) are dropped, not guessed at.
+            let capabilities: Vec<String> = entry
+                .pointer("/architecture/output_modalities")
+                .and_then(|v| v.as_array())
+                .map(|mods| {
+                    mods.iter()
+                        .filter_map(|m| m.as_str())
+                        .filter(|m| *m == "decisions")
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
             Some(PeerModel {
                 name,
                 context_length,
+                capabilities,
             })
         })
-        .collect())
+        .collect()
 }
 
 /// Fetch a JSON document from a peer endpoint.
@@ -800,6 +830,69 @@ node_name: {}
     }
 
     #[test]
+    fn parse_catalog_data_carries_decision_capability() {
+        // A leaf advertises llama.cpp's `architecture`; the master must keep
+        // advertising it for the materialized model, while tolerating
+        // modalities llm-orch does not model.
+        let data = serde_json::json!([
+            {
+                "id": "kev",
+                "context_length": 4096,
+                "architecture": {"input_modalities": ["text"], "output_modalities": ["text", "decisions"]}
+            },
+            {
+                "id": "tts",
+                "architecture": {"input_modalities": ["text"], "output_modalities": ["audio"]}
+            },
+            {"id": "plain"},
+        ])
+        .as_array()
+        .unwrap()
+        .clone();
+        let models = parse_catalog_data(&data, None);
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0].name, "kev");
+        assert_eq!(models[0].capabilities, vec!["decisions".to_string()]);
+        assert_eq!(models[0].context_length, Some(4096));
+        assert!(models[1].capabilities.is_empty(), "audio is not modelled");
+        assert!(models[2].capabilities.is_empty());
+    }
+
+    #[test]
+    fn effective_config_keeps_a_peer_decision_model_advertised() {
+        let mut cfg = base_config(Some("cheyenne"));
+        cfg.models = vec![];
+        cfg.peers = vec![peer("cortana")];
+        let registry = PeerRegistry::new(reqwest::Client::new());
+        registry.reconcile(&cfg);
+        {
+            let mut inner = registry.inner.write().unwrap();
+            inner.peers.get_mut("cortana").unwrap().catalog = Some(Catalog {
+                models: vec![PeerModel {
+                    name: "kev".into(),
+                    context_length: Some(4096),
+                    capabilities: vec!["decisions".into()],
+                }],
+                fetched_at: Instant::now(),
+            });
+        }
+        let eff = registry.effective_config(&cfg);
+        let kev = eff
+            .models
+            .iter()
+            .find(|m| m.name == "cortana/kev")
+            .expect("peer model materialized");
+        assert!(
+            kev.is_decision_model(),
+            "the master must advertise a leaf decision model as one"
+        );
+        // The bare alias for the unique peer model resolves to it, so the
+        // capability is reachable under both names.
+        let kev_bare = eff.models.iter().find(|m| m.name == "cortana/kev").unwrap();
+        assert_eq!(kev_bare.peer.as_deref(), Some("cortana"));
+    }
+
+    #[test]
     fn effective_config_materializes_qualified_and_bare_entries() {
         let mut cfg = base_config(Some("cheyenne"));
         cfg.models = vec![ModelConfig {
@@ -819,10 +912,12 @@ node_name: {}
                     PeerModel {
                         name: "qwen-flash".into(),
                         context_length: Some(32768),
+                        capabilities: vec![],
                     },
                     PeerModel {
                         name: "local-dense".into(),
                         context_length: None,
+                        capabilities: vec![],
                     },
                 ],
                 fetched_at: Instant::now(),
@@ -872,6 +967,7 @@ node_name: {}
                             models: vec![PeerModel {
                                 name: "qwen-flash".into(),
                                 context_length: None,
+                                capabilities: vec![],
                             }],
                             fetched_at: Instant::now(),
                         }),
@@ -903,6 +999,7 @@ node_name: {}
                 models: vec![PeerModel {
                     name: "cheyenne/local-dense".into(),
                     context_length: None,
+                    capabilities: vec![],
                 }],
                 fetched_at: Instant::now(),
             });
@@ -927,6 +1024,7 @@ node_name: {}
                 models: vec![PeerModel {
                     name: "qwen-flash".into(),
                     context_length: None,
+                    capabilities: vec![],
                 }],
                 fetched_at: Instant::now(),
             });
@@ -965,6 +1063,7 @@ node_name: {}
                     .map(|n| PeerModel {
                         name: (*n).into(),
                         context_length: None,
+                        capabilities: vec![],
                     })
                     .collect::<Vec<_>>(),
             );

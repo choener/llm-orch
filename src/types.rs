@@ -179,6 +179,13 @@ pub struct ModelsResponse {
     pub data: Vec<ModelEntry>,
 }
 
+/// llm-orch's default capability set: a plain text model.
+impl Default for Architecture {
+    fn default() -> Self {
+        Self::text()
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelEntry {
     pub id: String,
@@ -187,6 +194,41 @@ pub struct ModelEntry {
     pub owned_by: String,
     /// Context length (tokens).
     pub context_length: Option<usize>,
+    /// Capability advertisement (mirrors llama.cpp's `architecture`).
+    pub architecture: Architecture,
+}
+
+/// Per-model capability advertisement, mirroring the `architecture` object
+/// llama.cpp publishes in `/v1/models`: `input_modalities` lists what a
+/// model reads, `output_modalities` what it produces.
+///
+/// A model whose `output_modalities` contains `"decisions"` is a *native
+/// decision model*: it answers `POST /v1/systemone` with a probability per
+/// option instead of generating text.  Detection is by membership —
+/// `output_modalities.includes("decisions")` — and unknown values must be
+/// tolerated.
+#[derive(Debug, Clone, Serialize)]
+pub struct Architecture {
+    pub input_modalities: Vec<String>,
+    pub output_modalities: Vec<String>,
+}
+
+impl Architecture {
+    /// Plain text model — the default for every llm-orch model.
+    pub fn text() -> Self {
+        Self {
+            input_modalities: vec!["text".into()],
+            output_modalities: vec!["text".into()],
+        }
+    }
+
+    /// Text model that is also a native decision model.
+    pub fn text_and_decisions() -> Self {
+        Self {
+            input_modalities: vec!["text".into()],
+            output_modalities: vec!["text".into(), "decisions".into()],
+        }
+    }
 }
 
 // ── /v1/info and /admin/status response ──────────────────────────────────────
