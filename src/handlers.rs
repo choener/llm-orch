@@ -1677,7 +1677,10 @@ pub async fn rerank(
 /// (and rewritten to the resolved name), `state` / `questions` /
 /// `files`/`images` are forwarded untouched, so the backend stays the
 /// authority on question validation — it answers 400 on a malformed request
-/// and 501 when the loaded model is not a decision model.
+/// and 501 when the loaded model is not a decision model.  Those 4xx answers
+/// are passed through with their status; 5xx still surfaces as 502.
+/// Streaming is not part of the upstream contract, so it is not supported
+/// here either.
 ///
 /// Auth note: neither llama.cpp nor halogen requires a key of its own for
 /// this endpoint, so llm-orch's API-key gate is the only thing in front of a
@@ -1686,7 +1689,7 @@ pub async fn systemone(
     State(state): State<AppState>,
     key: ApiKey,
     Json(mut request): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let request_id = uuid::Uuid::new_v4().to_string();
     // `model` is the only field llm-orch interprets.
     let request_model = request
@@ -1763,7 +1766,7 @@ pub async fn systemone(
 
         // ── 5. Forward request, aggregate, release. ─────────────────────────
         let t0 = std::time::Instant::now();
-        let response_body = forward_request_aggregate(
+        let aggregated = forward_request_aggregate_keep_4xx(
             &state.client,
             &backend_url,
             &request,
@@ -1777,6 +1780,9 @@ pub async fn systemone(
             e
         })?;
         let elapsed = t0.elapsed();
+        let status = aggregated.status;
+        let response_body = aggregated.value;
+        let rejected = !status.is_success();
 
         // Debug log: response.
         if let Some(ref log_path) = debug_log_path {
@@ -1794,9 +1800,16 @@ pub async fn systemone(
                     body: Some(response_body.clone()),
                     usage,
                     duration_ms: Some(elapsed.as_millis() as u64),
-                    error: None,
+                    error: rejected.then(|| response_body.to_string()),
                 },
             );
+        }
+
+        // A rejected decision (bad question, model that cannot decide) is
+        // not a served request: it is passed back verbatim and never counted
+        // into the token or completion statistics.
+        if rejected {
+            return Ok((status, Json(response_body)).into_response());
         }
 
         // Statistics (opt-in): a decision answers without generation, and
@@ -1849,7 +1862,7 @@ pub async fn systemone(
             elapsed.as_millis()
         );
 
-        Ok(Json(response_body))
+        Ok((status, Json(response_body)).into_response())
     }
     .instrument(span)
     .await
@@ -3872,6 +3885,12 @@ fn note_peer_from_response(
     }
 }
 
+/// Aggregated backend response: status plus parsed JSON body.
+struct AggregatedResponse {
+    status: reqwest::StatusCode,
+    value: serde_json::Value,
+}
+
 /// Forward a request to a backend and aggregate the full response.
 ///
 /// `total_timeout` bounds the whole exchange (request + full body): a
@@ -3890,6 +3909,47 @@ async fn forward_request_aggregate(
     total_timeout: std::time::Duration,
     peer: Option<PeerForward<'_>>,
 ) -> Result<serde_json::Value, ApiError> {
+    Ok(
+        aggregate(client, backend_url, body, auth, total_timeout, peer, false)
+            .await?
+            .value,
+    )
+}
+
+/// Like [`forward_request_aggregate`], but a backend error that is the
+/// backend *answering the request* — a 4xx, or 501 Not Implemented — is
+/// returned to the caller verbatim instead of being flattened into a 502.
+///
+/// Endpoints whose request shape is validated by the backend rather than
+/// by llm-orch (currently `/v1/systemone`) need this: a caller must be
+/// able to tell "your question was malformed" (400) or "this model cannot
+/// answer decisions" (501 — llama.cpp's answer for a model that is not a
+/// decision model) apart from "the orchestrator or backend is broken"
+/// (502, which every other 5xx still maps to).
+async fn forward_request_aggregate_keep_4xx(
+    client: &reqwest::Client,
+    backend_url: &str,
+    body: &serde_json::Value,
+    auth: &Option<String>,
+    total_timeout: std::time::Duration,
+    peer: Option<PeerForward<'_>>,
+) -> Result<AggregatedResponse, ApiError> {
+    aggregate(client, backend_url, body, auth, total_timeout, peer, true).await
+}
+
+/// Shared body of the two aggregate forwarders.
+///
+/// `keep_client_errors` — pass 4xx and 501 responses through as-is (JSON
+/// body required); every other 5xx becomes [`ApiError::BackendError`].
+async fn aggregate(
+    client: &reqwest::Client,
+    backend_url: &str,
+    body: &serde_json::Value,
+    auth: &Option<String>,
+    total_timeout: std::time::Duration,
+    peer: Option<PeerForward<'_>>,
+    keep_client_errors: bool,
+) -> Result<AggregatedResponse, ApiError> {
     let work = async {
         let rewritten;
         let body = match &peer {
@@ -3911,6 +3971,18 @@ async fn forward_request_aggregate(
             }
             let text = resp.text().await.unwrap_or_else(|_| "unknown error".into());
             warn!(backend_status = %status, error = %text, "backend returned non-success");
+            // A 4xx — or llama.cpp's 501 "this model is not a decision
+            // model" — that carries a JSON body is a meaningful answer
+            // from the backend, not an orchestrator fault: hand it back
+            // as-is.
+            let answerable =
+                status.is_client_error() || status == reqwest::StatusCode::NOT_IMPLEMENTED;
+            if keep_client_errors
+                && answerable
+                && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
+            {
+                return Ok(AggregatedResponse { status, value });
+            }
             return Err(ApiError::BackendError(format!(
                 "backend returned {}: {}",
                 status, text
@@ -3931,7 +4003,7 @@ async fn forward_request_aggregate(
         {
             value["model"] = serde_json::Value::String(p.model_name.to_string());
         }
-        Ok(value)
+        Ok(AggregatedResponse { status, value })
     };
 
     if total_timeout.is_zero() {

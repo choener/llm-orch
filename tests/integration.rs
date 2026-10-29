@@ -719,6 +719,70 @@ async fn systemone_requires_auth_and_spawns_nothing() {
 }
 
 #[tokio::test]
+async fn systemone_backend_client_error_is_preserved() {
+    let dir = temp_dir("systemone-4xx");
+    let srv = boot(&dir, "tester: secret-key\n", &models_yaml("", 60)).await;
+    let client = reqwest::Client::new();
+
+    // The stub answers a missing `questions` object with 400 and an
+    // unsupported question type with 501 — the same split llama.cpp uses
+    // between "malformed decision" and "this model cannot decide".
+    // Both must reach the caller with their status, not as a 502.
+    let cases: Vec<(serde_json::Value, u16)> = vec![
+        (
+            serde_json::json!({"model": "m", "state": "hello there"}),
+            400,
+        ),
+        (
+            serde_json::json!({
+                "model": "m",
+                "state": "hello there",
+                "questions": {"q": {"type": "telepathy"}}
+            }),
+            501,
+        ),
+    ];
+    for (body, expected) in cases {
+        let resp = authed(&client, &format!("{}/v1/systemone", srv.url))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), expected);
+        // The backend's own error body is passed through untouched.
+        let echoed: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            echoed
+                .pointer("/error/message")
+                .and_then(|v| v.as_str())
+                .is_some_and(|m| !m.is_empty()),
+            "backend error body must survive forwarding: {echoed}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn systemone_backend_server_error_is_bad_gateway() {
+    let dir = temp_dir("systemone-5xx");
+    let srv = boot(
+        &dir,
+        "tester: secret-key\n",
+        &models_yaml(" --fail-status 503", 60),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let resp = authed(&client, &format!("{}/v1/systemone", srv.url))
+        .json(&systemone_body("m"))
+        .send()
+        .await
+        .unwrap();
+    // A broken backend stays a 502: it must not look like a decision the
+    // caller could have avoided.
+    assert_eq!(resp.status(), 502);
+}
+
+#[tokio::test]
 async fn systemone_needs_a_model_field() {
     let dir = temp_dir("systemone-model");
     let srv = boot(&dir, "tester: secret-key\n", &models_yaml("", 60)).await;
