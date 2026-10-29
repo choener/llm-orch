@@ -103,12 +103,15 @@ impl Config {
         let mut seen_names = HashSet::new();
         for m in &self.models {
             // Capability typos are silent failures (a client never finds the
-            // decision lane), so they are hard errors here.
+            // decision lane, or never sends an image to a vision model), so
+            // they are hard errors here.
             for cap in &m.capabilities {
-                if cap != "decisions" {
+                if !crate::types::KNOWN_CAPABILITIES.contains(&cap.as_str()) {
                     return Err(ConfigError::Validation(format!(
-                        "model '{}': unknown capability '{}' (known: decisions)",
-                        m.name, cap
+                        "model '{}': unknown capability '{}' (known: {})",
+                        m.name,
+                        cap,
+                        crate::types::KNOWN_CAPABILITIES.join(", ")
                     )));
                 }
             }
@@ -1099,11 +1102,16 @@ pub struct ModelConfig {
     pub max_concurrent: usize,
 
     /// Capabilities advertised to clients in `/v1/models`, mirroring
-    /// llama.cpp's per-model `architecture` object.  The only value
-    /// llm-orch defines today is `decisions`: a native decision model
-    /// (System One / Jev style, llama.cpp's `decisions` models or a
-    /// halogen `decider`/`d3`) that answers `POST /v1/systemone` instead
-    /// of generating text.
+    /// llama.cpp's per-model `architecture` object.  Values (see
+    /// [`crate::types::KNOWN_CAPABILITIES`]):
+    ///
+    /// - `decisions`: a native decision model (System One / Jev style,
+    ///   llama.cpp's `decisions` models or a halogen `decider`/`d3`) that
+    ///   answers `POST /v1/systemone` instead of generating text.
+    /// - `image` / `audio` / `video`: the model reads that modality besides
+    ///   text (vision decision models, omni models).
+    ///
+    /// `text` is implicit and must not be listed.
     ///
     /// It is declared here rather than read off a running backend because
     /// the marker has to be visible while the model is *not* loaded — that
@@ -2298,6 +2306,20 @@ models:
     }
 
     #[test]
+    fn accepts_input_modality_capabilities() {
+        // A vision decision model (OpenJev, Clef, halogen d3-nano): the
+        // client only attaches an image if the advertisement says it reads
+        // one.
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\n    capabilities: [decisions, image]",
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert!(cfg.models[0].is_decision_model());
+        assert_eq!(cfg.models[0].capabilities, ["decisions", "image"]);
+    }
+
+    #[test]
     fn rejects_unknown_capability() {
         // Typos in `capabilities` are otherwise silent: the client just never
         // finds the decision lane.
@@ -2306,6 +2328,12 @@ models:
             "cmd: \"sleep 3600\"\n    capabilities: [decision]",
         );
         expect_validation_error(&yaml, "unknown capability 'decision'");
+        // … and neither is a modality llm-orch does not know.
+        let yaml = BASE.replace(
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\n    capabilities: [vision]",
+        );
+        expect_validation_error(&yaml, "unknown capability 'vision'");
     }
 
     #[test]

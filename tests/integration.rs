@@ -804,7 +804,7 @@ async fn systemone_needs_a_model_field() {
 async fn v1_models_advertises_decisions_while_unloaded() {
     let dir = temp_dir("systemone-models");
     let yaml = format!(
-        "models:\n  - name: kev\n    context_length: 4096\n    capabilities: [decisions]\n    cmd: \"{STUB_BIN} --port {{port}}\"\n    idle_ttl: 60\n    max_instances: 1\n  - name: plain\n    context_length: 4096\n    cmd: \"{STUB_BIN} --port {{port}}\"\n    idle_ttl: 60\n    max_instances: 1\naliases:\n  - name: triage\n    target: kev\n"
+        "models:\n  - name: kev\n    context_length: 4096\n    capabilities: [decisions, image]\n    cmd: \"{STUB_BIN} --port {{port}}\"\n    idle_ttl: 60\n    max_instances: 1\n  - name: plain\n    context_length: 4096\n    cmd: \"{STUB_BIN} --port {{port}}\"\n    idle_ttl: 60\n    max_instances: 1\naliases:\n  - name: triage\n    target: kev\n"
     );
     let srv = boot(&dir, "tester: secret-key\n", &yaml).await;
     let client = reqwest::Client::new();
@@ -845,6 +845,27 @@ async fn v1_models_advertises_decisions_while_unloaded() {
         !has_decisions("plain"),
         "a text model must not advertise decisions"
     );
+    // What a model reads is advertised too — a vision decision model must
+    // say so, or a client never attaches an image.
+    let in_mods = |id: &str| {
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == serde_json::json!(id))
+            .unwrap()
+            .pointer("/architecture/input_modalities")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|m| m.as_str()).collect::<Vec<&str>>())
+            .unwrap_or_default()
+    };
+    assert_eq!(in_mods("kev").join(","), "text,image");
+    assert_eq!(
+        in_mods("triage").join(","),
+        "text,image",
+        "the alias carries the same input modalities"
+    );
+    assert_eq!(in_mods("plain").join(","), "text");
     // Discovery happened without spawning anything.
     assert!(srv.manager.instance_counts().is_empty());
 }

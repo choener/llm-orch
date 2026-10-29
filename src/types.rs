@@ -207,11 +207,29 @@ pub struct ModelEntry {
 /// option instead of generating text.  Detection is by membership —
 /// `output_modalities.includes("decisions")` — and unknown values must be
 /// tolerated.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Architecture {
+    #[serde(default)]
     pub input_modalities: Vec<String>,
+    #[serde(default)]
     pub output_modalities: Vec<String>,
 }
+
+/// The capability values llm-orch understands, in the vocabulary llama.cpp
+/// puts in its `architecture` object:
+///
+/// - `decisions` — an *output* capability: a native decision model, served
+///   by `POST /v1/systemone`.
+/// - `image`, `audio`, `video` — *input* modalities: what the model can
+///   read besides text (vision decision models, omni models).
+///
+/// Speech *output* (`audio` in `output_modalities`) is deliberately not
+/// modelled: llm-orch routes TTS and ASR through the `/v1/audio/*`
+/// endpoints, so a client never needs the advertisement to find them.
+pub const KNOWN_CAPABILITIES: [&str; 4] = ["decisions", "image", "audio", "video"];
+
+/// Input modalities, in the order they are advertised.
+const INPUT_MODALITIES: [&str; 3] = ["image", "audio", "video"];
 
 impl Architecture {
     /// Plain text model — the default for every llm-orch model.
@@ -222,12 +240,42 @@ impl Architecture {
         }
     }
 
-    /// Text model that is also a native decision model.
-    pub fn text_and_decisions() -> Self {
-        Self {
-            input_modalities: vec!["text".into()],
-            output_modalities: vec!["text".into(), "decisions".into()],
+    /// The advertisement implied by a model's declared capabilities.
+    /// Validation guarantees every entry is in [`KNOWN_CAPABILITIES`];
+    /// anything else is ignored here, never invented.
+    pub fn from_capabilities(capabilities: &[String]) -> Self {
+        let has = |cap: &str| capabilities.iter().any(|c| c == cap);
+        let mut input = vec!["text"];
+        for m in INPUT_MODALITIES {
+            if has(m) {
+                input.push(m);
+            }
         }
+        let mut output = vec!["text"];
+        if has("decisions") {
+            output.push("decisions");
+        }
+        Self {
+            input_modalities: input.into_iter().map(str::to_string).collect(),
+            output_modalities: output.into_iter().map(str::to_string).collect(),
+        }
+    }
+
+    /// The inverse: llm-orch capabilities implied by a peer's advertised
+    /// architecture.  Values outside [`KNOWN_CAPABILITIES`] are dropped —
+    /// they belong to the peer, and guessing them here would invent
+    /// llm-orch capabilities.  `text` is implicit on both sides.
+    pub fn capabilities(&self) -> Vec<String> {
+        let mut caps: Vec<String> = Vec::new();
+        if self.output_modalities.iter().any(|m| m == "decisions") {
+            caps.push("decisions".into());
+        }
+        for m in INPUT_MODALITIES {
+            if self.input_modalities.iter().any(|i| i == m) {
+                caps.push(m.into());
+            }
+        }
+        caps
     }
 }
 

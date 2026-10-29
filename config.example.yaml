@@ -300,15 +300,22 @@ models:
   # `architecture` object, so a client detects it the same way it would
   # against a single llama-server:
   #
-  #   capabilities: [decisions]
+  #   capabilities: [decisions]           # answers POST /v1/systemone
+  #   capabilities: [decisions, image]    # … and reads images too
+  #
+  # Known values: `decisions` (an output capability) and `image` / `audio` /
+  # `video` (input modalities the model reads besides text).  `text` is
+  # implicit; anything else is a config error, because a typo would just
+  # silently hide a lane from clients.
   #
   # `decisions` marks a native decision model (System One / Jev style:
   # llama.cpp's `decisions` GGUFs, or a halogen `decider`/`d3` model on the
   # NPU): instead of generating text it answers `POST /v1/systemone` with a
-  # probability for every option you gave it, in one forward pass.  It is
-  # declared here, never probed, because a client has to be able to find the
-  # decision lane while the model is still unloaded.  Any other value is a
-  # config error.
+  # probability for every option you gave it, in one forward pass.  Vision
+  # decision models (OpenJev, Clef, halogen `d3-nano`) need `image` as well,
+  # or a client will never attach the picture it wants judged.  Capabilities
+  # are declared here, never probed, because a client has to be able to find
+  # the decision lane while the model is still unloaded.
   #
   # Decision models are otherwise ordinary models (same spawn, queue,
   # autoscaling and eviction).  llama.cpp needs no special llm-orch support,

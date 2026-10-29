@@ -68,11 +68,7 @@ use tracing::Instrument;
 /// anything is loaded — llm-orch synthesizes `/v1/models` from config, and
 /// config is the only truth about an unloaded model.
 fn architecture_for(m: &crate::config::ModelConfig) -> crate::types::Architecture {
-    if m.is_decision_model() {
-        crate::types::Architecture::text_and_decisions()
-    } else {
-        crate::types::Architecture::text()
-    }
+    crate::types::Architecture::from_capabilities(&m.capabilities)
 }
 
 pub async fn list_models(

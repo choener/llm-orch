@@ -613,17 +613,12 @@ fn parse_catalog_data(data: &[serde_json::Value], peer_node: Option<&str>) -> Ve
             // Capabilities ride along: the peer's `architecture` object is
             // the only statement about a model the peer may never have
             // loaded, and this node republishes it.  Values llm-orch does
-            // not model (`audio`, future ones) are dropped, not guessed at.
-            let capabilities: Vec<String> = entry
-                .pointer("/architecture/output_modalities")
-                .and_then(|v| v.as_array())
-                .map(|mods| {
-                    mods.iter()
-                        .filter_map(|m| m.as_str())
-                        .filter(|m| *m == "decisions")
-                        .map(str::to_string)
-                        .collect()
-                })
+            // not model (`audio` output, future modalities) are dropped by
+            // `Architecture::capabilities`, never guessed at.
+            let capabilities = entry
+                .get("architecture")
+                .and_then(|a| serde_json::from_value::<crate::types::Architecture>(a.clone()).ok())
+                .map(|a| a.capabilities())
                 .unwrap_or_default();
             Some(PeerModel {
                 name,
@@ -833,12 +828,15 @@ node_name: {}
     fn parse_catalog_data_carries_decision_capability() {
         // A leaf advertises llama.cpp's `architecture`; the master must keep
         // advertising it for the materialized model, while tolerating
-        // modalities llm-orch does not model.
+        // values llm-orch does not model (speech output, future modalities).
         let data = serde_json::json!([
             {
-                "id": "kev",
+                "id": "openjev",
                 "context_length": 4096,
-                "architecture": {"input_modalities": ["text"], "output_modalities": ["text", "decisions"]}
+                "architecture": {
+                    "input_modalities": ["text", "image"],
+                    "output_modalities": ["text", "decisions"]
+                }
             },
             {
                 "id": "tts",
@@ -851,10 +849,16 @@ node_name: {}
         .clone();
         let models = parse_catalog_data(&data, None);
         assert_eq!(models.len(), 3);
-        assert_eq!(models[0].name, "kev");
-        assert_eq!(models[0].capabilities, vec!["decisions".to_string()]);
+        assert_eq!(models[0].name, "openjev");
+        assert_eq!(
+            models[0].capabilities,
+            vec!["decisions".to_string(), "image".to_string()]
+        );
         assert_eq!(models[0].context_length, Some(4096));
-        assert!(models[1].capabilities.is_empty(), "audio is not modelled");
+        assert!(
+            models[1].capabilities.is_empty(),
+            "speech output is not modelled"
+        );
         assert!(models[2].capabilities.is_empty());
     }
 
