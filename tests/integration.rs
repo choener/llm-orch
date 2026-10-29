@@ -870,6 +870,189 @@ async fn v1_models_advertises_decisions_while_unloaded() {
     assert!(srv.manager.instance_counts().is_empty());
 }
 
+/// A decision model is picked through an alias exactly like a chat model —
+/// the alias resolves before the backend is acquired, and the backend sees
+/// the real model name.
+#[tokio::test]
+async fn systemone_resolves_an_alias_to_its_decision_model() {
+    let dir = temp_dir("systemone-alias");
+    let yaml = format!(
+        "models:\n  - name: kev\n    context_length: 4096\n    capabilities: [decisions]\n    cmd: \"{STUB_BIN} --port {{port}}\"\n    idle_ttl: 60\n    max_instances: 1\naliases:\n  - name: triage\n    target: kev\n"
+    );
+    let srv = boot(&dir, "tester: secret-key\n", &yaml).await;
+    let client = reqwest::Client::new();
+
+    let resp = authed(&client, &format!("{}/v1/systemone", srv.url))
+        .json(&systemone_body("triage"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    // The stub echoes the model it was asked for: the alias must have been
+    // rewritten, or llama.cpp would not know what to answer with.
+    assert_eq!(body["model"], "kev");
+    assert_eq!(body["answers"].as_object().unwrap().len(), 3);
+}
+
+/// A decision pass is one forward pass with nothing sampled, so llm-orch
+/// accounts it as prompt tokens only — in the stats file and in the
+/// completion records behind `/admin/status`.
+#[tokio::test]
+async fn systemone_accounts_its_forward_pass_in_stats() {
+    let dir = temp_dir("systemone-stats");
+    let yaml = format!(
+        "models:\n  - name: kev\n    context_length: 4096\n    capabilities: [decisions]\n    cmd: \"{STUB_BIN} --port {{port}}\"\n    idle_ttl: 60\n    max_instances: 1\n"
+    );
+    let (srv, stats_file) = boot_with_stats(&dir, &yaml).await;
+    let client = reqwest::Client::new();
+
+    let resp = authed(&client, &format!("{}/v1/systemone", srv.url))
+        .json(&systemone_body("kev"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    // The stub reports `usage.input_tokens` as the word count of `state`.
+    let input_tokens = systemone_body("kev")["state"]
+        .as_str()
+        .unwrap()
+        .split_whitespace()
+        .count();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&stats_file).unwrap()).unwrap();
+    let total = &doc["models"]["kev"]["total"];
+    assert_eq!(total["requests"], 1);
+    assert_eq!(
+        total["prompt_tokens"], input_tokens,
+        "the whole forward pass is prompt tokens"
+    );
+    assert_eq!(total["completion_tokens"], 0, "nothing was sampled");
+
+    let resp = client
+        .get(format!("{}/admin/status", srv.url))
+        .bearer_auth("secret-key")
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert_eq!(status, 200, "/admin/status body: {text}");
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let kev = body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == serde_json::json!("kev"))
+        .expect("kev in /admin/status");
+    let rec = &kev["recent_completions"][0];
+    assert_eq!(rec["prompt_tokens"], input_tokens);
+    assert_eq!(rec["generated_tokens"], 0);
+    assert_eq!(rec["api_user"], "tester");
+}
+
+/// `debug_log` is how an operator sees what a decision model was asked and
+/// what it decided, so both lines must be written.
+#[tokio::test]
+async fn systemone_writes_debug_log_lines() {
+    let dir = temp_dir("systemone-debug");
+    let log = dir.join("kev.jsonl");
+    let yaml = format!(
+        "models:\n  - name: kev\n    context_length: 4096\n    capabilities: [decisions]\n    cmd: \"{STUB_BIN} --port {{port}}\"\n    idle_ttl: 60\n    max_instances: 1\n    debug_log: \"{}\"\n",
+        log.display()
+    );
+    let srv = boot(&dir, "tester: secret-key\n", &yaml).await;
+    let client = reqwest::Client::new();
+
+    let resp = authed(&client, &format!("{}/v1/systemone", srv.url))
+        .json(&systemone_body("kev"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    drop(resp);
+
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+        .expect("debug log written")
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(lines.len(), 2, "one request line, one response line");
+    assert_eq!(lines[0]["dir"], "request");
+    assert_eq!(lines[0]["model"], "kev");
+    assert!(
+        lines[0]["body"]["questions"]["team"].is_object(),
+        "the request line holds the questions that were asked"
+    );
+    assert_eq!(lines[1]["dir"], "response");
+    assert_eq!(
+        lines[0]["request_id"], lines[1]["request_id"],
+        "the two lines correlate"
+    );
+    assert_eq!(lines[1]["error"], serde_json::Value::Null);
+    assert!(
+        lines[1]["answers"].is_object() || lines[1]["body"]["answers"].is_object(),
+        "the response line holds the decisions: {}",
+        lines[1]
+    );
+}
+
+/// The decision lane has to survive peering: a leaf's decision model is
+/// advertised by the master while unloaded, and a decision request through
+/// the master is answered by the leaf.
+#[tokio::test]
+async fn peering_advertises_and_routes_a_leaf_decision_model() {
+    let topo = boot_peering_with("  - name: kev\n    context_length: 4096\n    capabilities: [decisions]\n    cmd: \"http://127.0.0.1:PORT\"\n    idle_ttl: 3600\n").await;
+    let client = reqwest::Client::new();
+
+    // The catalog is polled, not pushed; wait for the leaf model to appear.
+    let mut advertised = serde_json::Value::Null;
+    for _ in 0..100 {
+        let resp = client
+            .get(format!("{}/v1/models", topo.master.url))
+            .bearer_auth("secret-key")
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        if let Some(entry) = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == serde_json::json!("cortana/kev"))
+        {
+            advertised = entry.clone();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        advertised["architecture"]["output_modalities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m == "decisions"),
+        "the master must advertise the leaf's decision model: {advertised}"
+    );
+
+    let resp = authed(&client, &format!("{}/v1/systemone", topo.master.url))
+        .json(&systemone_body("cortana/kev"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["answers"].as_object().unwrap().len(),
+        3,
+        "the leaf must answer every question: {body}"
+    );
+    assert_eq!(body["model"], "cortana/kev", "master-side name is restored");
+}
+
 // ── Hot-reload ───────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -2964,16 +3147,23 @@ struct PeeringTopology {
 }
 
 async fn boot_peering() -> PeeringTopology {
+    boot_peering_with("").await
+}
+
+/// Peering topology with extra leaf models appended to the leaf's config.
+/// `PORT` in the extra yaml is replaced with the shared stub's port.
+async fn boot_peering_with(leaf_extra_models: &str) -> PeeringTopology {
     let leaf_port = free_port();
     let stub_port = free_port();
     let _stub = spawn_stub_on(stub_port).await;
+    let leaf_extra_models = leaf_extra_models.replace("PORT", &stub_port.to_string());
 
     // Leaf: node `cortana`, one remote model served by the stub.
     let leaf_dir = temp_dir("peering-leaf");
     let leaf_yaml = format!(
         "node_name: cortana\n\
 stats:\n  file: \"stats.json\"\n\
-models:\n  - name: qwen-flash\n    context_length: 8192\n    cmd: \"http://127.0.0.1:{stub_port}\"\n    idle_ttl: 3600\n"
+models:\n  - name: qwen-flash\n    context_length: 8192\n    cmd: \"http://127.0.0.1:{stub_port}\"\n    idle_ttl: 3600\n{leaf_extra_models}"
     );
     let leaf = boot_on_port(&leaf_dir, leaf_port, "tester: secret-key\n", &leaf_yaml).await;
 

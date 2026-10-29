@@ -12,6 +12,7 @@
 - **API Key Authentication**: Simple, file-based API key management with hot-reload support.
 - **Multi-GPU Support**: Supports models that span multiple GPUs by coordinating tensor splits across specified devices.
 - **Model Aliasing**: Create aliases for models with optional system prompt injections for different use cases.
+- **Decision Models (System One)**: Front llama.cpp's `decisions` models (and halogen NPU deciders) on `POST /v1/systemone`: one forward pass returns a probability per option instead of text — routing, triage, done-ness checks in milliseconds.
 - **Cluster Peering**: Front further llm-orch instances as one endpoint — peer models under `<peer>/<model>` names, one apikey per peer, unified stats and admin views.
 
 ## 🏗 Architecture
@@ -428,6 +429,29 @@ models:
     cmd: "{audiocpp}"
 ```
 `context_length` may be omitted for audio models. Responses are forwarded with the backend's Content-Type intact: WAV bytes, base64 JSON, SSE streams (TTS deltas, transcript deltas), or raw PCM all work; `stream=true` multipart transcriptions stream SSE. The bidirectional `/v1/audio/transcriptions/live` ingest endpoint is not proxied yet.
+
+### Decision models (`/v1/systemone`)
+A **decision model** does not generate text: you send it a `state` and typed `questions`, and one forward pass later you get a probability for every option you offered (TypeSafe's System One format, also spoken by llama.cpp and by halogen's NPU endpoint). It is the fast lane for the boring decisions around a chat model — route this ticket, is the agent's step done, is this input hostile — so it gets its own endpoint: `POST /v1/systemone`, fully gated behind the same API keys as everything else.
+
+Declare a decision model with `capabilities`, and clients find it in `/v1/models` exactly as they would against a single `llama-server`:
+```yaml
+models:
+  - name: kev
+    context_length: 8192
+    max_concurrent: 8
+    idle_ttl: 300
+    capabilities: [decisions]          # → architecture.output_modalities
+    cmd: |
+      {llama}
+        --model /models/Kev-4B-Q4_K_M.gguf
+        --ctx-size {context_length}
+        --parallel {max_concurrent}
+```
+```console
+curl -s localhost:8080/v1/models -H "Authorization: Bearer $KEY" \
+  | jq '.data[] | select(.architecture.output_modalities | index("decisions")) | .id'
+```
+The request body is passed through untouched — the backend is the authority on what a valid question is, so its 400 (malformed decision) and 501 ("this model is not a decision model") come back verbatim, while a broken backend stays a 502. Nothing is sampled, so the whole pass is billed as prompt tokens with 0 generated. Everything else is an ordinary model: same spawn, queue, autoscaling, `idle_ttl`, aliases, debug log and cluster peering (a leaf's decision models are advertised and served through the master). Vision decision models (OpenJev, Clef, halogen `d3-nano`) must add `image` to `capabilities`, or a client will never attach the picture to be judged. See [docs/009-systemone.md](docs/009-systemone.md) for the contract, question types, sizing notes and examples.
 
 ## ❄️ NixOS Module
 
