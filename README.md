@@ -9,7 +9,7 @@
 - **Load-Based Autoscaling**: Automatically scales the number of parallel instances for a model based on exponentially-weighted moving average (EMA) load metrics.
 - **Hot-Reloading**: Update your `config.yaml` or `apikeys.txt` at runtime; changes are applied immediately without restarting the orchestrator.
 - **Request Queueing**: Implements a FIFO queue for requests when all available instances are at capacity, preventing server crashes under heavy load.
-- **API Key Authentication**: Simple, file-based API key management with hot-reload support.
+- **API Key Authentication**: Simple, file-based API key management with hot-reload support. Keys can be stored as SHA-256 digests so the file at rest holds no usable credential.
 - **Multi-GPU Support**: Supports models that span multiple GPUs by coordinating tensor splits across specified devices.
 - **Model Aliasing**: Create aliases for models with optional system prompt injections for different use cases.
 - **Decision Models (System One)**: Front llama.cpp's `decisions` models (and halogen NPU deciders) on `POST /v1/systemone`: one forward pass returns a probability per option instead of text — routing, triage, done-ness checks in milliseconds.
@@ -42,6 +42,13 @@ cp apikeys.example.txt apikeys.txt
 ```
 
 Edit `config.yaml` to point to your model files and define your GPU layout. Make sure your `devices.vulkan` / `devices.rocm` mappings match the corresponding output of `llama-server --list-devices`.
+
+Mint an API key and paste the printed `label: sha256:…` line into `apikeys.txt`
+(the token itself is shown once and never stored):
+
+```bash
+./target/release/llm-orch keygen --label me
+```
 
 ### 3. Run
 Start the orchestrator:
@@ -81,6 +88,64 @@ config editors can add models but not forge keys. Relative paths resolve
 against the working directory. The file's *contents* are still hot-reloaded;
 only the path is fixed. Omit the flag entirely and llm-orch stays
 default-deny: every request is rejected.
+
+#### Hashed keys
+
+A line may hold the SHA-256 digest of the token instead of the token:
+
+```text
+personal-laptop:   sk-alice-6a8f3b2d1c                      # plaintext (still accepted)
+work-desktop:      sha256:9f86d081884c7d659a2feaa0c55ad…    # digest of the token
+openwebui:         sha256:9a4f75c4c4e12d0b6a4f0d3cf6b1d05d…  # inline comments allowed
+```
+
+Clients keep sending the same bearer token; llm-orch hashes what arrives and
+looks the digest up, so authentication stays O(1) and the file at rest — and
+llm-orch's own memory — hold nothing directly usable. A leaked backup, a
+wrong `chmod`, or the `key_files` read primitive a config editor already has
+then yields digests instead of credentials.
+
+Two caveats, both deliberate:
+
+- **Hash only machine-generated tokens.** SHA-256 is not a password KDF: a GPU
+  tries ~10¹⁰ guesses/s, so a human-chosen token is worthless. Use `keygen`
+  (192 bits). `$argon2id$…` is reserved for a future KDF build and is rejected
+  with a clear error rather than silently treated as a token.
+- **It is at-rest protection.** Anyone watching live traffic (a malicious
+  backend, the TLS-terminating proxy) still sees the plaintext bearer token.
+
+`sha256:` digests cover the **exact bytes** the client sends — a stray newline
+from `echo key | sha256sum` never matches — so use the tooling instead of
+hand-hashing. **llm-orch only ever reads the key file**; these commands are the
+supported way to write it:
+
+```bash
+llm-orch keygen --label ci-runner                 # prints the token once + the line to paste
+llm-orch hash-apikeys -k apikeys.txt              # preview converting plaintext lines to digests
+llm-orch hash-apikeys -k apikeys.txt --write      # convert in place (atomic, 0600, idempotent)
+printf '%s' "$TOKEN" | llm-orch verify-apikey -k apikeys.txt   # which label is this?
+```
+
+`hash-apikeys` keeps comments, labels and column alignment, and the plaintext
+is unrecoverable afterwards — hot-reload picks the file up without a restart.
+`verify-apikey` reads the token from stdin (never argv, which leaks via `ps`)
+and, on a miss, prints the digest of what it read so a mismatched line is easy
+to find; the same digest appears at `RUST_LOG=trace` when a request is denied.
+
+Once every line is hashed, lock the door: `--require-hashed-apikeys`
+(`services.llm-orch.requireHashedApikeys` on NixOS) refuses plaintext entries
+at load time, and `--check-config` checks the same rule.
+
+Migrating an existing file, one key at a time (no downtime):
+
+1. `llm-orch keygen --label <new-holder>` — hand the token to the client, paste
+   the printed `sha256:` line into the file. Hot-reload applies it immediately.
+2. Convert the remaining plaintext lines: `llm-orch hash-apikeys -k <file> --write`
+   (preview it first without `--write`; the file must be writable, i.e. `0600`).
+3. Confirm a client's token still maps to its label:
+   `printf '%s' "$TOKEN" | llm-orch verify-apikey -k <file>`.
+4. Add `--require-hashed-apikeys` and verify the deployment wiring end to end:
+   `llm-orch --check-config config.yaml -k <file> --require-hashed-apikeys`.
 
 ### Models
 In `config.yaml`, each model definition controls its lifecycle:
@@ -508,6 +573,7 @@ The module automatically uses the flake's own build of llm-orch; override with `
 | `package` | this flake's build | The llm-orch package to run. |
 | `configFile` | — (required) | Path to `config.yaml`; hot-reloaded at runtime. |
 | `apikeysFile` | `"/var/lib/llm-orch/apikeys.txt"` | Path passed as `--apikeyfile`. Deliberately outside the config so a `config.yaml` editor cannot redirect authentication. `null` runs default-deny (all requests rejected). |
+| `requireHashedApikeys` | `false` | Pass `--require-hashed-apikeys`: accept only `sha256:` digest keys and refuse plaintext entries. |
 | `user` / `group` | `"llm-orch"` | Account to run under. The default is created as a system user with `video`/`render` group membership for GPU access. Set to your own user if your model files are owned by it. |
 | `llamaPackage` | `pkgs.llama-cpp` | Provides `llama-server` on the service PATH. Set to `null` to opt out. |
 | `extraPackages` | `[]` | Additional packages on the service PATH (available to model `cmd`s and keep-alive hooks). |
@@ -557,7 +623,7 @@ those mappings and performs the required storage migration before the load.
 The service reads its files directly (hot-reload requires this), so ownership matters:
 
 - **Config file**: owned by the service user, may be world-readable (e.g. `0644 llm-orch:llm-orch`).
-- **Apikeys file** (path set via `services.llm-orch.apikeysFile`, passed as `--apikeyfile`): owned by the service user, readable by **no one else** (`0400` or `0600`). Its location is not expressible in `config.yaml`, so handing out write access to the config does not hand out the ability to forge keys.
+- **Apikeys file** (path set via `services.llm-orch.apikeysFile`, passed as `--apikeyfile`): owned by the service user, readable by **no one else** (`0400` or `0600`). Its location is not expressible in `config.yaml`, so handing out write access to the config does not hand out the ability to forge keys. Converting entries to `sha256:` digests (`llm-orch hash-apikeys`) additionally means the file — and llm-orch's memory — hold no usable credentials; that conversion writes the file, so it needs the file writable by whoever runs it (`0600`).
 - Relative paths in the config (like a relative `stats.file`) resolve against the state directory `/var/lib/llm-orch`, which the module creates owned by the service user.
 - Replace both files **atomically** (write temp file, then `mv`) so the hot-reload watcher fires reliably.
 

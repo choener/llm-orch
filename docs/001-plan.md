@@ -10,6 +10,13 @@ software; not a multi-tenant enterprise product.
     file. The file is user-editable at runtime and is hot-reloaded just like the
     main config (only its path is fixed at startup).
   - At minimum: one apikey per line, optional label/comment. Revocation = delete the line.
+  - A line may hold `sha256:<hex>` instead of the token, so the key file at rest (and
+    llm-orch's memory) hold no usable credential. Lookup stays O(1) (digest of the
+    presented token → map). Only machine-generated tokens may be hashed — SHA-256 is
+    not a KDF; `$argon2id$` is reserved for that and rejected with a clear error.
+  - llm-orch only ever *reads* the key file. Minting (`keygen`), converting
+    (`hash-apikeys`) and checking (`verify-apikey`) are operator subcommands; the
+    daemon never rewrites the credentials it authenticates against.
 - Hot-reload configuration. On config change (main config *or* apikeys file), reload
   without dropping in-flight requests. Config format is YAML (chosen for comments).
 - Config validation on hot-reload. Reject bad configs atomically rather than partially

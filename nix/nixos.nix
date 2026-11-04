@@ -143,6 +143,17 @@ in
       '';
     };
 
+    requireHashedApikeys = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Pass `--require-hashed-apikeys`: refuse plaintext apikeys and accept
+        only `sha256:` digest entries. Turn this on once every entry in
+        {option}`apikeysFile` has been converted with
+        `llm-orch hash-apikeys --write`; llm-orch itself never writes the file.
+      '';
+    };
+
     user = lib.mkOption {
       type = lib.types.str;
       default = defaultUserGroup;
@@ -301,7 +312,7 @@ in
         Group = cfg.group;
         ExecStart = "${lib.getExe cfg.package} --config ${cfg.configFile}${
           lib.optionalString (cfg.apikeysFile != null) " --apikeyfile ${cfg.apikeysFile}"
-        }";
+        }${lib.optionalString cfg.requireHashedApikeys " --require-hashed-apikeys"}";
         Restart = "on-failure";
         RestartSec = 5;
 

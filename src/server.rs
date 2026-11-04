@@ -284,7 +284,16 @@ impl FromRequestParts<AppState> for ApiKey {
             Some(label) => Ok(ApiKey {
                 label: label.to_owned(),
             }),
-            None => Err(ApiError::Unauthorized),
+            None => {
+                // Trace-only, and never the token itself: the digest of what
+                // the client actually sent is what makes a hand-hashed key
+                // line (stray newline, lost space) findable in seconds.
+                tracing::trace!(
+                    presented_sha256 = %crate::apikeys::sha256_hex(key),
+                    "apikey not recognized"
+                );
+                Err(ApiError::Unauthorized)
+            }
         }
     }
 }

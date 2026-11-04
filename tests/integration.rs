@@ -1166,7 +1166,13 @@ async fn apikeys_rotate_but_config_cannot_retarget_auth() {
     std::fs::write(&tmp, "tester: secret-key\nops: rotated-key\n").unwrap();
     std::fs::rename(&tmp, &keys_path).unwrap();
     let last_ak_mtime = Arc::new(Mutex::new(None));
-    reload::handle_apikeys_reload(&keys_path, &srv.apikeys, &last_ak_mtime).await;
+    reload::handle_apikeys_reload(
+        &keys_path,
+        &srv.apikeys,
+        apikeys::ApikeysOptions::default(),
+        &last_ak_mtime,
+    )
+    .await;
     assert_eq!(
         models_req("rotated-key".into()).await,
         200,
@@ -1207,6 +1213,299 @@ async fn apikeys_rotate_but_config_cannot_retarget_auth() {
         models_req("rotated-key".into()).await,
         200,
         "the rejected config must leave the running one in place"
+    );
+}
+
+// ── hashed apikeys ───────────────────────────────────────────────────
+
+/// Run the binary with stdin fed from a byte slice, returning the output.
+fn run_stdin(args: &[&str], stdin_data: &[u8]) -> std::process::Output {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(ORCH_BIN)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin_data).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[tokio::test]
+async fn hashed_apikey_authenticates_end_to_end() {
+    let dir = temp_dir("hashedkeys");
+    let srv = boot(
+        &dir,
+        &format!("work-desktop: {}\n", apikeys::hash_value("secret-key")),
+        &models_yaml("", 60),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let get = |key: String| {
+        let client = client.clone();
+        let url = format!("{}/v1/models", srv.url);
+        async move {
+            client
+                .get(&url)
+                .bearer_auth(key)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    // The client keeps sending the plaintext token; only the file holds a digest.
+    assert_eq!(get("secret-key".into()).await, 200);
+    // A case-folded guess is not a match (digests are exact-bytes; a token with
+    // stray whitespace could not even be sent as a header value).
+    assert_eq!(get("Secret-key".into()).await, 401);
+    assert_eq!(get("secret-keey".into()).await, 401);
+}
+
+#[test]
+fn require_hashed_apikeys_cli_matrix() {
+    let dir = temp_dir("reqhashed");
+    let config_path = write_config(&dir, free_port(), &models_yaml("", 60));
+    let keys = dir.join("apikeys.txt");
+
+    let mixed = format!(
+        "plain: sk-plain\nhashed: {}\n",
+        apikeys::hash_value("sk-hash")
+    );
+    std::fs::write(&keys, &mixed).unwrap();
+
+    // Mixed file: fine by default, refused with the ratchet.
+    let ok = std::process::Command::new(ORCH_BIN)
+        .arg("--check-config")
+        .arg(&config_path)
+        .arg("--apikeyfile")
+        .arg(&keys)
+        .output()
+        .unwrap();
+    assert!(ok.status.success(), "mixed file must load: {:?}", ok);
+    assert!(
+        String::from_utf8_lossy(&ok.stdout).contains("1 hashed, 1 plaintext"),
+        "check output must report the mix: {ok:?}"
+    );
+
+    let refused = std::process::Command::new(ORCH_BIN)
+        .arg("--check-config")
+        .arg(&config_path)
+        .arg("--apikeyfile")
+        .arg(&keys)
+        .arg("--require-hashed-apikeys")
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "a plaintext entry must be refused"
+    );
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(err.contains("plaintext"), "error must say why: {err}");
+
+    // Fully hashed file passes with the ratchet.
+    std::fs::write(
+        &keys,
+        format!("hashed: {}\n", apikeys::hash_value("sk-hash")),
+    )
+    .unwrap();
+    let all_hashed = std::process::Command::new(ORCH_BIN)
+        .args(["--check-config"])
+        .arg(&config_path)
+        .arg("--apikeyfile")
+        .arg(&keys)
+        .arg("--require-hashed-apikeys")
+        .output()
+        .unwrap();
+    assert!(
+        all_hashed.status.success(),
+        "hashed-only file must pass: {:?}",
+        all_hashed
+    );
+
+    // Reserved KDF digests fail loudly rather than as inert plaintext.
+    std::fs::write(&keys, "box: $argon2id$v=19$m=65536,t=3,p=4$abc$def\n").unwrap();
+    let kdf = std::process::Command::new(ORCH_BIN)
+        .arg("--check-config")
+        .arg(&config_path)
+        .arg("--apikeyfile")
+        .arg(&keys)
+        .output()
+        .unwrap();
+    assert!(!kdf.status.success(), "argon2id must be a hard error");
+    assert!(
+        String::from_utf8_lossy(&kdf.stderr).contains("argon2id"),
+        "{kdf:?}"
+    );
+}
+
+#[test]
+fn keygen_and_verify_apikey_round_trip() {
+    let dir = temp_dir("keygen");
+    let minted = std::process::Command::new(ORCH_BIN)
+        .arg("keygen")
+        .arg("--label")
+        .arg("ci-runner")
+        .output()
+        .unwrap();
+    assert!(minted.status.success(), "keygen must succeed: {minted:?}");
+    let out = String::from_utf8_lossy(&minted.stdout).to_string();
+    // Output is: comment, token, comment, `label: sha256:…` line.
+    let token = out
+        .lines()
+        .find(|l| l.starts_with("sk-"))
+        .expect("keygen must print the token")
+        .to_owned();
+    let line = out
+        .lines()
+        .find(|l| l.starts_with("ci-runner: sha256:"))
+        .expect("keygen must print the file line")
+        .to_owned();
+
+    let keys = dir.join("apikeys.txt");
+    std::fs::write(&keys, format!("{line}\n")).unwrap();
+
+    // The minted token authenticates against the hashed line…
+    let hit = run_stdin(
+        &["verify-apikey", "-k", keys.to_str().unwrap()],
+        token.as_bytes(),
+    );
+    assert!(hit.status.success(), "minted token must match: {hit:?}");
+    assert!(
+        String::from_utf8_lossy(&hit.stdout).contains("ci-runner"),
+        "{hit:?}"
+    );
+
+    // …and a `echo`-style trailing newline does not break it (tooling strips
+    // exactly one), while a wrong token reports its digest for debugging.
+    let hit2 = run_stdin(
+        &["verify-apikey", "-k", keys.to_str().unwrap()],
+        format!("{token}\n").as_bytes(),
+    );
+    assert!(
+        hit2.status.success(),
+        "trailing newline must be stripped: {hit2:?}"
+    );
+
+    let miss = run_stdin(
+        &["verify-apikey", "-k", keys.to_str().unwrap()],
+        b"sk-not-the-key",
+    );
+    assert!(!miss.status.success(), "wrong token must exit non-zero");
+    let msg = String::from_utf8_lossy(&miss.stdout).to_string();
+    assert!(msg.contains("no match"), "{msg}");
+    assert!(
+        msg.contains(&apikeys::sha256_hex("sk-not-the-key")),
+        "failure must report the digest of what was read: {msg}"
+    );
+
+    // Empty stdin is a usage error, not a silent "no match".
+    let empty = run_stdin(&["verify-apikey", "-k", keys.to_str().unwrap()], b"");
+    assert!(!empty.status.success());
+}
+
+#[test]
+fn hash_apikeys_converts_in_place_preserving_layout() {
+    let dir = temp_dir("hashkeys");
+    let config_path = write_config(&dir, free_port(), &models_yaml("", 60));
+    let keys = dir.join("apikeys.txt");
+    std::fs::write(
+        &keys,
+        "\
+# llm-orch API keys
+personal-laptop:   sk-alice            # alice's laptop
+work-desktop:      sk-bob
+",
+    )
+    .unwrap();
+
+    // Dry run by default: prints the conversion, leaves the file alone.
+    let dry = std::process::Command::new(ORCH_BIN)
+        .arg("hash-apikeys")
+        .arg("-k")
+        .arg(&keys)
+        .output()
+        .unwrap();
+    assert!(dry.status.success(), "{dry:?}");
+    let preview = String::from_utf8_lossy(&dry.stdout).to_string();
+    assert!(preview.contains("sha256:"), "{preview}");
+    assert!(!preview.contains("sk-alice"), "no plaintext in the preview");
+    assert!(preview.contains("# alice's laptop"), "comments preserved");
+    assert!(
+        std::fs::read_to_string(&keys).unwrap().contains("sk-alice"),
+        "dry run must not write"
+    );
+
+    // --write converts, keeps the file loadable, and is idempotent.
+    let w = std::process::Command::new(ORCH_BIN)
+        .arg("hash-apikeys")
+        .arg("-k")
+        .arg(&keys)
+        .arg("--write")
+        .output()
+        .unwrap();
+    assert!(w.status.success(), "{w:?}");
+    let after = std::fs::read_to_string(&keys).unwrap();
+    assert!(!after.contains("sk-alice"), "{after}");
+    assert!(after.starts_with("# llm-orch API keys\n"), "{after}");
+    assert!(after.contains("personal-laptop:   sha256:"), "{after}");
+    assert!(after.contains("# alice's laptop"), "{after}");
+    let check = std::process::Command::new(ORCH_BIN)
+        .arg("--check-config")
+        .arg(&config_path)
+        .arg("--apikeyfile")
+        .arg(&keys)
+        .arg("--require-hashed-apikeys")
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "converted file must satisfy the ratchet: {check:?}"
+    );
+
+    let again = std::process::Command::new(ORCH_BIN)
+        .arg("hash-apikeys")
+        .arg("-k")
+        .arg(&keys)
+        .arg("--write")
+        .output()
+        .unwrap();
+    assert!(again.status.success(), "{again:?}");
+    assert!(
+        String::from_utf8_lossy(&again.stdout).contains("nothing to convert"),
+        "{again:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&keys).unwrap(), after);
+
+    // The original plaintext tokens still authenticate after conversion.
+    let hit = run_stdin(
+        &["verify-apikey", "-k", keys.to_str().unwrap()],
+        b"sk-alice",
+    );
+    assert!(
+        hit.status.success(),
+        "converted key must still work: {hit:?}"
+    );
+}
+
+/// The shipped examples are executable documentation: they must parse.
+#[test]
+fn shipped_example_files_are_valid() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let out = std::process::Command::new(ORCH_BIN)
+        .arg("--check-config")
+        .arg(root.join("config.example.yaml"))
+        .arg("--apikeyfile")
+        .arg(root.join("apikeys.example.txt"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "shipped examples must validate: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 

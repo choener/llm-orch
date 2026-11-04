@@ -2,9 +2,36 @@
 # =================
 # One entry per line: `<label>: <key>`.  The label is used in logs and
 # metrics to identify the key holder; the key data must never appear in
-# logs.  Blank lines and lines starting with `#` are ignored.
-# Revocation = delete the line.
+# logs.  Blank lines, `#` lines and a whitespace-preceded ` # …` suffix on
+# a line are comments.  Revocation = delete the line.
 #
-personal-laptop:   sk-alice-6a8f3b2d1c
-work-desktop:      sk-bob-9e7d4c5f6a
-openwebui:         sk-carol-1b2c3d4e
+# Recommended: store the SHA-256 digest of the token instead of the token
+# itself, so a leaked file (backup, wrong permissions, pasted into a ticket)
+# hands out nothing usable, and llm-orch's own memory holds only digests:
+#
+#   label: sha256:<64 hex chars, case-insensitive>
+#
+# Generate a key (prints the token once, plus the line to paste here):
+#
+#   llm-orch keygen --label work-desktop
+#
+# Convert this file in place (dry run without --write; keeps comments and
+# alignment; the plaintext is then unrecoverable):
+#
+#   llm-orch hash-apikeys -k apikeys.txt --write
+#
+# Check what a client's token maps to (read from stdin, never argv):
+#
+#   printf '%s' "$TOKEN" | llm-orch verify-apikey -k apikeys.txt
+#
+# Hash ONLY machine-generated tokens.  SHA-256 is not a password KDF: a GPU
+# tries ~10^10 guesses/s, so a human-chosen token is cracked in seconds.
+# Start a `sha256:` line with `$argon2id$` if you ever need a real KDF — that
+# form is reserved and rejected by this build with a clear message.
+#
+# Serve with `--require-hashed-apikeys` once every line is hashed, and
+# plaintext entries are refused instead of merely tolerated.
+#
+personal-laptop:   sk-alice-6a8f3b2d1c            # delete once hashed
+work-desktop:      sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+openwebui:         sha256:9a4f75c4c4e12d0b6a4f0d3cf6b1d05d2b9f3f7a0f2a6e2cbe4a51d0e6f2bc31  # webui service token

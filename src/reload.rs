@@ -97,9 +97,13 @@ pub async fn handle_config_reload(
 }
 
 /// Atomic apikeys reload.
+///
+/// `opts` is fixed at startup (like the file's path): `--require-hashed-apikeys`
+/// is a command-line guarantee, so a reload cannot relax it.
 pub async fn handle_apikeys_reload(
     path: &std::path::Path,
     apikeys: &Arc<RwLock<apikeys::ApikeysStore>>,
+    opts: apikeys::ApikeysOptions,
     last_mtime: &Arc<Mutex<Option<std::time::SystemTime>>>,
 ) {
     let mtime = match std::fs::metadata(path).and_then(|m| m.modified()) {
@@ -114,13 +118,17 @@ pub async fn handle_apikeys_reload(
         }
     }
     info!("apikeys file changed, reloading…");
-    match apikeys::ApikeysStore::load(path) {
+    match apikeys::ApikeysStore::load_with(path, opts) {
         Ok(new_keys) => {
             let count = new_keys.len();
+            let hashed = new_keys.hashed_len();
             *apikeys.write().await = new_keys;
             // Record the mtime only on success (see config reload).
             *last_mtime.lock().await = Some(mtime);
-            info!("apikeys reloaded successfully — {} key(s)", count);
+            info!(
+                "apikeys reloaded successfully — {} key(s), {} hashed",
+                count, hashed
+            );
         }
         Err(e) => {
             error!("apikeys reload rejected (keeping old): {}", e);

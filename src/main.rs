@@ -1,7 +1,7 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use llm_orch::{
-    apikeys, config, debug_log, gpu, keepalive, mqtt, peers, reload, scheduler, server, stats,
-    watcher,
+    apikeys, config, debug_log, gpu, keepalive, keytool, mqtt, peers, reload, scheduler, server,
+    stats, watcher,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,12 +37,70 @@ struct Cli {
     )]
     apikeyfile: Option<std::path::PathBuf>,
 
+    /// Refuse plaintext apikeys: only `sha256:` digest entries are accepted.
+    ///
+    /// A command-line guarantee rather than a config field, for the same
+    /// reason the key file's path is: whoever may edit config.yaml must not be
+    /// able to relax it. A key file mixing both forms still loads without
+    /// this flag; set it once every entry is hashed.
+    #[arg(long = "require-hashed-apikeys")]
+    require_hashed_apikeys: bool,
+
     /// Validate the configuration file and exit without starting the server.
     /// Exits 0 on valid config, non-zero on errors.  With `--apikeyfile`
     /// the key file is validated too, so CI can check a deployment's whole
     /// wiring.
     #[arg(long = "check-config", value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
     check_config: Option<std::path::PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Operator tooling for the apikeys file.
+///
+/// llm-orch only ever *reads* the key file at runtime; these commands are the
+/// supported way to write or check it.
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Mint a new API key: prints the token once (hand it to the client) and
+    /// the hashed line to paste into the apikeys file.
+    Keygen {
+        /// Label identifying the key holder in logs and statistics.
+        #[arg(long)]
+        label: String,
+        /// How many keys to mint (labels get a -1, -2, … suffix).
+        #[arg(long, default_value_t = 1)]
+        count: usize,
+    },
+    /// Convert plaintext entries in the apikeys file to `sha256:` digests.
+    /// Idempotent and format-preserving; prints the result unless --write.
+    HashApikeys {
+        #[command(flatten)]
+        file: ApikeyFileArg,
+        /// Rewrite the file in place (atomic, mode 0600) instead of printing it.
+        #[arg(long)]
+        write: bool,
+    },
+    /// Report which label a bearer token maps to. The token is read from
+    /// stdin (hashed exactly as sent) so it never appears in the process list.
+    VerifyApikey {
+        #[command(flatten)]
+        file: ApikeyFileArg,
+    },
+}
+
+/// `--apikeyfile` for the apikeys subcommands (required there).
+#[derive(Parser, Debug)]
+struct ApikeyFileArg {
+    /// Path to the API keys file.
+    #[arg(
+        short = 'k',
+        long = "apikeyfile",
+        value_name = "PATH",
+        value_hint = clap::ValueHint::FilePath
+    )]
+    apikeyfile: std::path::PathBuf,
 }
 
 #[tokio::main]
@@ -61,6 +119,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
+    // ── apikeys tooling ─────────────────────────────────────────────────
+    // The daemon never writes the key file, so hashing/verification lives here.
+    if let Some(command) = &cli.command {
+        return run_command(command);
+    }
+
     // §2 — check-config mode: validate and exit.
     if let Some(check_path) = cli.check_config {
         match config::Config::load(&check_path) {
@@ -77,9 +141,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // The key file is part of the deployment wiring, so validate
                 // it here too — unlike at runtime, a missing/unreadable file
                 // is a hard error (a check that passes would deny everything).
+                let check_opts = apikeys::ApikeysOptions {
+                    require_hashed: cli.require_hashed_apikeys,
+                };
                 match &cli.apikeyfile {
-                    Some(p) => match apikeys::ApikeysStore::load(p) {
-                        Ok(store) => println!("OK: {} apikey(s) from {}", store.len(), p.display()),
+                    Some(p) => match apikeys::ApikeysStore::load_with(p, check_opts) {
+                        Ok(store) => println!(
+                            "OK: {} apikey(s) from {} ({} hashed, {} plaintext)",
+                            store.len(),
+                            p.display(),
+                            store.hashed_len(),
+                            store.plaintext_len()
+                        ),
                         Err(e) => {
                             eprintln!("ERROR: apikeys file {}: {}", p.display(), e);
                             std::process::exit(1);
@@ -115,10 +188,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Load API keys from --apikeyfile.
     //    No file, or an unreadable one ⇒ empty store (fail-closed).
     let apikeys_path = cli.apikeyfile;
+    let apikeys_opts = apikeys::ApikeysOptions {
+        require_hashed: cli.require_hashed_apikeys,
+    };
+    if apikeys_opts.require_hashed {
+        info!("apikeys: plaintext entries are refused (--require-hashed-apikeys)");
+    }
     let apikeys = match &apikeys_path {
         Some(path) => {
             info!("loading apikeys: {}", path.display());
-            match apikeys::ApikeysStore::load(path) {
+            match apikeys::ApikeysStore::load_with(path, apikeys_opts) {
                 Ok(a) => a,
                 Err(e) => {
                     warn!("could not load apikeys (fail-closed): {}", e);
@@ -132,8 +211,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     info!(
-        "loaded {} apikey(s){}",
+        "loaded {} apikey(s) ({} hashed, {} plaintext){}",
         apikeys.len(),
+        apikeys.hashed_len(),
+        apikeys.plaintext_len(),
         if apikeys.is_empty() {
             " (fail-closed: all requests denied)"
         } else {
@@ -300,6 +381,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mqtt_ctl = Arc::clone(&mqtt_ctl);
         let last_mtime = Arc::clone(&last_reload_mtime);
         let last_ak_mtime = Arc::clone(&last_apikeys_mtime);
+        let apikey_opts = apikeys_opts;
         let watch_handle = Arc::clone(&watch_handle);
         async move {
             // Key file paths currently being watched.
@@ -329,7 +411,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .await;
                         if let Some(path) = &apikeys_path {
-                            reload::handle_apikeys_reload(path, &apikeys, &last_ak_mtime).await;
+                            reload::handle_apikeys_reload(
+                                path,
+                                &apikeys,
+                                apikey_opts,
+                                &last_ak_mtime,
+                            )
+                            .await;
                         }
                         continue;
                     }
@@ -359,7 +447,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 match (&changed, &ak_p) {
                     (Some(c), Some(canon)) if c == canon => {
-                        reload::handle_apikeys_reload(&event.path, &apikeys, &last_ak_mtime).await;
+                        reload::handle_apikeys_reload(
+                            &event.path,
+                            &apikeys,
+                            apikey_opts,
+                            &last_ak_mtime,
+                        )
+                        .await;
                     }
                     _ => {}
                 }
@@ -498,4 +592,109 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("stopped");
 
     Ok(())
+}
+
+/// apikeys operator tooling (`keygen`, `hash-apikeys`, `verify-apikey`).
+///
+/// These are the only supported way to change the key file: the running
+/// orchestrator only ever reads it.
+fn run_command(command: &Command) -> Result<(), Box<dyn std::error::Error>> {
+    fn entries(n: usize) -> &'static str {
+        if n == 1 { "entry" } else { "entries" }
+    }
+
+    match command {
+        Command::Keygen { label, count } => {
+            for key in keytool::generate_keys(label, *count) {
+                println!(
+                    "# token for `{}` — hand it to the client once; it is not stored\n# anywhere and cannot be recovered later:",
+                    key.label
+                );
+                println!("{}", key.token);
+                println!("# paste this line into the apikeys file:");
+                print!("{}", key.line);
+            }
+            Ok(())
+        }
+        Command::HashApikeys { file, write } => {
+            let path = &file.apikeyfile;
+            let contents = std::fs::read_to_string(path)?;
+            let report = match keytool::hash_file_contents(&contents) {
+                Ok(report) => report,
+                Err(e) => {
+                    eprintln!("ERROR: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if report.is_noop() {
+                println!(
+                    "{}: nothing to convert ({} hashed {} already)",
+                    path.display(),
+                    report.already_hashed,
+                    entries(report.already_hashed)
+                );
+                return Ok(());
+            }
+            if !*write {
+                println!(
+                    "# {} plaintext {} in {} would become hashed (re-run with --write):",
+                    report.converted.len(),
+                    entries(report.converted.len()),
+                    path.display()
+                );
+                print!("{}", report.text);
+                return Ok(());
+            }
+            if let Err(e) = keytool::write_key_file(path, &report.text) {
+                eprintln!("ERROR: {e}");
+                std::process::exit(1);
+            }
+            println!(
+                "{}: hashed {} ({}) — the plaintext tokens are now unrecoverable;\nhot-reload picks the file up without a restart",
+                path.display(),
+                entries(report.converted.len()),
+                report.converted.join(", ")
+            );
+            Ok(())
+        }
+        Command::VerifyApikey { file } => {
+            // Default options on purpose: identifying a plaintext entry is
+            // useful even on an instance that refuses to serve it.
+            let store = match apikeys::ApikeysStore::load(&file.apikeyfile) {
+                Ok(store) => store,
+                Err(e) => {
+                    eprintln!("ERROR: {}: {}", file.apikeyfile.display(), e);
+                    std::process::exit(1);
+                }
+            };
+            use std::io::Read;
+            let mut raw = String::new();
+            std::io::stdin().read_to_string(&mut raw)?;
+            if raw.is_empty() {
+                eprintln!(
+                    "ERROR: no token on stdin — pipe it byte-exact, e.g.\n  \
+                     printf '%s' \"$TOKEN\" | llm-orch verify-apikey -k {}",
+                    file.apikeyfile.display()
+                );
+                std::process::exit(2);
+            }
+            let token = keytool::token_from_stdin(&raw);
+            match store.authenticate(token) {
+                Some(label) => {
+                    println!("matched label: {label}");
+                    Ok(())
+                }
+                None => {
+                    // Reporting the digest of what was actually read lets an
+                    // operator find the mismatching line (stray newline, lost
+                    // space, …) instead of guessing.
+                    println!(
+                        "no match — sha256 of the token read from stdin: {}",
+                        apikeys::sha256_hex(token)
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
 }

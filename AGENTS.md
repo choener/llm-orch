@@ -27,6 +27,9 @@ Design invariants (from `docs/001-plan.md` — do not break these):
 - **Apikeys location is CLI-only**: `--apikeyfile <path>`, never a `config.yaml`
   field, so editing the config cannot redirect authentication. Its contents are
   hot-reloaded; the path is fixed at startup.
+- **The apikeys file is read-only to the daemon.** llm-orch never writes it;
+  `keygen` / `hash-apikeys` / `verify-apikey` (in `src/keytool.rs`) are the only
+  supported writers. Entries may be plaintext or `sha256:<hex>` digests.
 - **No model preload**: GPUs stay idle until the first request; not configurable.
 - **Atomic config reload**: never partially apply an invalid config.
 - **Graceful shutdown**: drain in-flight requests and streams before killing backends.
@@ -65,7 +68,10 @@ exports `nixosModules.llm-orch` (module source in `nix/nixos.nix`).
   `nvidia-smi` (must be on PATH for live CUDA metrics).
 - `src/keepalive.rs` — GPU keep-alive manager (AMD-only; NVIDIA should use
   persistence mode instead).
-- `src/apikeys.rs` — API key file parsing/validation (hot-reloadable).
+- `src/apikeys.rs` — API key file parsing/validation (hot-reloadable; plaintext and
+  `sha256:` digest entries, reserved `$argon2id$` forms rejected loudly).
+- `src/keytool.rs` — operator tooling behind `llm-orch keygen|hash-apikeys|verify-apikey`
+  (the only writers of the apikeys file).
 - `src/mqtt.rs` — optional MQTT publisher for the `/v1/stats` documents
   (change-only retained topics; see `docs/007-mqtt-stats.md`).
   `src/bin/llm-orch-stub-mqtt.rs` is the minimal stub broker used by
@@ -108,5 +114,7 @@ exports `nixosModules.llm-orch` (module source in `nix/nixos.nix`).
   watcher fires reliably.
 - The apikeys file path comes from `--apikeyfile` only (see the invariant
   above); a `apikeys_file:` key in `config.yaml` is a hard validation error.
-- The apikeys file must be readable only by the service user (`0400`/`0600`).
+- The apikeys file must be readable only by the service user (`0400`/`0600`);
+  `llm-orch hash-apikeys --write` needs it writable (`0600`), refuses symlinks,
+  and rewrites it atomically with mode `0600`.
 - Relative paths in the config resolve against the working/state directory.
