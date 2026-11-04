@@ -24,6 +24,9 @@ Key behaviors:
 Design invariants (from `docs/001-plan.md` — do not break these):
 
 - **Default-deny auth**: no configured apikeys ⇒ deny all access.
+- **Apikeys location is CLI-only**: `--apikeyfile <path>`, never a `config.yaml`
+  field, so editing the config cannot redirect authentication. Its contents are
+  hot-reloaded; the path is fixed at startup.
 - **No model preload**: GPUs stay idle until the first request; not configurable.
 - **Atomic config reload**: never partially apply an invalid config.
 - **Graceful shutdown**: drain in-flight requests and streams before killing backends.
@@ -103,5 +106,7 @@ exports `nixosModules.llm-orch` (module source in `nix/nixos.nix`).
 - Both files are hot-reloaded via filesystem watch. When tooling or tests
   rewrite them, **replace atomically** (write temp file, then `mv`) so the
   watcher fires reliably.
+- The apikeys file path comes from `--apikeyfile` only (see the invariant
+  above); a `apikeys_file:` key in `config.yaml` is a hard validation error.
 - The apikeys file must be readable only by the service user (`0400`/`0600`).
 - Relative paths in the config resolve against the working/state directory.

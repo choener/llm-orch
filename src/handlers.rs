@@ -5076,7 +5076,6 @@ mod tests {
 
     const TEST_YAML: &str = r#"
 server: {}
-apikeys_file: apikeys.txt
 models:
   - name: m
     context_length: 4096

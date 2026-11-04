@@ -22,8 +22,25 @@ struct Cli {
     )]
     config: std::path::PathBuf,
 
+    /// Path to the API keys file (`label: key` per line).
+    ///
+    /// Deliberately a command-line argument and not a `config.yaml` field:
+    /// whoever is allowed to edit the config must not be able to redirect
+    /// authentication to a key file of their own. Omit it to run with no
+    /// keys at all (default-deny: every request is rejected). The file is
+    /// hot-reloaded, but its *path* is fixed for the process lifetime.
+    #[arg(
+        short = 'k',
+        long = "apikeyfile",
+        value_name = "PATH",
+        value_hint = clap::ValueHint::FilePath
+    )]
+    apikeyfile: Option<std::path::PathBuf>,
+
     /// Validate the configuration file and exit without starting the server.
-    /// Exits 0 on valid config, non-zero on errors.
+    /// Exits 0 on valid config, non-zero on errors.  With `--apikeyfile`
+    /// the key file is validated too, so CI can check a deployment's whole
+    /// wiring.
     #[arg(long = "check-config", value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
     check_config: Option<std::path::PathBuf>,
 }
@@ -57,6 +74,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for w in cfg.warnings() {
                     println!("WARNING: {w}");
                 }
+                // The key file is part of the deployment wiring, so validate
+                // it here too — unlike at runtime, a missing/unreadable file
+                // is a hard error (a check that passes would deny everything).
+                match &cli.apikeyfile {
+                    Some(p) => match apikeys::ApikeysStore::load(p) {
+                        Ok(store) => println!("OK: {} apikey(s) from {}", store.len(), p.display()),
+                        Err(e) => {
+                            eprintln!("ERROR: apikeys file {}: {}", p.display(), e);
+                            std::process::exit(1);
+                        }
+                    },
+                    None => println!(
+                        "WARNING: no --apikeyfile given — every request would be \
+                         denied (default-deny)"
+                    ),
+                }
                 std::process::exit(0);
             }
             Err(e) => {
@@ -79,13 +112,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("{w}");
     }
 
-    // 2. Load API keys from the path specified in the config.
-    //    If the file doesn't exist, continue with an empty store (fail-closed).
-    info!("loading apikeys: {}", cfg.apikeys_file.display());
-    let apikeys = match apikeys::ApikeysStore::load(&cfg.apikeys_file) {
-        Ok(a) => a,
-        Err(e) => {
-            warn!("could not load apikeys (fail-closed): {}", e);
+    // 2. Load API keys from --apikeyfile.
+    //    No file, or an unreadable one ⇒ empty store (fail-closed).
+    let apikeys_path = cli.apikeyfile;
+    let apikeys = match &apikeys_path {
+        Some(path) => {
+            info!("loading apikeys: {}", path.display());
+            match apikeys::ApikeysStore::load(path) {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!("could not load apikeys (fail-closed): {}", e);
+                    apikeys::ApikeysStore::empty()
+                }
+            }
+        }
+        None => {
+            warn!("no --apikeyfile given — fail-closed: all requests will be denied");
             apikeys::ApikeysStore::empty()
         }
     };
@@ -225,20 +267,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── File watchers + reload loop §6 ───────────────────────────────────
     let config_path = cli.config.clone();
-    let apikeys_path = shared_cfg.read().await.apikeys_file.clone();
     let (reload_tx, mut reload_rx) = broadcast::channel::<watcher::FileChange>(16);
     let watcher_tx = reload_tx.clone();
-    // Behind a lock so the reload task can rebuild the watcher when the
-    // apikeys path changes on reload.  Dropping the handle stops watching.
+    // Behind a lock so the reload task can rebuild the watcher when the key
+    // file set changes on reload.  Dropping the handle stops watching.
     let watch_handle = Arc::new(Mutex::new(None::<watcher::WatchHandle>));
-    // Watch the config, the apikeys file, and every key file (their
-    // contents feed remote `remote_auth` resolution at request time).
-    let mut watch_paths = vec![config_path.clone(), apikeys_path.clone()];
+    // Watch the config, the apikeys file (fixed by --apikeyfile), and every
+    // key file (their contents feed remote `remote_auth` resolution at
+    // request time).
+    let mut watch_paths = vec![config_path.clone()];
+    if let Some(path) = &apikeys_path {
+        watch_paths.push(path.clone());
+    }
     watch_paths.extend(shared_cfg.read().await.key_files.values().cloned());
     *watch_handle.lock().await =
         match watcher::watch_paths(watch_paths, reload_tx, Duration::from_secs(2)).await {
             Ok(wh) => {
-                info!("watching config and apikeys files for changes");
+                info!("watching config, apikeys and key files for changes");
                 Some(wh)
             }
             Err(e) => {
@@ -257,9 +302,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let last_ak_mtime = Arc::clone(&last_apikeys_mtime);
         let watch_handle = Arc::clone(&watch_handle);
         async move {
-            // The apikeys path currently being watched — updated when a
-            // config reload points us at a different file.
-            let mut watched_apikeys = apikeys_path.clone();
             // Key file paths currently being watched.
             let mut watched_keyfiles: Vec<std::path::PathBuf> =
                 cfg.read().await.key_files.values().cloned().collect();
@@ -279,7 +321,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         reload::handle_config_reload(
                             &config_path,
                             &cfg,
-                            &apikeys,
                             &manager,
                             &stats,
                             &peers,
@@ -287,8 +328,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &last_mtime,
                         )
                         .await;
-                        reload::handle_apikeys_reload(&watched_apikeys, &apikeys, &last_ak_mtime)
-                            .await;
+                        if let Some(path) = &apikeys_path {
+                            reload::handle_apikeys_reload(path, &apikeys, &last_ak_mtime).await;
+                        }
                         continue;
                     }
                     // All senders dropped — watcher is gone (shutdown).
@@ -297,7 +339,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // The watcher already pre-filters to our watched paths.
                 // Determine which file changed by comparing to canonical paths.
                 let cfg_p = config_path.canonicalize().ok();
-                let ak_p = watched_apikeys.canonicalize().ok();
+                let ak_p = apikeys_path.as_ref().and_then(|p| p.canonicalize().ok());
                 let changed = event.path.canonicalize().ok();
 
                 match (&changed, &cfg_p) {
@@ -305,7 +347,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         reload::handle_config_reload(
                             &event.path,
                             &cfg,
-                            &apikeys,
                             &manager,
                             &stats,
                             &peers,
@@ -347,30 +388,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     mqtt_ctl.apply(&c).await;
                 }
 
-                // If a config reload changed the apikeys path or the key
-                // file set, rebuild the watcher to follow the new files
-                // (replacing the handle drops the old watcher).
-                let (current_apikeys, current_keyfiles) = {
+                // If a config reload changed the key file set, rebuild the
+                // watcher to follow the new files (replacing the handle drops
+                // the old watcher).  The apikeys path is fixed at startup, so
+                // it never enters this comparison.
+                let current_keyfiles = {
                     let c = cfg.read().await;
-                    (
-                        c.apikeys_file.clone(),
-                        c.key_files.values().cloned().collect::<Vec<_>>(),
-                    )
+                    c.key_files.values().cloned().collect::<Vec<_>>()
                 };
-                if current_apikeys != watched_apikeys || current_keyfiles != watched_keyfiles {
-                    let mut paths = vec![config_path.clone(), current_apikeys.clone()];
+                if current_keyfiles != watched_keyfiles {
+                    let mut paths = vec![config_path.clone()];
+                    if let Some(path) = &apikeys_path {
+                        paths.push(path.clone());
+                    }
                     paths.extend(current_keyfiles.clone());
                     match watcher::watch_paths(paths, watcher_tx.clone(), Duration::from_secs(2))
                         .await
                     {
                         Ok(wh) => {
                             info!(
-                                "watch set changed — now following apikeys {} and {} key file(s)",
-                                current_apikeys.display(),
+                                "watch set changed — now following {} key file(s)",
                                 current_keyfiles.len()
                             );
                             *watch_handle.lock().await = Some(wh);
-                            watched_apikeys = current_apikeys;
                             watched_keyfiles = current_keyfiles;
                         }
                         Err(e) => {

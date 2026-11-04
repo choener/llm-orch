@@ -5372,7 +5372,6 @@ mod tests {
     const TEST_CONFIG_YAML: &str = r#"
 server:
   drain_idle_timeout_secs: 60
-apikeys_file: apikeys.txt
 models:
   - name: m
     context_length: 4096
@@ -5412,7 +5411,6 @@ models:
     const AUTOSCALE_CONFIG_YAML: &str = r#"
 server:
   drain_idle_timeout_secs: 60
-apikeys_file: apikeys.txt
 models:
   - name: m
     context_length: 4096
@@ -6562,7 +6560,6 @@ models:
 
     const TEST_CONFIG_YAML_B: &str = r#"
 server: {}
-apikeys_file: apikeys.txt
 models:
   - name: n
     context_length: 4096
@@ -6728,7 +6725,6 @@ models:
 
         let yaml = r#"
 server: {}
-apikeys_file: apikeys.txt
 models:
   - name: m
     context_length: 4096
@@ -6755,7 +6751,6 @@ models:
         // instantly-failing "true" command produces).
         let yaml = r#"
 server: {}
-apikeys_file: apikeys.txt
 models:
   - name: m
     context_length: 4096
@@ -6848,7 +6843,6 @@ models:
         // ensure_instance must report Unavailable (not park on a queue).
         let yaml = r#"
 server: {}
-apikeys_file: apikeys.txt
 models:
   - name: m
     context_length: 4096
@@ -7118,7 +7112,6 @@ models:
 
     const MULTI_GPU_YAML: &str = r#"
 server: {}
-apikeys_file: apikeys.txt
 devices:
   vulkan:
     0: "0000:01:00.0"
@@ -7137,7 +7130,6 @@ models:
 
     const MIGRATION_VICTIM_YAML: &str = r#"
 server: {}
-apikeys_file: apikeys.txt
 devices:
   vulkan:
     0: "0000:01:00.0"
@@ -7179,7 +7171,6 @@ models:
 
     const MIGRATION_PLAN_YAML: &str = r#"
 server: {}
-apikeys_file: apikeys.txt
 devices:
   vulkan:
     0: "0000:01:00.0"
@@ -7780,7 +7771,6 @@ models:
 
     const ROCM_GPU_YAML: &str = r#"
 server: {}
-apikeys_file: apikeys.txt
 devices:
   rocm:
     0: "0000:0a:00.0"
@@ -7861,7 +7851,6 @@ models:
     async fn rocm_and_vulkan_share_vram_accounting_by_pci_slot() {
         let yaml = r#"
 server: {}
-apikeys_file: apikeys.txt
 devices:
   vulkan:
     0: "0000:0a:00.0"
@@ -7905,7 +7894,6 @@ models:
 
     const CUDA_GPU_YAML: &str = r#"
 server: {}
-apikeys_file: apikeys.txt
 devices:
   cuda:
     0:
@@ -8014,7 +8002,6 @@ models:
         // use static vram_mb totals from devices.cuda.
         let yaml = r#"
 server: {}
-apikeys_file: apikeys.txt
 devices:
   cuda:
     0:
@@ -8071,7 +8058,6 @@ models:
         // Metrics report 48 GB but vram_mb caps usable capacity at 24 GB.
         let yaml = r#"
 server: {}
-apikeys_file: apikeys.txt
 devices:
   cuda:
     0:
@@ -8103,7 +8089,6 @@ models:
     async fn cuda_device_without_metrics_or_static_vram_is_unusable() {
         let yaml = r#"
 server: {}
-apikeys_file: apikeys.txt
 devices:
   cuda:
     0:
@@ -8131,7 +8116,6 @@ models:
         // enable placement.
         let yaml = r#"
 server: {}
-apikeys_file: apikeys.txt
 devices:
   vulkan:
     0: "0000:00:02.0"
@@ -8188,7 +8172,6 @@ models:
         // silently oversubscribed.
         let yaml = r#"
 server: {}
-apikeys_file: apikeys.txt
 devices:
   vulkan:
     0: "0000:00:02.0"
@@ -8320,7 +8303,6 @@ models:
         let yaml = r#"
 server:
   drain_idle_timeout_secs: 60
-apikeys_file: apikeys.txt
 models:
   - name: m
     context_length: 4096
@@ -8359,7 +8341,6 @@ models:
         // resolving the receiver.
         let yaml = r#"
 server: {}
-apikeys_file: apikeys.txt
 models:
   - name: m
     context_length: 4096
@@ -8419,7 +8400,6 @@ models:
     /// Two spawn-failing models (`true` exits instantly), no device pools.
     const TWO_MODEL_YAML: &str = r#"
 server: {}
-apikeys_file: apikeys.txt
 models:
   - name: m1
     context_length: 4096
@@ -8442,7 +8422,6 @@ models:
     /// `dense` can still spawn on the free GPU 2.
     const MAKEROOM_YAML: &str = r#"
 server: {}
-apikeys_file: apikeys.txt
 devices:
   vulkan:
     0: "0000:01:00.0"

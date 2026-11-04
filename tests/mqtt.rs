@@ -108,13 +108,11 @@ fn write_config(dir: &Path, broker_port: u16) -> PathBuf {
     std::fs::write(
         &path,
         format!(
-            "server:\n  listen: \"127.0.0.1:0\"\napikeys_file: \"{}\"\nnode_name: testnode\nstats:\n  file: \"{}\"\nmqtt:\n  broker: \"127.0.0.1:{broker_port}\"\n  prefix: llmtest\n  interval: 60\n",
-            dir.join("apikeys.txt").display(),
+            "server:\n  listen: \"127.0.0.1:0\"\nnode_name: testnode\nstats:\n  file: \"{}\"\nmqtt:\n  broker: \"127.0.0.1:{broker_port}\"\n  prefix: llmtest\n  interval: 60\n",
             dir.join("stats.json").display(),
         ),
     )
     .unwrap();
-    std::fs::write(dir.join("apikeys.txt"), "").ok();
     path
 }
 
@@ -242,13 +240,9 @@ async fn mqtt_disabled_without_config_section() {
     let path = dir.join("config.yaml");
     std::fs::write(
         &path,
-        format!(
-            "server:\n  listen: \"127.0.0.1:0\"\napikeys_file: \"{}\"\nnode_name: testnode\n",
-            dir.join("apikeys.txt").display()
-        ),
+        "server:\n  listen: \"127.0.0.1:0\"\nnode_name: testnode\n",
     )
     .unwrap();
-    std::fs::write(dir.join("apikeys.txt"), "").ok();
     let cfg = config::Config::load(&path).unwrap();
 
     let (gpu_reader, _gpu_task) = gpu::GpuReader::start(Duration::from_secs(3600));

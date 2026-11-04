@@ -10,11 +10,14 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 /// Atomic config reload: validate first, swap only on success.
+///
+/// The apikeys store is *not* touched here: its path is fixed at startup
+/// (`--apikeyfile`) so a config edit can never redirect authentication, and
+/// the file itself is hot-reloaded by `handle_apikeys_reload`.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_config_reload(
     path: &std::path::Path,
     cfg: &Arc<RwLock<config::Config>>,
-    apikeys: &Arc<RwLock<apikeys::ApikeysStore>>,
     manager: &Arc<scheduler::InstanceManager>,
     stats: &Arc<stats::StatsStore>,
     peers: &Arc<peers::PeerRegistry>,
@@ -36,7 +39,6 @@ pub async fn handle_config_reload(
     info!("config file changed, reloading…");
     match config::Config::load(path) {
         Ok(new_cfg) => {
-            // Reload apikeys if the path changed.
             {
                 let old = cfg.read().await;
                 if new_cfg.server.listen != old.server.listen {
@@ -45,18 +47,6 @@ pub async fn handle_config_reload(
                         new = %new_cfg.server.listen,
                         "server.listen changed — requires a restart, keeping the old listener"
                     );
-                }
-                if new_cfg.apikeys_file != old.apikeys_file {
-                    match apikeys::ApikeysStore::load(&new_cfg.apikeys_file) {
-                        Ok(new_keys) => {
-                            info!("apikeys reloaded: {} key(s)", new_keys.len());
-                            *apikeys.write().await = new_keys;
-                        }
-                        Err(e) => {
-                            error!("apikeys reload failed (keeping old): {}", e);
-                            return;
-                        }
-                    }
                 }
             }
 

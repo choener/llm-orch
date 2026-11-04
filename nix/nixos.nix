@@ -113,13 +113,33 @@ in
         service user (see {option}`services.llm-orch.user`); world-readable
         is fine.
 
-        The apikeys file referenced by `apikeys_file` inside the config must
-        be owned by the service user and readable by no one else (mode 0400
-        or 0600). Relative paths inside the config are resolved against the
-        state directory, `/var/lib/llm-orch`.
+        Relative paths inside the config are resolved against the state
+        directory, `/var/lib/llm-orch`. The config deliberately does not say
+        where API keys come from — see {option}`services.llm-orch.apikeysFile`
+        — so this file can be handed to a wider group of editors without
+        letting them redirect authentication.
 
-        Both files are hot-reloaded at runtime; replace them atomically
-        (write to a temp file, then `mv`) so the watcher fires reliably.
+        The file is hot-reloaded at runtime; replace it atomically (write to a
+        temp file, then `mv`) so the watcher fires reliably.
+      '';
+    };
+
+    apikeysFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = "/var/lib/llm-orch/apikeys.txt";
+      example = lib.literalExpression ''"/run/secrets/llm-orch-apikeys"'';
+      description = ''
+        Path to the API keys file, passed to llm-orch as `--apikeyfile`.
+        It lives outside the config on purpose: whoever may edit
+        {option}`configFile` must not be able to point authentication at a
+        file of their own.
+
+        The file must be owned by the service user and readable by no one
+        else (mode 0400 or 0600); one `label: key` per line. Its *contents*
+        are hot-reloaded, its path is fixed for the lifetime of the service.
+
+        Set to `null` to run without any keys — llm-orch is default-deny, so
+        every request is rejected.
       '';
     };
 
@@ -279,12 +299,14 @@ in
       serviceConfig = {
         User = cfg.user;
         Group = cfg.group;
-        ExecStart = "${lib.getExe cfg.package} --config ${cfg.configFile}";
+        ExecStart = "${lib.getExe cfg.package} --config ${cfg.configFile}${
+          lib.optionalString (cfg.apikeysFile != null) " --apikeyfile ${cfg.apikeysFile}"
+        }";
         Restart = "on-failure";
         RestartSec = 5;
 
-        # Relative paths in the config (e.g. apikeys_file: "apikeys.txt")
-        # resolve against this directory. Owned by the service user.
+        # Relative paths in the config (e.g. a relative stats file) resolve
+        # against this directory. Owned by the service user.
         StateDirectory = "llm-orch";
         WorkingDirectory = "/var/lib/llm-orch";
 

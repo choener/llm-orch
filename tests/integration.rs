@@ -34,7 +34,7 @@ fn write_config(dir: &Path, listen_port: u16, models_yaml: &str) -> PathBuf {
     // idle_ttl is only a make-room protection window now); test servers
     // must reap idle instances quickly.
     let config_yaml = format!(
-        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\napikeys_file: \"apikeys.txt\"\n{models_yaml}"
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\n{models_yaml}"
     );
     let path = dir.join("config.yaml");
     std::fs::write(&path, config_yaml).unwrap();
@@ -77,7 +77,7 @@ async fn boot_from_config_path(
 ) -> TestServer {
     std::fs::write(dir.join("apikeys.txt"), apikeys_contents).unwrap();
     let cfg = config::Config::load(config_path).unwrap();
-    let keys = apikeys::ApikeysStore::load(&cfg.apikeys_file)
+    let keys = apikeys::ApikeysStore::load(&dir.join("apikeys.txt"))
         .unwrap_or_else(|_| apikeys::ApikeysStore::empty());
 
     let (gpu_reader, _gpu_task) = gpu::GpuReader::start(Duration::from_secs(5));
@@ -229,7 +229,7 @@ async fn queued_stream_emits_sse_comment_before_assignment() {
     std::fs::write(dir.join("apikeys.txt"), "tester: secret-key\n").unwrap();
 
     let cfg = config::Config::load(&config_path).unwrap();
-    let keys = apikeys::ApikeysStore::load(&cfg.apikeys_file).unwrap();
+    let keys = apikeys::ApikeysStore::load(&dir.join("apikeys.txt")).unwrap();
     let (gpu_reader, _gpu_task) = gpu::GpuReader::start(Duration::from_secs(5));
     let gpu_snapshot = gpu_reader.snapshot_arc();
     let (manager, release_rx, crash_rx) =
@@ -1070,7 +1070,6 @@ async fn reload_rejects_bad_config_and_keeps_serving_old() {
     reload::handle_config_reload(
         &config_path,
         &srv.config,
-        &srv.apikeys,
         &srv.manager,
         &srv.stats,
         &srv.peers,
@@ -1104,7 +1103,6 @@ async fn reload_rejects_bad_config_and_keeps_serving_old() {
     reload::handle_config_reload(
         &config_path,
         &srv.config,
-        &srv.apikeys,
         &srv.manager,
         &srv.stats,
         &srv.peers,
@@ -1127,7 +1125,6 @@ async fn reload_rejects_bad_config_and_keeps_serving_old() {
     reload::handle_config_reload(
         &config_path,
         &srv.config,
-        &srv.apikeys,
         &srv.manager,
         &srv.stats,
         &srv.peers,
@@ -1138,6 +1135,79 @@ async fn reload_rejects_bad_config_and_keeps_serving_old() {
     let cfg = srv.config.read().await;
     assert_eq!(cfg.server.queue_heartbeat_secs, 10);
     assert_eq!(cfg.models[0].max_concurrent, 8);
+}
+
+#[tokio::test]
+async fn apikeys_rotate_but_config_cannot_retarget_auth() {
+    let dir = temp_dir("akreload");
+    let srv = boot(&dir, "tester: secret-key\n", &models_yaml("", 60)).await;
+    let keys_path = dir.join("apikeys.txt");
+    let config_path = dir.join("config.yaml");
+    let client = reqwest::Client::new();
+
+    let models_req = |key: String| {
+        let client = client.clone();
+        let url = format!("{}/v1/models", srv.url);
+        async move {
+            client
+                .get(&url)
+                .bearer_auth(key)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    assert_eq!(models_req("rotated-key".into()).await, 401);
+
+    // Rotating the apikeys file (atomically, as the docs recommend) is
+    // hot-reloaded without a restart.
+    let tmp = dir.join("apikeys.txt.tmp");
+    std::fs::write(&tmp, "tester: secret-key\nops: rotated-key\n").unwrap();
+    std::fs::rename(&tmp, &keys_path).unwrap();
+    let last_ak_mtime = Arc::new(Mutex::new(None));
+    reload::handle_apikeys_reload(&keys_path, &srv.apikeys, &last_ak_mtime).await;
+    assert_eq!(
+        models_req("rotated-key".into()).await,
+        200,
+        "a rotated key must be accepted"
+    );
+
+    // The point of --apikeyfile: a config edit can no longer point auth at a
+    // key file of the editor's choosing. `apikeys_file` is not a config field
+    // anymore, so the *whole* config is rejected (atomic reload) and the
+    // attacker's key never becomes valid.
+    std::fs::write(dir.join("evil.txt"), "evil: evil-key\n").unwrap();
+    std::fs::write(
+        &config_path,
+        format!(
+            "{}apikeys_file: {}\n",
+            std::fs::read_to_string(&config_path).unwrap(),
+            dir.join("evil.txt").display()
+        ),
+    )
+    .unwrap();
+    let last_mtime = Arc::new(Mutex::new(None));
+    reload::handle_config_reload(
+        &config_path,
+        &srv.config,
+        &srv.manager,
+        &srv.stats,
+        &srv.peers,
+        &srv.mqtt,
+        &last_mtime,
+    )
+    .await;
+    assert_eq!(
+        models_req("evil-key".into()).await,
+        401,
+        "a config edit must not be able to introduce keys"
+    );
+    assert_eq!(
+        models_req("rotated-key".into()).await,
+        200,
+        "the rejected config must leave the running one in place"
+    );
 }
 
 // ── --check-config ───────────────────────────────────────────────────────────
@@ -1153,6 +1223,55 @@ fn check_config_exits_zero_on_valid_nonzero_on_invalid() {
         .output()
         .unwrap();
     assert!(ok.status.success(), "valid config must exit 0: {:?}", ok);
+
+    // --apikeyfile is validated too, so CI catches a missing or malformed
+    // key file (at runtime the same problem only fail-closes, with a warning).
+    std::fs::write(dir.join("apikeys.txt"), "tester: secret-key\n").unwrap();
+    let with_keys = std::process::Command::new(ORCH_BIN)
+        .arg("--check-config")
+        .arg(&config_path)
+        .arg("--apikeyfile")
+        .arg(dir.join("apikeys.txt"))
+        .output()
+        .unwrap();
+    assert!(
+        with_keys.status.success(),
+        "valid key file must pass: {:?}",
+        with_keys
+    );
+    let missing_keys = std::process::Command::new(ORCH_BIN)
+        .arg("--check-config")
+        .arg(&config_path)
+        .arg("--apikeyfile")
+        .arg(dir.join("nope.txt"))
+        .output()
+        .unwrap();
+    assert!(
+        !missing_keys.status.success(),
+        "a missing key file must fail the check"
+    );
+
+    // The removed `apikeys_file` config field must fail loudly, not be
+    // silently ignored.
+    let stale = format!(
+        "{}apikeys_file: apikeys.txt\n",
+        std::fs::read_to_string(&config_path).unwrap()
+    );
+    std::fs::write(&config_path, stale).unwrap();
+    let stale_field = std::process::Command::new(ORCH_BIN)
+        .arg("--check-config")
+        .arg(&config_path)
+        .output()
+        .unwrap();
+    assert!(
+        !stale_field.status.success(),
+        "a config still setting apikeys_file must be rejected"
+    );
+    assert!(
+        String::from_utf8_lossy(&stale_field.stderr).contains("apikeys_file"),
+        "the error must name the removed field"
+    );
+    let config_path = write_config(&dir, free_port(), &models_yaml("", 60));
 
     std::fs::write(&config_path, "models: not-a-list\n").unwrap();
     let bad = std::process::Command::new(ORCH_BIN)
@@ -1219,6 +1338,8 @@ async fn sigterm_with_inflight_stream_exits_cleanly() {
     let mut child = tokio::process::Command::new(ORCH_BIN)
         .arg("--config")
         .arg(&config_path)
+        .arg("--apikeyfile")
+        .arg(dir.join("apikeys.txt"))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(stdout))
         .stderr(std::process::Stdio::null())
@@ -1597,7 +1718,7 @@ fn real_drm_slots() -> Vec<String> {
 /// the 90 GB target fits only after one resident model is migrated.
 fn migration_cuda_yaml(listen_port: u16, slots: &[String]) -> String {
     format!(
-        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  queue_wait_timeout_secs: 20\n  queue_heartbeat_secs: 1\n  migration_timeout_secs: 15\napikeys_file: \"apikeys.txt\"\ndevices:\n  cuda:\n    0:\n      pci: \"{}\"\n      vram_mb: 100000\n    1:\n      pci: \"{}\"\n      vram_mb: 100000\nmodels:\n  - name: m1\n    context_length: 4096\n    cmd: \"{STUB_BIN} --port {{port}} --chunks 60 --chunk-delay-ms 50\"\n    max_instances: 1\n    max_concurrent: 1\n    vram: 30000\n    cuda_devices: [0, 1]\n  - name: m2\n    context_length: 4096\n    cmd: \"{STUB_BIN} --port {{port}} --chunks 60 --chunk-delay-ms 50\"\n    max_instances: 1\n    max_concurrent: 1\n    vram: 30000\n    cuda_devices: [0, 1]\n  - name: large\n    context_length: 4096\n    cmd: \"{STUB_BIN} --port {{port}}\"\n    max_instances: 1\n    max_concurrent: 1\n    vram: 90000\n    cuda_devices: [0, 1]\naliases:\n  - name: preferred\n    targets: [large]\n    policy: prefer_order\n    make_room: migrate\n",
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  queue_wait_timeout_secs: 20\n  queue_heartbeat_secs: 1\n  migration_timeout_secs: 15\ndevices:\n  cuda:\n    0:\n      pci: \"{}\"\n      vram_mb: 100000\n    1:\n      pci: \"{}\"\n      vram_mb: 100000\nmodels:\n  - name: m1\n    context_length: 4096\n    cmd: \"{STUB_BIN} --port {{port}} --chunks 60 --chunk-delay-ms 50\"\n    max_instances: 1\n    max_concurrent: 1\n    vram: 30000\n    cuda_devices: [0, 1]\n  - name: m2\n    context_length: 4096\n    cmd: \"{STUB_BIN} --port {{port}} --chunks 60 --chunk-delay-ms 50\"\n    max_instances: 1\n    max_concurrent: 1\n    vram: 30000\n    cuda_devices: [0, 1]\n  - name: large\n    context_length: 4096\n    cmd: \"{STUB_BIN} --port {{port}}\"\n    max_instances: 1\n    max_concurrent: 1\n    vram: 90000\n    cuda_devices: [0, 1]\naliases:\n  - name: preferred\n    targets: [large]\n    policy: prefer_order\n    make_room: migrate\n",
         slots[0], slots[1]
     )
 }
@@ -1798,7 +1919,6 @@ async fn alias_targets_hot_reloaded() {
     reload::handle_config_reload(
         &config_path,
         &srv.config,
-        &srv.apikeys,
         &srv.manager,
         &srv.stats,
         &srv.peers,
@@ -2189,7 +2309,7 @@ async fn sd_passthrough_backend_failure_is_bad_gateway() {
     let listen_port = free_port();
     let models = sd_models_yaml_flags(60, " --fail-status 500");
     let cfg_yaml = format!(
-        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  default_diffusion_model: \"sd-m\"\napikeys_file: \"apikeys.txt\"\n{models}",
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  default_diffusion_model: \"sd-m\"\n{models}",
     );
     let config_path = dir.join("config.yaml");
     std::fs::write(&config_path, cfg_yaml).unwrap();
@@ -2250,7 +2370,7 @@ async fn sd_video_generation_polls_through_an_unreachable_but_alive_backend() {
     // pending, so llm-orch is mid-poll when the backend goes deaf.
     let models = sd_models_yaml_flags(60, " --job-pending-secs 30 --stop-serving-after 1");
     let cfg_yaml = format!(
-        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\n  backend_total_timeout_secs: 4\napikeys_file: \"apikeys.txt\"\n{models}",
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\n  backend_total_timeout_secs: 4\n{models}",
     );
     let config_path = dir.join("config.yaml");
     std::fs::write(&config_path, cfg_yaml).unwrap();
@@ -2294,7 +2414,7 @@ async fn sd_video_generation_aborts_when_backend_process_exits() {
     let listen_port = free_port();
     let models = sd_models_yaml_flags(60, " --job-pending-secs 30 --exit-after 1");
     let cfg_yaml = format!(
-        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\n  backend_total_timeout_secs: 120\napikeys_file: \"apikeys.txt\"\n{models}",
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\n  backend_total_timeout_secs: 120\n{models}",
     );
     let config_path = dir.join("config.yaml");
     std::fs::write(&config_path, cfg_yaml).unwrap();
@@ -2388,7 +2508,7 @@ async fn sd_passthrough_sdapi_txt2img() {
     let listen_port = free_port();
     let models = sd_models_yaml(60);
     let cfg_yaml = format!(
-        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\n  default_diffusion_model: \"sd-m\"\napikeys_file: \"apikeys.txt\"\n{models}",
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\n  default_diffusion_model: \"sd-m\"\n{models}",
     );
     let config_path = dir.join("config.yaml");
     std::fs::write(&config_path, cfg_yaml).unwrap();
@@ -2417,7 +2537,7 @@ async fn sd_passthrough_sdcpp_vid_gen() {
     let listen_port = free_port();
     let models = sd_models_yaml(60);
     let cfg_yaml = format!(
-        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\n  default_diffusion_model: \"sd-m\"\napikeys_file: \"apikeys.txt\"\n{models}",
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\n  default_diffusion_model: \"sd-m\"\n{models}",
     );
     let config_path = dir.join("config.yaml");
     std::fs::write(&config_path, cfg_yaml).unwrap();
@@ -2445,7 +2565,7 @@ async fn sd_passthrough_default_diffusion_fallback() {
     let listen_port = free_port();
     let models = sd_models_yaml(60);
     let cfg_yaml = format!(
-        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\n  default_diffusion_model: \"sd-m\"\napikeys_file: \"apikeys.txt\"\n{models}",
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\n  default_diffusion_model: \"sd-m\"\n{models}",
     );
     let config_path = dir.join("config.yaml");
     std::fs::write(&config_path, cfg_yaml).unwrap();
@@ -2471,7 +2591,7 @@ async fn sd_passthrough_x_llm_model_header() {
     let listen_port = free_port();
     let models = sd_models_yaml(60);
     let cfg_yaml = format!(
-        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\napikeys_file: \"apikeys.txt\"\n{models}",
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\n{models}",
     );
     let config_path = dir.join("config.yaml");
     std::fs::write(&config_path, cfg_yaml).unwrap();
@@ -2504,7 +2624,7 @@ async fn sd_passthrough_missing_model_returns_400() {
     let listen_port = free_port();
     let models = sd_models_yaml(60);
     let cfg_yaml = format!(
-        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\napikeys_file: \"apikeys.txt\"\n{models}",
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\n{models}",
     );
     let config_path = dir.join("config.yaml");
     std::fs::write(&config_path, cfg_yaml).unwrap();
@@ -2695,7 +2815,7 @@ async fn remote_model_forwards_and_injects_resolved_auth() {
 
     let listen_port = free_port();
     let config_yaml = format!(
-        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\napikeys_file: \"apikeys.txt\"\n{}",
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\n{}",
         remote_model_yaml(port, &key_path.display().to_string())
     );
     let config_path = dir.join("config.yaml");
@@ -2783,7 +2903,7 @@ async fn remote_model_down_fails_fast_then_recovers() {
     let dead_port = free_port();
     let listen_port = free_port();
     let config_yaml = format!(
-        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\napikeys_file: \"apikeys.txt\"\n{}",
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\n{}",
         remote_model_yaml_queue0(dead_port, &key_path.display().to_string())
     );
     let config_path = dir.join("config.yaml");
@@ -2859,7 +2979,7 @@ async fn remote_model_without_remote_auth_sends_no_header() {
     // Remote model with a configured key file but *no* `remote_auth`:
     // the stub must see no Authorization header at all.
     let config_yaml = format!(
-        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\napikeys_file: \"apikeys.txt\"\nkey_files:\n  deploy_key: \"{key}\"\nmodels:\n  - name: r\n    context_length: 4096\n    cmd: \"http://127.0.0.1:{port}\"\n    max_instances: 1\n",
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\nkey_files:\n  deploy_key: \"{key}\"\nmodels:\n  - name: r\n    context_length: 4096\n    cmd: \"http://127.0.0.1:{port}\"\n    max_instances: 1\n",
         key = key_path.display()
     );
     let config_path = dir.join("config.yaml");
@@ -2908,7 +3028,7 @@ async fn boot_with_stats(dir: &Path, models_yaml: &str) -> (TestServer, PathBuf)
     let listen_port = free_port();
     let stats_file = dir.join("stats.json");
     let config_yaml = format!(
-        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\napikeys_file: \"apikeys.txt\"\nstats:\n  file: \"{}\"\n{models_yaml}",
+        "server:\n  listen: \"127.0.0.1:{listen_port}\"\n  port_range: \"ephemeral\"\n  drain_idle_timeout_secs: 1\nstats:\n  file: \"{}\"\n{models_yaml}",
         stats_file.display()
     );
     let config_path = dir.join("config.yaml");
@@ -3042,7 +3162,6 @@ async fn stats_hot_reload_retargers_file() {
     reload::handle_config_reload(
         &config_path,
         &srv.config,
-        &srv.apikeys,
         &srv.manager,
         &srv.stats,
         &srv.peers,
@@ -3075,7 +3194,7 @@ async fn stats_config_validation() {
 
     // Missing parent directory → rejected at config load.
     let bad = format!(
-        "server:\n  listen: \"127.0.0.1:{}\"\n  port_range: \"ephemeral\"\napikeys_file: \"apikeys.txt\"\nstats:\n  file: \"no-such-dir/stats.json\"\n",
+        "server:\n  listen: \"127.0.0.1:{}\"\n  port_range: \"ephemeral\"\nstats:\n  file: \"no-such-dir/stats.json\"\n",
         free_port()
     );
     let bad_path = dir.join("bad-config.yaml");

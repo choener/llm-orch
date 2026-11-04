@@ -816,7 +816,6 @@ mod tests {
         let yaml = format!(
             r#"
 server: {{}}
-apikeys_file: apikeys.txt
 node_name: {}
 "#,
             node.unwrap_or("~")

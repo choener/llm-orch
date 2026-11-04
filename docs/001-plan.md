@@ -4,8 +4,11 @@ software; not a multi-tenant enterprise product.
 # Core
 
 - Default-deny access with apikeys. If no apikeys are configured, deny all access.
-  - Apikeys live in a separate file referenced from the main config (`apikeys_file: ...`).
-    The file is user-editable at runtime and is hot-reloaded just like the main config.
+  - Apikeys live in a separate file whose path is given on the command line
+    (`llm-orch --apikeyfile path`), *not* in the main config: whoever may edit
+    `config.yaml` must not be able to redirect authentication to their own key
+    file. The file is user-editable at runtime and is hot-reloaded just like the
+    main config (only its path is fixed at startup).
   - At minimum: one apikey per line, optional label/comment. Revocation = delete the line.
 - Hot-reload configuration. On config change (main config *or* apikeys file), reload
   without dropping in-flight requests. Config format is YAML (chosen for comments).

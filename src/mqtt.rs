@@ -579,7 +579,6 @@ mod tests {
             r#"
 server:
   listen: "127.0.0.1:0"
-apikeys_file: /dev/null
 {yaml_extra}
 "#
         );

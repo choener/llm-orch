@@ -46,7 +46,7 @@ Edit `config.yaml` to point to your model files and define your GPU layout. Make
 ### 3. Run
 Start the orchestrator:
 ```bash
-./target/release/llm-orch --config config.yaml
+./target/release/llm-orch --config config.yaml --apikeyfile apikeys.txt
 ```
 
 ### 4. Use
@@ -63,6 +63,24 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 ## ⚙️ Configuration Deep Dive
+
+### API keys
+
+Authentication is a file of `label: key` lines whose path is given on the
+command line, **not** in `config.yaml`:
+
+```bash
+llm-orch --config config.yaml --apikeyfile /etc/llm-orch/apikeys.txt   # -k works too
+```
+
+Keeping the *location* outside the config is deliberate: `config.yaml` is the
+file administrators hand to model operators, and whoever could set
+`apikeys_file` there could point authentication at their own key list. With
+`--apikeyfile` the path is fixed by the (root-owned) service definition, so
+config editors can add models but not forge keys. Relative paths resolve
+against the working directory. The file's *contents* are still hot-reloaded;
+only the path is fixed. Omit the flag entirely and llm-orch stays
+default-deny: every request is rejected.
 
 ### Models
 In `config.yaml`, each model definition controls its lifecycle:
@@ -489,6 +507,7 @@ The module automatically uses the flake's own build of llm-orch; override with `
 | `enable` | `false` | Enable the llm-orch service. |
 | `package` | this flake's build | The llm-orch package to run. |
 | `configFile` | — (required) | Path to `config.yaml`; hot-reloaded at runtime. |
+| `apikeysFile` | `"/var/lib/llm-orch/apikeys.txt"` | Path passed as `--apikeyfile`. Deliberately outside the config so a `config.yaml` editor cannot redirect authentication. `null` runs default-deny (all requests rejected). |
 | `user` / `group` | `"llm-orch"` | Account to run under. The default is created as a system user with `video`/`render` group membership for GPU access. Set to your own user if your model files are owned by it. |
 | `llamaPackage` | `pkgs.llama-cpp` | Provides `llama-server` on the service PATH. Set to `null` to opt out. |
 | `extraPackages` | `[]` | Additional packages on the service PATH (available to model `cmd`s and keep-alive hooks). |
@@ -538,8 +557,8 @@ those mappings and performs the required storage migration before the load.
 The service reads its files directly (hot-reload requires this), so ownership matters:
 
 - **Config file**: owned by the service user, may be world-readable (e.g. `0644 llm-orch:llm-orch`).
-- **Apikeys file** (path set via `apikeys_file` in the config): owned by the service user, readable by **no one else** (`0400` or `0600`).
-- Relative paths in the config (like `apikeys_file: "apikeys.txt"`) resolve against the state directory `/var/lib/llm-orch`, which the module creates owned by the service user.
+- **Apikeys file** (path set via `services.llm-orch.apikeysFile`, passed as `--apikeyfile`): owned by the service user, readable by **no one else** (`0400` or `0600`). Its location is not expressible in `config.yaml`, so handing out write access to the config does not hand out the ability to forge keys.
+- Relative paths in the config (like a relative `stats.file`) resolve against the state directory `/var/lib/llm-orch`, which the module creates owned by the service user.
 - Replace both files **atomically** (write temp file, then `mv`) so the hot-reload watcher fires reliably.
 
 ### Hardening notes
@@ -578,3 +597,6 @@ containers.
   ```bash
   ./target/release/llm-orch --check-config config.yaml
   ```
+  Add `--apikeyfile` to validate the key file as well; at check time a
+  missing or malformed key file is a hard error (at startup it only
+  fail-closes, with a warning).

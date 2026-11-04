@@ -24,7 +24,15 @@ pub enum ConfigError {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
-    pub apikeys_file: PathBuf,
+
+    /// **Removed.** The apikeys file is given on the command line
+    /// (`llm-orch --apikeyfile <path>`) instead of here: whoever is allowed
+    /// to edit `config.yaml` must not be able to redirect authentication to
+    /// a file of their own choosing.  The field is kept purely so a stale
+    /// config fails loudly at load (see [`Config::validate`]) instead of
+    /// being silently ignored.
+    #[serde(default)]
+    pub apikeys_file: Option<PathBuf>,
 
     /// Named `{key}` → value fragments substituted into model `cmd` fields.
     #[serde(default)]
@@ -80,13 +88,7 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let contents = std::fs::read_to_string(path)?;
         let mut config: Self = serde_yaml_ng::from_str(&contents)?;
-        // Resolve relative apikeys_file against the config file's directory.
-        if config.apikeys_file.is_relative()
-            && let Some(parent) = path.parent()
-        {
-            config.apikeys_file = parent.join(&config.apikeys_file);
-        }
-        // Resolve a relative stats file the same way.
+        // Resolve a relative stats file against the config file's directory.
         if let Some(stats) = &mut config.stats
             && stats.file.is_relative()
             && let Some(parent) = path.parent()
@@ -99,6 +101,20 @@ impl Config {
 
     /// Check the configuration for semantic errors beyond YAML parsing.
     fn validate(&self) -> Result<(), ConfigError> {
+        // --- removed apikeys_file ---
+        // Auth location is a deployment concern (CLI), not a config one.
+        // Fail loudly rather than silently ignoring a stale setting.
+        if self.apikeys_file.is_some() {
+            return Err(ConfigError::Validation(
+                "`apikeys_file` has been removed from the config: the apikeys \
+                 file is now given on the command line (`llm-orch --apikeyfile \
+                 <path>`), so editing config.yaml cannot redirect \
+                 authentication. Delete the `apikeys_file:` line and add \
+                 `--apikeyfile` to the service's ExecStart."
+                    .into(),
+            ));
+        }
+
         // --- models ---
         let mut seen_names = HashSet::new();
         for m in &self.models {
@@ -1957,9 +1973,10 @@ fn default_drain_timeout() -> u64 {
 mod tests {
     use super::*;
 
+    /// Minimal valid config.  Its `cmd: "sleep 3600"` line doubles as the
+    /// anchor tests use to append extra top-level sections via `replace`.
     const BASE: &str = r#"
 server: {}
-apikeys_file: apikeys.txt
 models:
   - name: m
     context_length: 4096
@@ -1985,6 +2002,17 @@ models:
     #[test]
     fn base_config_is_valid() {
         parse(BASE).unwrap();
+    }
+
+    #[test]
+    fn rejects_removed_apikeys_file() {
+        // The apikeys location moved to `--apikeyfile` so that editing
+        // config.yaml cannot redirect auth; a stale config must fail loudly
+        // rather than be silently ignored.
+        expect_validation_error(
+            &format!("{BASE}apikeys_file: apikeys.txt\n"),
+            "`apikeys_file` has been removed",
+        );
     }
 
     #[test]
@@ -2122,8 +2150,8 @@ models:
     #[test]
     fn rejects_zero_keepalive_sleep() {
         let yaml = BASE.replace(
-            "apikeys_file: apikeys.txt",
-            "apikeys_file: apikeys.txt\nkeep_alive:\n  amd:\n    cmd: \"true\"\n    sleep: 0",
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\nkeep_alive:\n  amd:\n    cmd: \"true\"\n    sleep: 0",
         );
         expect_validation_error(&yaml, "keep_alive.amd.sleep must be > 0");
     }
@@ -2185,7 +2213,6 @@ models:
         // The offload flag may hide inside a cmd alias.
         let yaml = r#"
 server: {}
-apikeys_file: apikeys.txt
 cmd_aliases:
   llama: |
     llama-server
@@ -2239,7 +2266,6 @@ models:
     fn rejects_device_flag_hidden_in_alias() {
         let yaml = r#"
 server: {}
-apikeys_file: apikeys.txt
 cmd_aliases:
   llama: |
     llama-server
@@ -2259,7 +2285,6 @@ models:
         // `--device` would desync VRAM accounting from the actual spawn.
         let yaml = r#"
 server: {}
-apikeys_file: apikeys.txt
 devices:
   cuda:
     0:
@@ -2431,9 +2456,9 @@ models:
         for placements in ["[[0],[1]]", "[[0,1]]"] {
             let yaml = BASE
                 .replace(
-                    "apikeys_file: apikeys.txt",
+                    "cmd: \"sleep 3600\"",
                     &format!(
-                        "apikeys_file: apikeys.txt\ndevices:\n  vulkan:\n    0: \"{}\"\n    1: \"{}\"",
+                        "cmd: \"sleep 3600\"\ndevices:\n  vulkan:\n    0: \"{}\"\n    1: \"{}\"",
                         slots[0], slots[1]
                     ),
                 )
@@ -2477,9 +2502,9 @@ models:
         }
         let yaml = BASE
             .replace(
-                "apikeys_file: apikeys.txt",
+                "cmd: \"sleep 3600\"",
                 &format!(
-                    "apikeys_file: apikeys.txt\ndevices:\n  vulkan:\n    0: \"{}\"",
+                    "cmd: \"sleep 3600\"\ndevices:\n  vulkan:\n    0: \"{}\"",
                     slots[0]
                 ),
             )
@@ -2494,8 +2519,8 @@ models:
     fn rejects_reserved_cmd_alias_names() {
         for reserved in ["port", "context_length", "max_concurrent", "name"] {
             let yaml = BASE.replace(
-                "apikeys_file: apikeys.txt",
-                &format!("apikeys_file: apikeys.txt\ncmd_aliases:\n  {reserved}: \"x\""),
+                "cmd: \"sleep 3600\"",
+                &format!("cmd: \"sleep 3600\"\ncmd_aliases:\n  {reserved}: \"x\""),
             );
             expect_validation_error(&yaml, &format!("'{reserved}' is a reserved name"));
         }
@@ -2581,9 +2606,9 @@ models:
         }
         let yaml = BASE
             .replace(
-                "apikeys_file: apikeys.txt",
+                "cmd: \"sleep 3600\"",
                 &format!(
-                    "apikeys_file: apikeys.txt\ndevices:\n  rocm:\n    0: \"{}\"",
+                    "cmd: \"sleep 3600\"\ndevices:\n  rocm:\n    0: \"{}\"",
                     slots[0]
                 ),
             )
@@ -2620,9 +2645,9 @@ models:
         }
         let yaml = BASE
             .replace(
-                "apikeys_file: apikeys.txt",
+                "cmd: \"sleep 3600\"",
                 &format!(
-                    "apikeys_file: apikeys.txt\ndevices:\n  rocm:\n    0: \"{}\"",
+                    "cmd: \"sleep 3600\"\ndevices:\n  rocm:\n    0: \"{}\"",
                     slots[0]
                 ),
             )
@@ -2641,9 +2666,9 @@ models:
         }
         let yaml = BASE
             .replace(
-                "apikeys_file: apikeys.txt",
+                "cmd: \"sleep 3600\"",
                 &format!(
-                    "apikeys_file: apikeys.txt\ndevices:\n  rocm:\n    0: \"{}\"\n    1: \"{}\"",
+                    "cmd: \"sleep 3600\"\ndevices:\n  rocm:\n    0: \"{}\"\n    1: \"{}\"",
                     slots[0], slots[1]
                 ),
             )
@@ -2667,9 +2692,9 @@ models:
             return;
         }
         let yaml = BASE.replace(
-            "apikeys_file: apikeys.txt",
+            "cmd: \"sleep 3600\"",
             &format!(
-                "apikeys_file: apikeys.txt\ndevices:\n  rocm:\n    0: \"{0}\"\n    1: \"{0}\"",
+                "cmd: \"sleep 3600\"\ndevices:\n  rocm:\n    0: \"{0}\"\n    1: \"{0}\"",
                 slots[0]
             ),
         );
@@ -2679,8 +2704,8 @@ models:
     #[test]
     fn rejects_non_amd_rocm_slot() {
         let yaml = BASE.replace(
-            "apikeys_file: apikeys.txt",
-            "apikeys_file: apikeys.txt\ndevices:\n  rocm:\n    0: \"0000:ff:ff.f\"",
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\ndevices:\n  rocm:\n    0: \"0000:ff:ff.f\"",
         );
         expect_validation_error(&yaml, "not found as an AMD GPU");
     }
@@ -2711,9 +2736,9 @@ models:
         }
         let yaml = BASE
             .replace(
-                "apikeys_file: apikeys.txt",
+                "cmd: \"sleep 3600\"",
                 &format!(
-                    "apikeys_file: apikeys.txt\ndevices:\n  cuda:\n    0:\n      pci: \"{}\"",
+                    "cmd: \"sleep 3600\"\ndevices:\n  cuda:\n    0:\n      pci: \"{}\"",
                     slots[0]
                 ),
             )
@@ -2732,9 +2757,9 @@ models:
         }
         let yaml = BASE
             .replace(
-                "apikeys_file: apikeys.txt",
+                "cmd: \"sleep 3600\"",
                 &format!(
-                    "apikeys_file: apikeys.txt\ndevices:\n  cuda:\n    0:\n      pci: \"{}\"\n      vram_mb: 24576\n    1:\n      pci: \"{}\"",
+                    "cmd: \"sleep 3600\"\ndevices:\n  cuda:\n    0:\n      pci: \"{}\"\n      vram_mb: 24576\n    1:\n      pci: \"{}\"",
                     slots[0], slots[1]
                 ),
             )
@@ -2755,9 +2780,9 @@ models:
             return;
         }
         let yaml = BASE.replace(
-            "apikeys_file: apikeys.txt",
+            "cmd: \"sleep 3600\"",
             &format!(
-                "apikeys_file: apikeys.txt\ndevices:\n  cuda:\n    0:\n      pci: \"{0}\"\n    1:\n      pci: \"{0}\"",
+                "cmd: \"sleep 3600\"\ndevices:\n  cuda:\n    0:\n      pci: \"{0}\"\n    1:\n      pci: \"{0}\"",
                 slots[0]
             ),
         );
@@ -2771,9 +2796,9 @@ models:
             return; // no DRM cards in this environment
         }
         let yaml = BASE.replace(
-            "apikeys_file: apikeys.txt",
+            "cmd: \"sleep 3600\"",
             &format!(
-                "apikeys_file: apikeys.txt\ndevices:\n  vulkan:\n    0: \"{0}\"\n  cuda:\n    0:\n      pci: \"{0}\"",
+                "cmd: \"sleep 3600\"\ndevices:\n  vulkan:\n    0: \"{0}\"\n  cuda:\n    0:\n      pci: \"{0}\"",
                 drm[0]
             ),
         );
@@ -2783,8 +2808,8 @@ models:
     #[test]
     fn rejects_cuda_slot_not_on_pci_bus() {
         let yaml = BASE.replace(
-            "apikeys_file: apikeys.txt",
-            "apikeys_file: apikeys.txt\ndevices:\n  cuda:\n    0:\n      pci: \"0000:ff:ff.f\"",
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\ndevices:\n  cuda:\n    0:\n      pci: \"0000:ff:ff.f\"",
         );
         expect_validation_error(&yaml, "not found in /sys/bus/pci/devices/");
     }
@@ -2792,8 +2817,8 @@ models:
     #[test]
     fn rejects_empty_keepalive_cmd() {
         let yaml = BASE.replace(
-            "apikeys_file: apikeys.txt",
-            "apikeys_file: apikeys.txt\nkeep_alive:\n  amd:\n    cmd: \"  \"\n    sleep: 5",
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\nkeep_alive:\n  amd:\n    cmd: \"  \"\n    sleep: 5",
         );
         expect_validation_error(&yaml, "keep_alive.amd.cmd must not be empty");
     }
@@ -2803,8 +2828,8 @@ models:
     #[test]
     fn accepts_scalar_target_as_one_element_targets() {
         let yaml = BASE.replace(
-            "apikeys_file: apikeys.txt",
-            "apikeys_file: apikeys.txt\naliases:\n  - name: a\n    target: m",
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\naliases:\n  - name: a\n    target: m",
         );
         let cfg = parse(&yaml).unwrap();
         assert_eq!(cfg.aliases[0].targets, vec!["m".to_owned()]);
@@ -2817,8 +2842,8 @@ models:
     #[test]
     fn accepts_migration_make_room_mode() {
         let yaml = BASE.replace(
-            "apikeys_file: apikeys.txt",
-            "apikeys_file: apikeys.txt\naliases:\n  - name: a\n    targets: [m]\n    make_room: migrate",
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\naliases:\n  - name: a\n    targets: [m]\n    make_room: migrate",
         );
         let cfg = parse(&yaml).unwrap();
         assert_eq!(cfg.aliases[0].make_room, MakeRoomMode::Migrate);
@@ -2828,13 +2853,11 @@ models:
 
     #[test]
     fn accepts_targets_list_with_explicit_settings() {
-        let yaml = BASE.replace(
-            "cmd: \"sleep 3600\"",
-            "cmd: \"sleep 3600\"\n  - name: m2\n    context_length: 4096\n    cmd: \"sleep 3600\"",
-        )
-        .replace(
-            "apikeys_file: apikeys.txt",
-            "apikeys_file: apikeys.txt\naliases:\n  - name: a\n    targets: [m, m2]\n    policy: prefer_order\n    make_room: drain_surplus\n    drain_timeout: 60",
+        // Second model + aliases appended to BASE (BASE's `cmd` line can't
+        // serve as the anchor twice: `replace` would rewrite its own output).
+        let yaml = format!(
+            "{}  - name: m2\n    context_length: 4096\n    cmd: \"sleep 7200\"\naliases:\n  - name: a\n    targets: [m, m2]\n    policy: prefer_order\n    make_room: drain_surplus\n    drain_timeout: 60\n",
+            BASE
         );
         let cfg = parse(&yaml).unwrap();
         let a = &cfg.aliases[0];
@@ -2847,8 +2870,8 @@ models:
     #[test]
     fn rejects_empty_targets_list() {
         let yaml = BASE.replace(
-            "apikeys_file: apikeys.txt",
-            "apikeys_file: apikeys.txt\naliases:\n  - name: a\n    targets: []",
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\naliases:\n  - name: a\n    targets: []",
         );
         expect_validation_error(&yaml, "targets must not be empty");
     }
@@ -2856,8 +2879,8 @@ models:
     #[test]
     fn rejects_unknown_alias_target() {
         let yaml = BASE.replace(
-            "apikeys_file: apikeys.txt",
-            "apikeys_file: apikeys.txt\naliases:\n  - name: a\n    targets: [m, nope]",
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\naliases:\n  - name: a\n    targets: [m, nope]",
         );
         expect_validation_error(&yaml, "alias 'a' targets unknown model 'nope'");
     }
@@ -2865,8 +2888,8 @@ models:
     #[test]
     fn rejects_alias_chaining() {
         let yaml = BASE.replace(
-            "apikeys_file: apikeys.txt",
-            "apikeys_file: apikeys.txt\naliases:\n  - name: a\n    target: m\n  - name: b\n    targets: [a]",
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\naliases:\n  - name: a\n    target: m\n  - name: b\n    targets: [a]",
         );
         expect_validation_error(&yaml, "aliases cannot chain");
     }
@@ -2874,8 +2897,8 @@ models:
     #[test]
     fn rejects_zero_drain_timeout() {
         let yaml = BASE.replace(
-            "apikeys_file: apikeys.txt",
-            "apikeys_file: apikeys.txt\naliases:\n  - name: a\n    target: m\n    drain_timeout: 0",
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\naliases:\n  - name: a\n    target: m\n    drain_timeout: 0",
         );
         expect_validation_error(&yaml, "drain_timeout must be > 0");
     }
@@ -2885,8 +2908,8 @@ models:
         // Old configs with system_prompt / prompt_template keep loading —
         // serde ignores the now-unknown keys.
         let yaml = BASE.replace(
-            "apikeys_file: apikeys.txt",
-            "apikeys_file: apikeys.txt\naliases:\n  - name: a\n    target: m\n    system_prompt: hi\n    prompt_template: \"{prompt}\"",
+            "cmd: \"sleep 3600\"",
+            "cmd: \"sleep 3600\"\naliases:\n  - name: a\n    target: m\n    system_prompt: hi\n    prompt_template: \"{prompt}\"",
         );
         parse(&yaml).unwrap();
     }
@@ -2982,7 +3005,6 @@ models:
         // is different from llama.cpp's --device selector.
         let yaml = r#"
 server: {}
-apikeys_file: apikeys.txt
 models:
   - name: m
     context_length: 4096
@@ -2998,7 +3020,6 @@ models:
         // for having GPU offload flags — it manages its own offload.
         let yaml = r#"
 server: {}
-apikeys_file: apikeys.txt
 models:
   - name: m
     context_length: 4096
@@ -3014,7 +3035,6 @@ models:
         // though no GPU env vars are injected.
         let yaml = r#"
 server: {}
-apikeys_file: apikeys.txt
 models:
   - name: m
     context_length: 4096
@@ -3065,7 +3085,6 @@ models:
         let mut s = String::from(
             r#"
 server: {}
-apikeys_file: apikeys.txt
 models:
   - name: r
     cmd: "https://remote.example.com:8080"
@@ -3084,7 +3103,6 @@ models:
         let cfg = parse(
             r#"
 server: {}
-apikeys_file: apikeys.txt
 models:
   - name: r
     cmd: "https://remote.example.com:8080"
@@ -3114,7 +3132,6 @@ models:
         std::fs::write(&key_path, "sekret-token\n").unwrap();
         let yaml = r#"
 server: {}
-apikeys_file: apikeys.txt
 key_files:
   deploy_key: __KEY_PATH__
 models:
@@ -3195,7 +3212,6 @@ models:
     fn rejects_missing_key_file() {
         let yaml = r#"
 server: {}
-apikeys_file: apikeys.txt
 key_files:
   k: /nonexistent/llm-orch-test-key
 "#;
@@ -3210,7 +3226,6 @@ key_files:
         std::fs::write(&path, "x").unwrap();
         let yaml = r#"
 server: {}
-apikeys_file: apikeys.txt
 key_files:
   port: __KEY_PATH__
 "#
@@ -3235,7 +3250,6 @@ key_files:
         format!(
             r#"
 server: {{}}
-apikeys_file: apikeys.txt
 node_name: cheyenne
 {peers}
 models:

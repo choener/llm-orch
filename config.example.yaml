@@ -68,9 +68,13 @@ server:
 # ---------------------------------------------------------------------------
 # API keys
 # ---------------------------------------------------------------------------
-# Path to the API keys file (one key per line, optional # comment suffix).
-# Hot-reloaded at runtime; changes take effect without restart.
-apikeys_file: "apikeys.txt"
+# Not configured here.  The key file is given on the command line:
+#   llm-orch --config config.yaml --apikeyfile /etc/llm-orch/apikeys.txt
+# Keeping its location out of this file is deliberate: whoever may edit
+# config.yaml must not be able to point authentication at their own keys.
+# The file itself (one `label: key` per line, optional # comment suffix) is
+# hot-reloaded at runtime; only its path is fixed at startup.  Without the
+# flag llm-orch is default-deny and rejects every request.
 
 # ---------------------------------------------------------------------------
 # Key files (remote model authentication)
