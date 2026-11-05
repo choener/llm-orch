@@ -7,6 +7,7 @@ use futures_util::StreamExt;
 use llm_orch::{apikeys, config, debug_log, gpu, reload, scheduler, server, stats};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, oneshot};
 
@@ -15,7 +16,29 @@ const ORCH_BIN: &str = env!("CARGO_BIN_EXE_llm-orch");
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+/// Cursor into this process's private port window.
+static NEXT_PORT: AtomicU16 = AtomicU16::new(0);
+
+/// Hand out a port for a test server.
+///
+/// Ports come from a per-process window *below* the Linux ephemeral range
+/// (32768..), so parallel tests in this binary can never be handed the same
+/// port and ordinary outbound client sockets don't land on them either. The
+/// probe bind skips anything a leftover process already holds — but the
+/// listener is still dropped before the server binds it, so a third-party
+/// process could in principle win the race; `boot_from_config_path` recovers
+/// from that by retrying with a fresh port.
 fn free_port() -> u16 {
+    // Offset the window by the pid so concurrent test runs don't overlap.
+    let base = 20_000 + (std::process::id() as u16 % 4_000);
+    for _ in 0..8_000 {
+        let offset = NEXT_PORT.fetch_add(1, Ordering::Relaxed) % 8_000;
+        let candidate = base + offset;
+        if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", candidate)) {
+            return listener.local_addr().unwrap().port();
+        }
+    }
+    // Window exhausted (effectively impossible): fall back to the OS.
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -70,11 +93,42 @@ async fn boot(dir: &Path, apikeys_contents: &str, models_yaml: &str) -> TestServ
 /// Boot from a complete config file, allowing integration tests to provide
 /// device maps and static capacities that are independent of host GPU
 /// metrics.
+///
+/// If the listen port is somehow taken by another process, the config is
+/// retargeted to a fresh port and the boot retried instead of failing an
+/// unrelated assertion.
 async fn boot_from_config_path(
     dir: &Path,
     config_path: &Path,
     apikeys_contents: &str,
 ) -> TestServer {
+    for attempt in 0..4u32 {
+        match try_boot(dir, config_path, apikeys_contents).await {
+            Ok(server) => return server,
+            // A retried attempt leaks its background tasks (instance manager,
+            // gpu reader); harmless in a test process that is about to exit.
+            Err(listen) if attempt + 1 < 4 => {
+                let fresh = free_port();
+                let text = std::fs::read_to_string(config_path).unwrap();
+                let patched = text.replace(&listen, &format!("127.0.0.1:{fresh}"));
+                assert_ne!(
+                    patched, text,
+                    "config must reference its listen address {listen} to retry"
+                );
+                std::fs::write(config_path, patched).unwrap();
+            }
+            Err(err) => panic!("server failed to start: {err}"),
+        }
+    }
+    unreachable!()
+}
+
+/// One boot attempt; `Err(listen)` when the HTTP server could not bind.
+async fn try_boot(
+    dir: &Path,
+    config_path: &Path,
+    apikeys_contents: &str,
+) -> Result<TestServer, String> {
     std::fs::write(dir.join("apikeys.txt"), apikeys_contents).unwrap();
     let cfg = config::Config::load(config_path).unwrap();
     let keys = apikeys::ApikeysStore::load(&dir.join("apikeys.txt"))
@@ -145,12 +199,19 @@ async fn boot_from_config_path(
     let server_task = tokio::spawn(server::serve(state, rx));
     // The server binds immediately on a fresh port; give it a moment.
     tokio::time::sleep(Duration::from_millis(100)).await;
-    if server_task.is_finished() {
-        panic!("server task exited at startup: {:?}", server_task.await);
-    }
-
     let listen = shared_cfg.read().await.server.listen.clone();
-    TestServer {
+    if server_task.is_finished() {
+        let err = match server_task.await {
+            Ok(Err(e)) => e,
+            other => format!("unexpected server task outcome: {other:?}"),
+        };
+        // A lost port race is retryable; anything else is a real failure.
+        if err.contains("Address already in use") {
+            return Err(listen);
+        }
+        panic!("server task exited at startup: {err}");
+    }
+    Ok(TestServer {
         url: format!("http://{listen}"),
         manager,
         config: shared_cfg,
@@ -160,7 +221,7 @@ async fn boot_from_config_path(
         mqtt: mqtt_ctl,
         _shutdown: tx,
         _dir: dir.to_path_buf(),
-    }
+    })
 }
 
 fn authed(client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
