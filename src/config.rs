@@ -660,74 +660,7 @@ impl Config {
 
         // --- devices ---
         if let Some(ref devs) = self.devices {
-            let pci_slots = list_pci_slots();
-            let existing_slots: HashSet<&str> = pci_slots.iter().map(|s| s.as_str()).collect();
-            for (idx, slot) in &devs.vulkan {
-                if !existing_slots.contains(slot.as_str()) {
-                    return Err(ConfigError::Validation(format!(
-                        "devices.vulkan.{}: PCI slot '{}' not found in /sys/class/drm/card*/device/",
-                        idx, slot
-                    )));
-                }
-            }
-            // Check for duplicate slots.
-            let mut seen = HashSet::new();
-            for slot in devs.vulkan.values() {
-                if !seen.insert(slot) {
-                    return Err(ConfigError::Validation(format!(
-                        "devices.vulkan: PCI slot '{}' assigned to multiple indices",
-                        slot
-                    )));
-                }
-            }
-
-            // --- cuda ---
-            // NVIDIA GPUs do not register DRM cards, so slots are checked
-            // against /sys/bus/pci/devices/ directly.
-            let mut seen_cuda = HashSet::new();
-            for (idx, cdev) in &devs.cuda {
-                if !pci_slot_exists(&cdev.pci) {
-                    return Err(ConfigError::Validation(format!(
-                        "devices.cuda.{}: PCI slot '{}' not found in /sys/bus/pci/devices/",
-                        idx, cdev.pci
-                    )));
-                }
-                if !seen_cuda.insert(&cdev.pci) {
-                    return Err(ConfigError::Validation(format!(
-                        "devices.cuda: PCI slot '{}' assigned to multiple indices",
-                        cdev.pci
-                    )));
-                }
-                if devs.vulkan.values().any(|s| s == &cdev.pci) {
-                    return Err(ConfigError::Validation(format!(
-                        "devices.cuda.{}: PCI slot '{}' is also assigned in devices.vulkan",
-                        idx, cdev.pci
-                    )));
-                }
-            }
-
-            // --- rocm ---
-            // ROCm GPUs are AMD DRM devices.  Unlike Vulkan, which may use
-            // other DRM vendors too, reject a ROCm mapping that does not
-            // identify an AMD card so a typo cannot become an unplaceable
-            // model later in the scheduler.
-            let amd_slots = list_amd_pci_slots();
-            let existing_amd_slots: HashSet<&str> = amd_slots.iter().map(|s| s.as_str()).collect();
-            let mut seen_rocm = HashSet::new();
-            for (idx, slot) in &devs.rocm {
-                if !existing_amd_slots.contains(slot.as_str()) {
-                    return Err(ConfigError::Validation(format!(
-                        "devices.rocm.{}: PCI slot '{}' not found as an AMD GPU in /sys/class/drm/card*/device/",
-                        idx, slot
-                    )));
-                }
-                if !seen_rocm.insert(slot) {
-                    return Err(ConfigError::Validation(format!(
-                        "devices.rocm: PCI slot '{}' assigned to multiple indices",
-                        slot
-                    )));
-                }
-            }
+            validate_device_slots(devs, &SysfsSlots::probe())?;
         }
 
         // --- model vulkan_devices ---
@@ -820,6 +753,11 @@ impl Config {
     /// `--check-config` output and at startup.
     pub fn warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
+        // Slots that could not be looked up are worth saying out loud: the
+        // config loads, but nothing proves the GPU is really there.
+        if let Some(ref devs) = self.devices {
+            warnings.extend(SysfsSlots::probe().unverified(devs));
+        }
         for m in &self.models {
             if !m.autoscale.as_ref().is_some_and(|a| a.enabled) {
                 continue;
@@ -1611,20 +1549,141 @@ pub struct CudaDeviceConfig {
     pub vram_mb: Option<u64>,
 }
 
-/// List PCI slot names from `/sys/class/drm/card*/device/uevent`.
-fn list_pci_slots() -> Vec<String> {
-    list_drm_pci_slots(false)
+/// sysfs directory holding the DRM card devices (`card0`, `card1`, …).
+const DRM_SYSFS: &str = "/sys/class/drm";
+
+/// sysfs directory holding the PCI devices.
+const PCI_BUS_SYSFS: &str = "/sys/bus/pci/devices";
+
+/// PCI slots read from sysfs: the reference the `devices` mapping is
+/// validated against.
+///
+/// A namespace is `None`/false when sysfs could not be read at all — a
+/// container or a build sandbox has no `/sys`.  There, "slot not found" says
+/// nothing about the config, so the lookup is skipped and reported as a
+/// warning instead of an error.
+#[derive(Debug, Default)]
+struct SysfsSlots {
+    /// Slots that expose a DRM card device (Vulkan namespace).
+    drm: Option<HashSet<String>>,
+    /// Slots whose DRM card device is an AMD GPU (ROCm namespace).
+    amd: Option<HashSet<String>>,
+    /// Whether the PCI bus could be listed (CUDA namespace).
+    pci_bus: bool,
 }
 
-/// List PCI slot names for AMD DRM devices.
-fn list_amd_pci_slots() -> Vec<String> {
-    list_drm_pci_slots(true)
+impl SysfsSlots {
+    fn probe() -> Self {
+        SysfsSlots {
+            drm: list_drm_pci_slots(false).map(|slots| slots.into_iter().collect()),
+            amd: list_drm_pci_slots(true).map(|slots| slots.into_iter().collect()),
+            pci_bus: Path::new(PCI_BUS_SYSFS).is_dir(),
+        }
+    }
+
+    /// Warnings for device namespaces sysfs could not be read for.
+    fn unverified(&self, devs: &DevicesConfig) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.drm.is_none() && !(devs.vulkan.is_empty() && devs.rocm.is_empty()) {
+            warnings.push(format!(
+                "devices: {DRM_SYSFS} is not readable, so vulkan/rocm PCI slots were not verified against real hardware"
+            ));
+        }
+        if !self.pci_bus && !devs.cuda.is_empty() {
+            warnings.push(format!(
+                "devices: {PCI_BUS_SYSFS} is not readable, so cuda PCI slots were not verified against real hardware"
+            ));
+        }
+        warnings
+    }
 }
 
-fn list_drm_pci_slots(amd_only: bool) -> Vec<String> {
+/// Validate the `devices` mapping against a sysfs view.
+///
+/// Existence checks run only for the namespaces sysfs could answer for.  The
+/// duplicate and cross-namespace rules are pure config rules and always run.
+fn validate_device_slots(devs: &DevicesConfig, sysfs: &SysfsSlots) -> Result<(), ConfigError> {
+    // --- vulkan ---
+    if let Some(drm) = &sysfs.drm {
+        for (idx, slot) in &devs.vulkan {
+            if !drm.contains(slot.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "devices.vulkan.{}: PCI slot '{}' not found in /sys/class/drm/card*/device/",
+                    idx, slot
+                )));
+            }
+        }
+    }
+    // Check for duplicate slots.
+    let mut seen = HashSet::new();
+    for slot in devs.vulkan.values() {
+        if !seen.insert(slot) {
+            return Err(ConfigError::Validation(format!(
+                "devices.vulkan: PCI slot '{}' assigned to multiple indices",
+                slot
+            )));
+        }
+    }
+
+    // --- cuda ---
+    // NVIDIA GPUs do not register DRM cards, so slots are checked
+    // against /sys/bus/pci/devices/ directly.
+    let mut seen_cuda = HashSet::new();
+    for (idx, cdev) in &devs.cuda {
+        if sysfs.pci_bus && !pci_slot_exists(&cdev.pci) {
+            return Err(ConfigError::Validation(format!(
+                "devices.cuda.{}: PCI slot '{}' not found in /sys/bus/pci/devices/",
+                idx, cdev.pci
+            )));
+        }
+        if !seen_cuda.insert(&cdev.pci) {
+            return Err(ConfigError::Validation(format!(
+                "devices.cuda: PCI slot '{}' assigned to multiple indices",
+                cdev.pci
+            )));
+        }
+        if devs.vulkan.values().any(|s| s == &cdev.pci) {
+            return Err(ConfigError::Validation(format!(
+                "devices.cuda.{}: PCI slot '{}' is also assigned in devices.vulkan",
+                idx, cdev.pci
+            )));
+        }
+    }
+
+    // --- rocm ---
+    // ROCm GPUs are AMD DRM devices.  Unlike Vulkan, which may use other DRM
+    // vendors too, reject a ROCm mapping that does not identify an AMD card so
+    // a typo cannot become an unplaceable model later in the scheduler.
+    if let Some(amd) = &sysfs.amd {
+        for (idx, slot) in &devs.rocm {
+            if !amd.contains(slot.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "devices.rocm.{}: PCI slot '{}' not found as an AMD GPU in /sys/class/drm/card*/device/",
+                    idx, slot
+                )));
+            }
+        }
+    }
+    let mut seen_rocm = HashSet::new();
+    for slot in devs.rocm.values() {
+        if !seen_rocm.insert(slot) {
+            return Err(ConfigError::Validation(format!(
+                "devices.rocm: PCI slot '{}' assigned to multiple indices",
+                slot
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn list_drm_pci_slots(amd_only: bool) -> Option<Vec<String>> {
+    if !Path::new(DRM_SYSFS).is_dir() {
+        return None;
+    }
     let mut slots = Vec::new();
     for i in 0..16 {
-        let device = std::path::PathBuf::from(format!("/sys/class/drm/card{}/device", i));
+        let device = PathBuf::from(format!("{DRM_SYSFS}/card{}/device", i));
         if amd_only
             && std::fs::read_to_string(device.join("vendor"))
                 .map(|vendor| vendor.trim() != "0x1002")
@@ -1641,14 +1700,12 @@ fn list_drm_pci_slots(amd_only: bool) -> Vec<String> {
             }
         }
     }
-    slots
+    Some(slots)
 }
 
 /// Check whether a PCI slot name exists under `/sys/bus/pci/devices/`.
 fn pci_slot_exists(slot: &str) -> bool {
-    std::path::Path::new("/sys/bus/pci/devices")
-        .join(slot)
-        .exists()
+    Path::new(PCI_BUS_SYSFS).join(slot).exists()
 }
 
 // ---------------------------------------------------------------------------
@@ -2545,12 +2602,73 @@ models:
 
     /// Real DRM PCI slots (what devices.vulkan validates against).
     fn real_drm_slots() -> Vec<String> {
-        list_pci_slots()
+        list_drm_pci_slots(false).unwrap_or_default()
     }
 
     /// Real AMD DRM PCI slots (what devices.rocm validates against).
     fn real_amd_slots() -> Vec<String> {
-        list_amd_pci_slots()
+        list_drm_pci_slots(true).unwrap_or_default()
+    }
+
+    /// A sysfs view where every namespace answered, holding `drm` slots.
+    fn sysfs_with(drm: &[&str]) -> SysfsSlots {
+        SysfsSlots {
+            drm: Some(drm.iter().map(|s| s.to_string()).collect()),
+            amd: Some(drm.iter().map(|s| s.to_string()).collect()),
+            pci_bus: true,
+        }
+    }
+
+    fn devices(yaml: &str) -> DevicesConfig {
+        serde_yaml_ng::from_str(yaml).unwrap()
+    }
+
+    #[test]
+    fn device_slots_must_exist_in_a_readable_sysfs() {
+        let devs = devices("vulkan:\n  0: \"0000:01:00.0\"\nrocm:\n  0: \"0000:01:00.0\"\n");
+        let err = validate_device_slots(&devs, &sysfs_with(&["0000:02:00.0"]))
+            .expect_err("a slot sysfs did not report must be rejected");
+        assert!(
+            format!("{err}").contains("not found in /sys/class/drm"),
+            "{err}"
+        );
+        // A non-AMD card passes the Vulkan lookup but not the ROCm one.
+        let mut intel_only = sysfs_with(&["0000:01:00.0"]);
+        intel_only.amd = Some(HashSet::new());
+        let err =
+            validate_device_slots(&devs, &intel_only).expect_err("a ROCm slot must be an AMD card");
+        assert!(
+            format!("{err}").contains("not found as an AMD GPU"),
+            "{err}"
+        );
+        validate_device_slots(&devs, &sysfs_with(&["0000:01:00.0"])).unwrap();
+    }
+
+    #[test]
+    fn device_slot_lookups_are_skipped_without_sysfs() {
+        // No `/sys` at all (a build sandbox or a container): every slot is
+        // unverifiable, so validation must fall back to the config-only rules
+        // — otherwise the shipped example config could never build.
+        let devs = devices(
+            "vulkan:\n  0: \"0000:03:00.0\"\nrocm:\n  0: \"0000:03:00.0\"\ncuda:\n  0:\n    pci: \"0000:65:00.0\"\n",
+        );
+        validate_device_slots(&devs, &SysfsSlots::default())
+            .expect("unverifiable slots must not be an error");
+        // A typo is not caught here, so say so.
+        let warnings = SysfsSlots::default().unverified(&devs);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+
+        // The config-only rules still hold without sysfs.
+        let duplicated = devices("vulkan:\n  0: \"0000:03:00.0\"\n  1: \"0000:03:00.0\"\n");
+        let err = validate_device_slots(&duplicated, &SysfsSlots::default())
+            .expect_err("a slot claimed twice is a config error");
+        assert!(
+            format!("{err}").contains("assigned to multiple indices"),
+            "{err}"
+        );
+
+        // With sysfs readable there is nothing to warn about.
+        assert!(sysfs_with(&[]).unverified(&devs).is_empty());
     }
 
     #[test]
@@ -2703,6 +2821,9 @@ models:
 
     #[test]
     fn rejects_non_amd_rocm_slot() {
+        if SysfsSlots::probe().amd.is_none() {
+            return; // no sysfs in this environment
+        }
         let yaml = BASE.replace(
             "cmd: \"sleep 3600\"",
             "cmd: \"sleep 3600\"\ndevices:\n  rocm:\n    0: \"0000:ff:ff.f\"",
@@ -2807,6 +2928,9 @@ models:
 
     #[test]
     fn rejects_cuda_slot_not_on_pci_bus() {
+        if !SysfsSlots::probe().pci_bus {
+            return; // no PCI bus visible in this environment
+        }
         let yaml = BASE.replace(
             "cmd: \"sleep 3600\"",
             "cmd: \"sleep 3600\"\ndevices:\n  cuda:\n    0:\n      pci: \"0000:ff:ff.f\"",

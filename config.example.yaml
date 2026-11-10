@@ -140,6 +140,12 @@ server:
 # placement and VRAM accounting.  Declaring `--device`/`-dev` (or a
 # draft-device flag) in a model's `cmd` is a config error for the same
 # reason; keep a draft model on the CPU with `--spec-draft-ngl 0`.
+#
+# Slots are checked against the running host: `devices.vulkan` and
+# `devices.rocm` against /sys/class/drm, `devices.cuda` against
+# /sys/bus/pci/devices.  Where sysfs is not mounted at all (a container, a
+# build sandbox) the lookup is skipped and reported as a warning, so a typo
+# there is only caught on the real host.
 devices:
   vulkan:
     0: "0000:03:00.0"  # dGPU — find with `llama-server --list-devices`
