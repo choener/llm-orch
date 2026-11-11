@@ -1,0 +1,71 @@
+# llm-orch — systemd service for plain Linux hosts
+#
+# Mirrors the hardened native (non-container) profile of the NixOS module
+# (nix/nixos.nix).  Install with systemd/install.sh, which places this file
+# at /etc/systemd/system/llm-orch.service.
+#
+# Paths are fixed: binary in /usr/local/bin, config and apikeys in
+# /etc/llm-orch.  The apikeys path is a CLI argument, never a config field.
+
+[Unit]
+Description=llm-orch — single-host LLM orchestrator
+Wants=network-online.target
+After=network-online.target
+# llm-orch exits immediately on a broken config; without a limit systemd
+# would restart it forever in a tight loop.
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+User=llm-orch
+Group=llm-orch
+ExecStart=/usr/local/bin/llm-orch --config /etc/llm-orch/config.yaml --apikeyfile /etc/llm-orch/apikeys.txt
+Restart=on-failure
+RestartSec=5
+
+# Relative paths in the config (stats file, debug log) resolve against this
+# directory.  systemd creates it, owned by the service user, on first start.
+StateDirectory=llm-orch
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/llm-orch
+
+# ── Privilege dropping ─────────────────────────────────────────────────
+# Dedicated system user, no capabilities, no privilege escalation.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+
+# Filesystem: everything read-only except /var/lib/llm-orch (StateDirectory
+# whitelists it under ProtectSystem=strict).  Model files outside the state
+# directory (e.g. /data/vllm) stay readable; only writes are blocked.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+# Kernel and IPC surface reduction.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+UMask=0077
+
+# Networking: HTTP listener, loopback backends, journald.  No netlink, no
+# packet sockets.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# GPU access.  PrivateDevices must stay off: it hides the device nodes and
+# CUDA/Vulkan then silently falls back to CPU.  DevicePolicy=closed allows
+# the standard device set (/dev/null, /dev/urandom, /dev/ptmx, …) plus the
+# entries below; rules whose group matches nothing on this host are skipped.
+DevicePolicy=closed
+DeviceAllow=char-drm rw
+DeviceAllow=char-kfd rw
+DeviceAllow=char-nvidia* rw
+
+# NVIDIA/Vulkan JIT-compile kernels and shaders at runtime, which needs
+# writable and executable memory.  Keep this off (the default).
+MemoryDenyWriteExecute=no
+
+[Install]
+WantedBy=multi-user.target

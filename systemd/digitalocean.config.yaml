@@ -1,0 +1,61 @@
+# llm-orch configuration for the DigitalOcean droplet.
+#
+# Single remote model: a vLLM server already running on the same host at
+# 127.0.0.1:8000.  A model whose `cmd` is an http(s) URL is a *remote*
+# model: llm-orch spawns no process and uses no GPU itself — it health-probes
+# GET {cmd}/health on the first request and forwards traffic as a passthrough
+# instance.  There is nothing to autoscale, evict, or shut down; a down
+# endpoint is re-probed by the next request.
+#
+# IMPORTANT: llm-orch rewrites the request's `model` field to this model's
+# `name` before forwarding (strict backends validate it), and names must not
+# contain '/' (reserved for cluster peering).  vLLM's default model id is
+# usually a HuggingFace repo id like "Qwen/Qwen3-8B" — start vLLM with a
+# slash-free alias and use that here:
+#   vllm serve Qwen/Qwen3-8B --served-model-name qwen3-8b
+# Check what vLLM currently serves with:
+#   curl -s http://127.0.0.1:8000/v1/models
+#
+# Before switching to this config, validate it:
+#   ./target/release/llm-orch --check-config systemd/digitalocean.config.yaml
+
+server:
+  # Local, unencrypted; put nginx or a cloud load balancer in front for
+  # anything public.  TLS terminates there by design.
+  listen: "127.0.0.1:8080"
+
+models:
+  # Must equal vLLM's --served-model-name (see above), slash-free.
+  - name: "REPLACE-WITH-VLLM-SERVED-MODEL-NAME"
+    # Base URL of the vLLM OpenAI-compatible server.  No trailing slash,
+    # no path — llm-orch appends /v1/... itself.  `{port}` is not available
+    # for remote models (no port is allocated).
+    cmd: "http://127.0.0.1:8000"
+
+    # Match vLLM's --max-model-len (or the model's default); advertised in
+    # /v1/models and used for request validation upstream of the backend.
+    context_length: 32768
+
+    # Remote models are a single passthrough instance; keep at 1.
+    max_instances: 1
+
+    # Concurrency cap on the vLLM endpoint.  vLLM batches continuously, so
+    # this can be well above what a llama.cpp backend would take; raise or
+    # lower to bound simultaneous requests to vLLM.
+    max_concurrent: 16
+
+    # Requests beyond max_concurrent wait in the queue; beyond that, 429.
+    queue_depth: 64
+
+    # If vLLM was started with --api-key, send it on every forwarded request.
+    # The token is read from a key file (re-read at request time, so rotating
+    # the file applies without a restart):
+    #
+    # key_files:
+    #   vllm_key: /etc/llm-orch/vllm-key.txt
+    # ...and on the model:
+    #   remote_auth: "Bearer {vllm_key}"
+
+    # Deliberately absent for remote models (config errors): vram, gpus,
+    # device pools (vulkan_devices/cuda_devices/rocm_devices), autoscale.
+    # idle_ttl is meaningless: the passthrough instance is never evicted.

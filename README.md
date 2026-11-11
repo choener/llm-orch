@@ -55,6 +55,9 @@ Start the orchestrator:
 ```bash
 ./target/release/llm-orch --config config.yaml --apikeyfile apikeys.txt
 ```
+For a production host, install it as a hardened systemd service instead —
+see [`systemd/README.md`](systemd/README.md) for plain Linux hosts, or the
+[NixOS module](#️⃣-nixos-module) section for NixOS.
 
 ### 4. Use
 The orchestrator provides an OpenAI-compatible API. You can query it using any LLM client:
