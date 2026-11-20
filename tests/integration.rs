@@ -1551,13 +1551,61 @@ work-desktop:      sk-bob
     );
 }
 
-/// The shipped examples are executable documentation: they must parse.
+/// `true` for PCI slot strings (`0000:03:00.0`).
+fn is_pci_slot(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 12
+        && b[..4].iter().all(|c| c.is_ascii_hexdigit())
+        && b[4] == b':'
+        && b[5..7].iter().all(|c| c.is_ascii_hexdigit())
+        && b[7] == b':'
+        && b[8..10].iter().all(|c| c.is_ascii_hexdigit())
+        && b[10] == b'.'
+        && b[11].is_ascii_hexdigit()
+}
+
+/// Rewrite every quoted PCI slot in `text` to a slot from `slots`
+/// (cycling), so a config documenting another machine's GPU placement
+/// validates against this machine's sysfs.  Commented example slots are
+/// rewritten too — they are inert.  Quoted strings that are not PCI
+/// slots stay untouched; an unbalanced quote in a comment can at worst
+/// leave a live slot unsubstituted, which the subsequent validation
+/// reports.
+fn localize_pci_slots(text: &str, slots: &[String]) -> String {
+    if slots.is_empty() {
+        return text.to_owned();
+    }
+    let mut parts: Vec<String> = text.split('"').map(str::to_owned).collect();
+    let mut next = 0;
+    for part in parts.iter_mut().skip(1).step_by(2) {
+        if is_pci_slot(part) {
+            *part = slots[next % slots.len()].clone();
+            next += 1;
+        }
+    }
+    parts.join("\"")
+}
+
+/// The shipped examples are executable documentation: they must parse
+/// and validate.  The example's `devices:` section documents concrete
+/// PCI slots from the author's machine, so the copy under test localizes
+/// them to this host's DRM slots and slot validation runs at full
+/// strength against real sysfs.  On a host without DRM cards (a
+/// container) sysfs is unverifiable and the file validates verbatim.
 #[test]
 fn shipped_example_files_are_valid() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = temp_dir("example-valid");
+    let example = std::fs::read_to_string(root.join("config.example.yaml")).unwrap();
+    let config_path = dir.join("config.example.yaml");
+    std::fs::write(
+        &config_path,
+        localize_pci_slots(&example, &real_drm_slots()),
+    )
+    .unwrap();
     let out = std::process::Command::new(ORCH_BIN)
         .arg("--check-config")
-        .arg(root.join("config.example.yaml"))
+        .arg(&config_path)
         .arg("--apikeyfile")
         .arg(root.join("apikeys.example.txt"))
         .output()
@@ -1568,6 +1616,20 @@ fn shipped_example_files_are_valid() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[test]
+fn localize_pci_slots_substitutes_only_quoted_pci_slots() {
+    let slots = vec!["0000:aa:00.0".to_string(), "0000:bb:00.0".to_string()];
+    let text =
+        "vulkan:\n  0: \"0000:03:00.0\" # dGPU\n  # 1: \"0000:7b:00.0\"\nname: \"not-a-slot\"\n";
+    let out = localize_pci_slots(text, &slots);
+    assert_eq!(
+        out,
+        "vulkan:\n  0: \"0000:aa:00.0\" # dGPU\n  # 1: \"0000:bb:00.0\"\nname: \"not-a-slot\"\n"
+    );
+    // No DRM slots: returned unchanged (unverifiable sysfs passes by design).
+    assert_eq!(localize_pci_slots(text, &[]), text);
 }
 
 // ── --check-config ───────────────────────────────────────────────────────────
@@ -2443,8 +2505,13 @@ async fn spawn_pins_vulkan_model_with_device_selector() {
     let llama_stub = llama_stub_link(&dir);
     let argv_single = dir.join("argv-vk-single.txt");
     let argv_dual = dir.join("argv-vk-dual.txt");
+    // vram_limit_mb declares static capacity for both devices: the test
+    // must pass on any host with two DRM cards, including ones whose
+    // cards have no VRAM metrics reader (an Intel iGPU, a display
+    // adapter) — without metrics and without a declared limit a
+    // Vulkan/ROCm device is unplaceable.
     let yaml = format!(
-        "devices:\n  vulkan:\n    0: \"{}\"\n    1: \"{}\"\nmodels:\n  - name: vk-single\n    context_length: 4096\n    cmd: \"{} --port {{port}} --argv-log {}\"\n    max_instances: 1\n    max_concurrent: 1\n    vram: 1000\n    gpus: 1\n    vulkan_devices: [0, 1]\n  - name: vk-dual\n    context_length: 4096\n    cmd: \"{} --port {{port}} --argv-log {}\"\n    max_instances: 1\n    max_concurrent: 1\n    vram: 1000\n    gpus: 2\n    vulkan_devices: [0, 1]\n",
+        "devices:\n  vulkan:\n    0: \"{}\"\n    1: \"{}\"\n  vram_limit_mb:\n    0: 8192\n    1: 8192\nmodels:\n  - name: vk-single\n    context_length: 4096\n    cmd: \"{} --port {{port}} --argv-log {}\"\n    max_instances: 1\n    max_concurrent: 1\n    vram: 1000\n    gpus: 1\n    vulkan_devices: [0, 1]\n  - name: vk-dual\n    context_length: 4096\n    cmd: \"{} --port {{port}} --argv-log {}\"\n    max_instances: 1\n    max_concurrent: 1\n    vram: 1000\n    gpus: 2\n    vulkan_devices: [0, 1]\n",
         slots[0],
         slots[1],
         llama_stub.display(),
@@ -2498,8 +2565,10 @@ async fn spawn_device_selector_uses_post_filter_ranks() {
     let dir = temp_dir("device-pin-ranks");
     let llama_stub = llama_stub_link(&dir);
     let argv_log = dir.join("argv-ranks.txt");
+    // Static capacity via vram_limit_mb (see the vk-single/vk-dual test):
+    // the pinned device must be placeable without host VRAM metrics.
     let yaml = format!(
-        "devices:\n  vulkan:\n    0: \"{}\"\n    1: \"{}\"\nmodels:\n  - name: vk-rank\n    context_length: 4096\n    cmd: \"{} --port {{port}} --argv-log {}\"\n    max_instances: 1\n    max_concurrent: 1\n    vram: 1000\n    gpus: 1\n    vulkan_devices: [[1]]\n",
+        "devices:\n  vulkan:\n    0: \"{}\"\n    1: \"{}\"\n  vram_limit_mb:\n    0: 8192\n    1: 8192\nmodels:\n  - name: vk-rank\n    context_length: 4096\n    cmd: \"{} --port {{port}} --argv-log {}\"\n    max_instances: 1\n    max_concurrent: 1\n    vram: 1000\n    gpus: 1\n    vulkan_devices: [[1]]\n",
         slots[0],
         slots[1],
         llama_stub.display(),
