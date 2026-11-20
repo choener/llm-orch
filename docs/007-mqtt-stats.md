@@ -44,7 +44,9 @@ restart (the subtraction crosses a reset boundary).
   previous snapshot are treated as zero-counted (the stats map only
   holds models with activity).  A window with no activity publishes no
   `rates` section at all — a monotonic `window_secs` would otherwise
-  churn the payload every tick.
+  churn the payload every tick.  Rates stay **per-model**: the per-user
+  counters (issue #12) ride along in the stats document untouched, and
+  per-user rates are out of scope.
 - **Credentials follow the peer-key convention.**  `mqtt.key` is a
   template with `{name}` placeholders resolved from the existing
   `key_files:` map (rotated key files re-resolve on hot-reload).
@@ -65,7 +67,7 @@ All under `{mqtt.prefix}` (default `llmorch`), per node:
 | Topic | Payload |
 | --- | --- |
 | `{prefix}/{node}/status` | `online` / `offline` (retained string) |
-| `{prefix}/{node}/stats` | the `GET /v1/stats` document (`enabled`, `version`, `started_at`, `updated_at`, `models` union incl. node-qualified entries, `gpus` live metrics) plus the optional `rates` block |
+| `{prefix}/{node}/stats` | the `GET /v1/stats` document (`enabled`, `version`, `started_at`, `updated_at`, `models` union incl. node-qualified entries, `users` per-apikey-label counters, `gpus` live metrics) plus the optional `rates` block |
 | `{prefix}/{node}/models` | `{version, node, models: [{name, context_length}], aliases: [{name, targets}]}` from the effective config (peer models appear as `<peer>/<model>`) |
 | `{prefix}/{node}/gpus` | `{version, node, gpus: [{index, pci_slot, vram_vendor, vram_total_bytes}]}` — static inventory only, so it changes only with hardware/config |
 | `{prefix}/{peer}/stats` | **gateway re-export**: each configured peer's cached `StatsResponse` document, republished under the peer's own name (no extra fetches — the same 10 s cache the stats endpoint uses) |

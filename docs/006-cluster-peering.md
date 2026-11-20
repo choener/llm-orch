@@ -116,7 +116,12 @@ models and statistics.
      node serving it (local + peers) — duplicated models add up.
    The master does *not* count forwarded requests into its own per-model
    metrics — the leaf's numbers are authoritative for leaf models;
-   aggregation happens only at query time. Peer-state observability (last
+   aggregation happens only at query time. Per-user counters (issue #12) are
+   the exception: the authenticating node records them for every request it
+   serves, including forwarded ones, keyed by the master-side model name
+   (per-user accounting happens only at the master — decision 2); leaf
+   `users` maps are *not* merged into the union, since labels are
+   per-node namespaces. Peer-state observability (last
    successful fetch, catalog age, in-flight count, recent errors) is
    included in `/admin/status`.
 10. **Request-ID mapping.** The master mints its own request IDs (as

@@ -1,6 +1,6 @@
 # Token / model statistics
 
-Status: **implemented** (issue #1).
+Status: **implemented** (issue #1; per-user counters in issue #12).
 
 ## Problem statement
 
@@ -8,6 +8,9 @@ Operators want to see, per model, how many tokens have been served —
 prompt / cached / completion — plus request and time-to-first-token (TTFT)
 statistics, both *cumulative* and *since boot*, and they want that data
 available to external systems (Home Assistant) without scraping logs.
+Accounts also want to benchmark their own usage: the same counters are
+recorded per apikey label, broken down per model, plus a per-user
+aggregate across models.
 
 ## Design decisions
 
@@ -34,6 +37,28 @@ available to external systems (Home Assistant) without scraping logs.
   contributions; a `tracing::warn!` flags the missing usage so token
   counters are never silently short.  Failed requests (backend error
   responses, truncated streams) are not counted.
+- **Per-user counters in the same shape (issue #12).**  Every served request
+  is additionally recorded for the authenticating apikey label: a sparse
+  per-user per-model matrix plus a per-user aggregate across models, each
+  with the same `total`/`boot` two-set shape and the same counting rules.
+  Only (label, model) pairs with recorded activity exist, so the file stays
+  O(active pairs), bounded by apikeys × models; the aggregate is stored
+  alongside so per-user totals need no consumer-side summation.
+- **Per-user accounting happens on the authenticating node (cluster
+  peering).**  A gateway records per-user counters for every request it
+  serves, including peer-forwarded ones — keyed by the master-side model
+  name (the name the client requested, as materialized in the effective
+  config), because that is what the user benchmarked.  The per-model skip
+  for peer models is unchanged, so leaf model numbers stay authoritative.
+  The gateway does **not** merge leaf `users` maps into its stats union:
+  labels are per-node namespaces (each node has its own apikeys file), so
+  bare-name merging could conflate distinct users.  See
+  `docs/006-cluster-peering.md`, decisions 2 and 9.
+- **Privacy: every key holder can read every label's totals.**
+  `/v1/stats` is auth-gated like all `/v1/*` endpoints, but there is no
+  role model today.  If user levels/roles are ever introduced, per-user
+  visibility in `/v1/stats` must be revisited (e.g. users see only their
+  own row).
 - **Best-effort persistence.**  File-write failures are `tracing::warn!`ed and
   swallowed — statistics must never fail or slow down a request.
 
@@ -64,20 +89,42 @@ published immediately with the existing state.
                  "last_active": 1751966400 },
       "boot":  { "…": "same shape" }
     }
+  },
+  "users": {
+    "work-desktop": {
+      "total": { "requests": 42, "…": "the same counters as a model" },
+      "boot":  { "…": "same shape" },
+      "models": {
+        "qwen3-32b": {
+          "total": { "…": "same shape" },
+          "boot":  { "…": "same shape" }
+        }
+      }
+    }
   }
 }
 ```
 
 `started_at` is the first startup (restored from the file if present).
+`users` is keyed by apikey label; each label carries an aggregate across
+models (`total`/`boot`) plus a per-model breakdown with the same shape as
+the top-level `models`.  The schema stays version 1: `users` is optional
+(`serde(default)`), so files written by older binaries load without it and
+old binaries ignore it.  Caveat: an old binary that rewrites the file
+drops user counters — acceptable for a rollback.
 
 ## Endpoint
 
 `GET /v1/stats` (auth-gated like the other `/v1/*` endpoints):
 
-- the counters document above (as `models`, plus `enabled`, `started_at`,
-  `updated_at`), and
+- the counters document above (as `models` and `users`, plus `enabled`,
+  `started_at`, `updated_at`), and
 - `gpus` — the latest `GpuMetrics` snapshot (VRAM, busy %, temperature,
   power, clocks) in the same `GpuStatus` shape as `/v1/info`.
+
+Cluster peering: the endpoint returns the union of the local models and
+the peers' (node-qualified plus bare-summed entries); the `users` map is
+the local node's own only (see the peering decision above).
 
 ## Recording points
 
@@ -93,15 +140,20 @@ published immediately with the existing state.
   request/duration only.  Truncated streams and client disconnects are not
   recorded, matching the completion ring-buffer rule.  Only successful
   completions are counted.
+- **Per-user**: every recording call carries the apikey label
+  (`ApiKey.label`, known at auth time).  Peer-forwarded requests skip the
+  per-model counters but still count per-user on the authenticating node,
+  keyed by the master-side model name.
 
 ## Code layout
 
 - `src/stats.rs` — `StatsStore` (counters, restore, atomic persistence,
-  `set_path` for reload), `ModelCounters`, `StatsFile`.
+  `set_path` for reload), `ModelCounters`, `StatsModel`, `StatsUser`,
+  `StatsFile`.
 - `src/config.rs` — `StatsConfig` + validation (non-empty path, existing
   parent directory).
-- `src/handlers.rs` — `record_stats()`, `stats_endpoint()`, `SseForwarder`
-  TTFT/usage recording.
+- `src/handlers.rs` — `record_stats()` (per-model + per-user recording),
+  `stats_endpoint()`, `SseForwarder` TTFT/usage recording.
 - `src/reload.rs` — stats path retarget on config reload.
 - `src/server.rs` — `AppState.stats`, `/v1/stats` route.
 
@@ -109,9 +161,12 @@ published immediately with the existing state.
 
 - Unit (`src/stats.rs`): counter accumulation, file write/restore (total
   persists, boot zeroes), corrupt-file recovery, disabled no-op, path
-  retarget, missing-parent robustness.
+  retarget, missing-parent robustness; per-user per-model accumulation
+  and aggregate, per-user restore (total persists, boot zeroes), old
+  files without `users` load, peer-model requests count per-user only.
 - Integration (`tests/integration.rs`): end-to-end non-streaming + streaming
   requests update the JSON file and `/v1/stats`; TTFT is recorded for
   streaming; `enabled: false` when unconfigured; 401 without auth; hot-reload
   retarget publishes the new file; config validation rejects a missing parent
-  directory.
+  directory; a labeled key's requests populate its `users` matrix and
+  aggregate in the endpoint and the JSON file.

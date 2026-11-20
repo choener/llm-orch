@@ -173,8 +173,8 @@ async fn mqtt_publishes_docs_change_only_with_rates() {
         "unchanged docs must not be republished"
     );
 
-    // ── recorded request → new stats doc with positive rates ──────────
-    stats_store.record("m", Some(10), None, Some(5), 100, None);
+    // ── recorded request → new stats doc with positive rates ──────
+    stats_store.record("tester", "m", true, Some(10), None, Some(5), 100, None);
     ctl.tick_now();
     let msgs = stub
         .wait_for("llmtest/testnode/stats", |m| {

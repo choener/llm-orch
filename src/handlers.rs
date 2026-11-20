@@ -683,6 +683,7 @@ pub async fn chat_completions(
             // Statistics (opt-in).
             record_stats(
                 &state,
+                &key.label,
                 &model_name,
                 response_body
                     .pointer("/usage/prompt_tokens")
@@ -1013,6 +1014,7 @@ pub async fn responses(
             // Statistics (opt-in).
             record_stats(
                 &state,
+                &key.label,
                 &model_name,
                 response_body
                     .pointer("/usage/input_tokens")
@@ -1364,6 +1366,7 @@ pub async fn completions(
             // Statistics (opt-in).
             record_stats(
                 &state,
+                &key.label,
                 &model_name,
                 response_body
                     .pointer("/usage/prompt_tokens")
@@ -1403,7 +1406,7 @@ pub async fn completions(
 /// but always non-streaming and forwarded to the backend's `/v1/embeddings`.
 pub async fn embeddings(
     State(state): State<AppState>,
-    _key: ApiKey,
+    key: ApiKey,
     Json(mut request): Json<EmbeddingRequest>,
 ) -> Result<Json<EmbeddingResponse>, ApiError> {
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -1482,6 +1485,7 @@ pub async fn embeddings(
         // Statistics (opt-in): embeddings have no generation tokens.
         record_stats(
             &state,
+            &key.label,
             &model_name,
             stats_prompt,
             None,
@@ -1626,6 +1630,7 @@ pub async fn rerank(
         // Statistics (opt-in): reranking has no generation tokens.
         record_stats(
             &state,
+            &key.label,
             &model_name,
             response_body
                 .pointer("/usage/prompt_tokens")
@@ -1832,6 +1837,7 @@ pub async fn systemone(
         // reports its token use as `usage.input_tokens`.
         record_stats(
             &state,
+            &key.label,
             &model_name,
             response_body
                 .pointer("/usage/input_tokens")
@@ -3733,8 +3739,15 @@ fn log_completion(
 /// only); the store warns about the missing usage.  No-op when stats
 /// are not configured; the store is best-effort and never fails the
 /// request.
+///
+/// Per-user counters always record on this (the authenticating) node,
+/// keyed by `api_user` (the apikey label) and the master-side model
+/// name — including peer-forwarded requests (docs/006, decision 2:
+/// per-user accounting happens only at the master).
+#[allow(clippy::too_many_arguments)]
 fn record_stats(
     state: &AppState,
+    api_user: &str,
     model_name: &str,
     prompt_tokens: Option<u64>,
     cached_tokens: Option<u64>,
@@ -3746,15 +3759,15 @@ fn record_stats(
     // its own per-model metrics — the leaf's numbers are authoritative
     // for its models (docs/006, decision 9; the union aggregates them
     // at query time).
-    if state.manager.is_peer_model(model_name) {
-        return;
-    }
+    let count_model = !state.manager.is_peer_model(model_name);
     // Every served request counts, even when the backend reported no
     // usage (some OpenAI-compatible providers omit it): the token
     // fields stay absent and the request/duration counters still
     // advance (the store warns about the missing usage).
     state.stats.record(
+        api_user,
         model_name,
+        count_model,
         prompt_tokens,
         cached_tokens,
         completion_tokens,
@@ -4866,23 +4879,26 @@ impl<S> Drop for SseForwarder<S> {
             // Statistics (opt-in) — clean completions only, same rule
             // as the ring buffer above.  Recorded even when the stream
             // carried no usage chunk: the token fields stay absent and
-            // only the request/duration counters advance.  Peer
-            // models are skipped — the leaf's numbers are
-            // authoritative (docs/006, decision 9; mirrors
-            // `record_stats` for the non-streaming path).
+            // only the request/duration counters advance.  Peer-forwarded
+            // requests skip the per-model counters — the leaf's numbers
+            // are authoritative (docs/006, decision 9) — but still count
+            // per-user on this authenticating node (decision 2), keyed
+            // by the master-side model name; mirrors `record_stats` for
+            // the non-streaming path.
             let ttft_ms = self
                 .first_chunk_at
                 .map(|t| t.saturating_duration_since(self.t0).as_millis() as u64);
-            if !self.manager.is_peer_model(&self.model_name) {
-                self.stats.record(
-                    &self.model_name,
-                    prompt_opt,
-                    cached_opt,
-                    gen_opt,
-                    duration_ms,
-                    ttft_ms,
-                );
-            }
+            let count_model = !self.manager.is_peer_model(&self.model_name);
+            self.stats.record(
+                &self.api_user,
+                &self.model_name,
+                count_model,
+                prompt_opt,
+                cached_opt,
+                gen_opt,
+                duration_ms,
+                ttft_ms,
+            );
             self.manager.record_completion(
                 &self.model_name,
                 crate::types::CompletionRecord {

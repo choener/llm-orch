@@ -965,7 +965,7 @@ async fn systemone_accounts_its_forward_pass_in_stats() {
     let yaml = format!(
         "models:\n  - name: kev\n    context_length: 4096\n    capabilities: [decisions]\n    cmd: \"{STUB_BIN} --port {{port}}\"\n    idle_ttl: 60\n    max_instances: 1\n"
     );
-    let (srv, stats_file) = boot_with_stats(&dir, &yaml).await;
+    let (srv, stats_file) = boot_with_stats(&dir, &yaml, "tester: secret-key\n").await;
     let client = reqwest::Client::new();
 
     let resp = authed(&client, &format!("{}/v1/systemone", srv.url))
@@ -3384,7 +3384,7 @@ async fn remote_model_without_remote_auth_sends_no_header() {
 
 /// Boot a server with the `stats:` section enabled, writing to a file in
 /// the test directory.
-async fn boot_with_stats(dir: &Path, models_yaml: &str) -> (TestServer, PathBuf) {
+async fn boot_with_stats(dir: &Path, models_yaml: &str, apikeys: &str) -> (TestServer, PathBuf) {
     let listen_port = free_port();
     let stats_file = dir.join("stats.json");
     let config_yaml = format!(
@@ -3393,14 +3393,15 @@ async fn boot_with_stats(dir: &Path, models_yaml: &str) -> (TestServer, PathBuf)
     );
     let config_path = dir.join("config.yaml");
     std::fs::write(&config_path, config_yaml).unwrap();
-    let srv = boot_from_config_path(dir, &config_path, "tester: secret-key\n").await;
+    let srv = boot_from_config_path(dir, &config_path, apikeys).await;
     (srv, stats_file)
 }
 
 #[tokio::test]
 async fn stats_counters_json_file_and_endpoint() {
     let dir = temp_dir("stats");
-    let (srv, stats_file) = boot_with_stats(&dir, &models_yaml("", 60)).await;
+    let (srv, stats_file) =
+        boot_with_stats(&dir, &models_yaml("", 60), "tester: secret-key\n").await;
     let client = reqwest::Client::new();
 
     // Non-streaming chat completion (stub: prompt=5, completion=3).
@@ -3427,6 +3428,13 @@ async fn stats_counters_json_file_and_endpoint() {
         &doc["models"]["m"]["boot"], total,
         "single boot: boot counters equal total counters"
     );
+    // The apikey label gets the same request in its per-user matrix and
+    // aggregate (issue #12).
+    let user = &doc["users"]["tester"];
+    assert_eq!(user["total"]["requests"], 1);
+    assert_eq!(user["total"]["prompt_tokens"], 5);
+    assert_eq!(user["models"]["m"]["total"]["requests"], 1);
+    assert_eq!(user["models"]["m"]["total"]["completion_tokens"], 3);
 
     // Streaming chat completion → TTFT is measured.
     let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
@@ -3463,12 +3471,24 @@ async fn stats_counters_json_file_and_endpoint() {
         "ttft min/max must be present after a streaming request"
     );
     assert_eq!(v["models"]["m"]["boot"], v["models"]["m"]["total"]);
+    // Both requests landed on the tester label (streaming included).
+    assert_eq!(v["users"]["tester"]["total"]["requests"], 2);
+    assert_eq!(v["users"]["tester"]["total"]["ttft_count"], 1);
+    assert_eq!(v["users"]["tester"]["models"]["m"]["total"]["requests"], 2);
+    assert_eq!(
+        v["users"]["tester"]["models"]["m"]["total"]["prompt_tokens"],
+        10
+    );
 
     // The JSON file agrees with the endpoint.
     let doc2: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&stats_file).unwrap()).unwrap();
     assert_eq!(doc2["models"]["m"]["total"]["requests"], 2);
     assert_eq!(doc2["models"]["m"]["total"]["ttft_count"], 1);
+    assert_eq!(
+        doc2["users"]["tester"]["models"]["m"]["total"]["ttft_count"],
+        1
+    );
 
     // No auth → 401.
     let resp = client
@@ -3477,6 +3497,76 @@ async fn stats_counters_json_file_and_endpoint() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn stats_users_per_label_matrix_and_aggregate() {
+    let dir = temp_dir("stats-users");
+    // Two models × two labeled keys: the per-user counters form a
+    // (label, model) matrix plus a per-user aggregate across models.
+    let two_models = format!(
+        "models:\n  - name: m\n    context_length: 4096\n    cmd: \"{STUB_BIN} --port {{port}}\"\n    idle_ttl: 60\n    max_instances: 1\n  - name: m2\n    context_length: 4096\n    cmd: \"{STUB_BIN} --port {{port}}\"\n    idle_ttl: 60\n    max_instances: 1\n"
+    );
+    let (srv, stats_file) =
+        boot_with_stats(&dir, &two_models, "tester: secret-key\nalice: alice-key\n").await;
+    let client = reqwest::Client::new();
+
+    // tester: two requests on m, one on m2 (stub: prompt=5, completion=3).
+    for model in ["m", "m", "m2"] {
+        let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
+            .json(&chat_body(model))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+    // alice: one request on m.
+    let resp = client
+        .post(format!("{}/v1/chat/completions", srv.url))
+        .bearer_auth("alice-key")
+        .json(&chat_body("m"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The stats file: per-user per-model matrix plus per-user aggregate.
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&stats_file).unwrap()).unwrap();
+    let tester = &doc["users"]["tester"];
+    assert_eq!(tester["total"]["requests"], 3);
+    assert_eq!(tester["total"]["prompt_tokens"], 15);
+    assert_eq!(tester["total"]["completion_tokens"], 9);
+    assert_eq!(tester["models"]["m"]["total"]["requests"], 2);
+    assert_eq!(tester["models"]["m"]["total"]["prompt_tokens"], 10);
+    assert_eq!(tester["models"]["m2"]["total"]["requests"], 1);
+    assert_eq!(tester["models"]["m2"]["total"]["prompt_tokens"], 5);
+    // Within one boot, boot mirrors total — aggregate and matrix.
+    assert_eq!(tester["boot"]["requests"], 3);
+    assert_eq!(tester["models"]["m"]["boot"]["requests"], 2);
+    let alice = &doc["users"]["alice"];
+    assert_eq!(alice["total"]["requests"], 1);
+    assert_eq!(alice["models"]["m"]["total"]["requests"], 1);
+    assert_eq!(alice["models"]["m"]["total"]["prompt_tokens"], 5);
+    // The per-model counters are untouched by the user split.
+    assert_eq!(doc["models"]["m"]["total"]["requests"], 3);
+    assert_eq!(doc["models"]["m2"]["total"]["requests"], 1);
+
+    // /v1/stats carries the users map.  Every key holder can read every
+    // label's row (auth-gated, but no role model — docs/005).
+    let resp = client
+        .get(format!("{}/v1/stats", srv.url))
+        .bearer_auth("alice-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["users"]["tester"]["total"]["requests"], 3);
+    assert_eq!(v["users"]["tester"]["models"]["m"]["total"]["requests"], 2);
+    assert_eq!(v["users"]["tester"]["models"]["m2"]["total"]["requests"], 1);
+    assert_eq!(v["users"]["alice"]["total"]["requests"], 1);
+    assert_eq!(v["users"]["alice"]["models"]["m"]["total"]["requests"], 1);
 }
 
 #[tokio::test]
@@ -3500,7 +3590,8 @@ async fn stats_disabled_reports_enabled_false() {
 #[tokio::test]
 async fn stats_hot_reload_retargers_file() {
     let dir = temp_dir("stats-retarget");
-    let (srv, stats_file) = boot_with_stats(&dir, &models_yaml("", 60)).await;
+    let (srv, stats_file) =
+        boot_with_stats(&dir, &models_yaml("", 60), "tester: secret-key\n").await;
     let client = reqwest::Client::new();
 
     let resp = authed(&client, &format!("{}/v1/chat/completions", srv.url))
@@ -3842,6 +3933,44 @@ async fn peering_stats_union_sums_and_qualifies() {
         !obj.contains_key("cheyenne/cortana/qwen-flash"),
         "no double qualification: {obj:?}"
     );
+
+    // Per-user counters (issue #12): the master counts both requests
+    // under the tester label — the forwarded one keyed by the master-side
+    // model name (the name the client requested) — and does NOT merge the
+    // leaf's users map into the union (labels are per-node namespaces).
+    let users = &body["users"];
+    assert_eq!(users["tester"]["total"]["requests"], 2);
+    assert_eq!(
+        users["tester"]["models"]["local-dense"]["total"]["requests"],
+        1
+    );
+    assert_eq!(
+        users["tester"]["models"]["cortana/qwen-flash"]["total"]["requests"], 1,
+        "forwarded requests count per-user under the master-side model name"
+    );
+    assert!(
+        !users["tester"]["models"]
+            .as_object()
+            .unwrap()
+            .contains_key("qwen-flash"),
+        "the user matrix keys by the master-side model name, not the leaf's"
+    );
+
+    // The leaf's own accounting: it authenticated the master's peer key
+    // under its own tester label and recorded the leaf-side model name.
+    let resp = client
+        .get(format!("{}/v1/stats", topo.leaf.url))
+        .bearer_auth("secret-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let leaf_body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        leaf_body["users"]["tester"]["models"]["qwen-flash"]["total"]["requests"],
+        1
+    );
+    assert_eq!(leaf_body["users"]["tester"]["total"]["requests"], 1);
 }
 
 /// An unreachable peer with no catalog yet: requests fail fast with a

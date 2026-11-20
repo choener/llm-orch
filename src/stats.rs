@@ -7,6 +7,11 @@
 //   survives restarts (the "bragging" total).
 // - `boot`  — zeroed at every startup (ephemeral since-boot view).
 //
+// The same counters are additionally recorded per apikey label (per-user
+// per-model matrix plus a per-user aggregate across models), so accounts
+// can benchmark their own usage; the label is known at auth time
+// (`ApiKey.label`) and threaded into every recording call.
+//
 // Both are updated after every served request — requests whose backend
 // reported no usage count without token totals (warned).  The
 // JSON file is rewritten (atomic temp + rename) on each update, following
@@ -94,6 +99,11 @@ pub struct StatsFile {
     pub updated_at: u64,
     /// Per-model counters, keyed by (resolved) model name.
     pub models: HashMap<String, StatsModel>,
+    /// Per-user counters, keyed by apikey label.  Optional since schema
+    /// version 1 grew the field: files written by older binaries load
+    /// without it, and it is omitted while empty.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub users: HashMap<String, StatsUser>,
 }
 
 /// The two counter sets for one model.
@@ -103,6 +113,19 @@ pub struct StatsModel {
     pub total: ModelCounters,
     /// Counters since this process started.
     pub boot: ModelCounters,
+}
+
+/// One user's counters (apikey label): a per-model breakdown plus an
+/// aggregate across models, each in the `total`/`boot` two-set shape.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct StatsUser {
+    /// Aggregate cumulative counters across models.
+    pub total: ModelCounters,
+    /// Aggregate counters across models since this process started.
+    pub boot: ModelCounters,
+    /// Per-model breakdown (`total`/`boot` per model).
+    #[serde(default)]
+    pub models: HashMap<String, StatsModel>,
 }
 
 impl StatsModel {
@@ -154,6 +177,77 @@ struct StatsState {
     started_at: u64,
     totals: HashMap<String, ModelCounters>,
     boot: HashMap<String, ModelCounters>,
+    /// Per-user counters, keyed by apikey label.
+    users: HashMap<String, UserState>,
+}
+
+/// In-memory per-user counters: per-model breakdown plus aggregate.
+#[derive(Default)]
+struct UserState {
+    /// Cumulative per-model counters.
+    totals: HashMap<String, ModelCounters>,
+    /// Per-model counters since this process started.
+    boot: HashMap<String, ModelCounters>,
+    /// Cumulative aggregate across models.
+    agg_total: ModelCounters,
+    /// Aggregate across models since this process started.
+    agg_boot: ModelCounters,
+}
+
+impl StatsState {
+    /// The full stats document for the current state (`updated_at` = now).
+    fn doc(&self) -> StatsFile {
+        StatsFile {
+            version: 1,
+            started_at: self.started_at,
+            updated_at: now_secs(),
+            models: self.models_doc(),
+            users: self.users_doc(),
+        }
+    }
+
+    fn models_doc(&self) -> HashMap<String, StatsModel> {
+        self.totals
+            .iter()
+            .map(|(name, c)| {
+                (
+                    name.clone(),
+                    StatsModel {
+                        total: *c,
+                        boot: self.boot.get(name).copied().unwrap_or_default(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn users_doc(&self) -> HashMap<String, StatsUser> {
+        self.users
+            .iter()
+            .map(|(label, u)| {
+                (
+                    label.clone(),
+                    StatsUser {
+                        total: u.agg_total,
+                        boot: u.agg_boot,
+                        models: u
+                            .totals
+                            .iter()
+                            .map(|(name, c)| {
+                                (
+                                    name.clone(),
+                                    StatsModel {
+                                        total: *c,
+                                        boot: u.boot.get(name).copied().unwrap_or_default(),
+                                    },
+                                )
+                            })
+                            .collect(),
+                    },
+                )
+            })
+            .collect()
+    }
 }
 
 /// Shared statistics store; lives in `AppState`.
@@ -167,7 +261,7 @@ impl StatsStore {
     /// error: the file is created on the first recorded request (or
     /// written on demand), and a corrupt file just resets `total`.
     pub fn new(stats_file: Option<&PathBuf>) -> Self {
-        let (started_at, totals) = match stats_file {
+        let (started_at, totals, users) = match stats_file {
             Some(path) => match std::fs::read_to_string(path)
                 .ok()
                 .and_then(|s| serde_json::from_str::<StatsFile>(&s).ok())
@@ -175,10 +269,31 @@ impl StatsStore {
                 Some(doc) => (
                     doc.started_at.max(1),
                     doc.models.into_iter().map(|(k, v)| (k, v.total)).collect(),
+                    // User counters restore like the per-model ones: `total`
+                    // survives, `boot` zeroes (files without a `users` map —
+                    // written by older binaries — restore empty).
+                    doc.users
+                        .into_iter()
+                        .map(|(label, u)| {
+                            (
+                                label,
+                                UserState {
+                                    totals: u
+                                        .models
+                                        .into_iter()
+                                        .map(|(k, v)| (k, v.total))
+                                        .collect(),
+                                    boot: HashMap::new(),
+                                    agg_total: u.total,
+                                    agg_boot: ModelCounters::default(),
+                                },
+                            )
+                        })
+                        .collect(),
                 ),
-                None => (now_secs().max(1), HashMap::new()),
+                None => (now_secs().max(1), HashMap::new(), HashMap::new()),
             },
-            None => (now_secs().max(1), HashMap::new()),
+            None => (now_secs().max(1), HashMap::new(), HashMap::new()),
         };
         Self {
             state: Mutex::new(StatsState {
@@ -186,6 +301,7 @@ impl StatsStore {
                 started_at,
                 totals,
                 boot: HashMap::new(),
+                users,
             }),
         }
     }
@@ -215,9 +331,20 @@ impl StatsStore {
 
     /// Record one served request and rewrite the JSON file atomically.
     /// No-op when stats are disabled.
+    ///
+    /// Updates three places: the top-level per-model counters (unless
+    /// `count_model` is false — cluster peering: a peer-forwarded request
+    /// never counts into the local per-model metrics, the leaf's numbers
+    /// are authoritative there), the user's per-model entry, and the
+    /// user's aggregate across models.  The model key is always the
+    /// master-side (effective-config) model name — the name the client
+    /// requested.
+    #[allow(clippy::too_many_arguments)]
     pub fn record(
         &self,
+        user: &str,
         model: &str,
+        count_model: bool,
         prompt_tokens: Option<u64>,
         cached_tokens: Option<u64>,
         completion_tokens: Option<u64>,
@@ -229,38 +356,54 @@ impl StatsStore {
             if state.path.is_none() {
                 return;
             }
-            state.totals.entry(model.to_owned()).or_default().apply(
-                prompt_tokens,
-                cached_tokens,
-                completion_tokens,
-                duration_ms,
-                ttft_ms,
-            );
-            state.boot.entry(model.to_owned()).or_default().apply(
-                prompt_tokens,
-                cached_tokens,
-                completion_tokens,
-                duration_ms,
-                ttft_ms,
-            );
-            StatsFile {
-                version: 1,
-                started_at: state.started_at,
-                updated_at: now_secs(),
-                models: state
-                    .totals
-                    .iter()
-                    .map(|(name, c)| {
-                        (
-                            name.clone(),
-                            StatsModel {
-                                total: *c,
-                                boot: state.boot.get(name).copied().unwrap_or_default(),
-                            },
-                        )
-                    })
-                    .collect(),
+            if count_model {
+                state.totals.entry(model.to_owned()).or_default().apply(
+                    prompt_tokens,
+                    cached_tokens,
+                    completion_tokens,
+                    duration_ms,
+                    ttft_ms,
+                );
+                state.boot.entry(model.to_owned()).or_default().apply(
+                    prompt_tokens,
+                    cached_tokens,
+                    completion_tokens,
+                    duration_ms,
+                    ttft_ms,
+                );
             }
+            // Per-user counters always record on the authenticating node
+            // (docs/006, decision 2) — including peer-forwarded requests.
+            let u = state.users.entry(user.to_owned()).or_default();
+            u.totals.entry(model.to_owned()).or_default().apply(
+                prompt_tokens,
+                cached_tokens,
+                completion_tokens,
+                duration_ms,
+                ttft_ms,
+            );
+            u.boot.entry(model.to_owned()).or_default().apply(
+                prompt_tokens,
+                cached_tokens,
+                completion_tokens,
+                duration_ms,
+                ttft_ms,
+            );
+            u.agg_total.apply(
+                prompt_tokens,
+                cached_tokens,
+                completion_tokens,
+                duration_ms,
+                ttft_ms,
+            );
+            u.agg_boot.apply(
+                prompt_tokens,
+                cached_tokens,
+                completion_tokens,
+                duration_ms,
+                ttft_ms,
+            );
+            state.doc()
         };
         self.persist_with(doc);
     }
@@ -268,24 +411,7 @@ impl StatsStore {
     /// Snapshot of the current document (for the `/v1/stats` endpoint).
     pub fn snapshot(&self) -> Option<StatsFile> {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.path.as_ref().map(|_| StatsFile {
-            version: 1,
-            started_at: state.started_at,
-            updated_at: now_secs(),
-            models: state
-                .totals
-                .iter()
-                .map(|(name, c)| {
-                    (
-                        name.clone(),
-                        StatsModel {
-                            total: *c,
-                            boot: state.boot.get(name).copied().unwrap_or_default(),
-                        },
-                    )
-                })
-                .collect(),
-        })
+        state.path.as_ref().map(|_| state.doc())
     }
 
     /// Rewrite the file atomically (temp in the same directory + rename).
@@ -366,6 +492,13 @@ pub struct StatsResponse {
     /// Per-model counters: `total` (across restarts) and `boot` (since
     /// this process started).
     pub models: HashMap<String, StatsModel>,
+    /// Per-user counters (apikey label → per-model breakdown + aggregate),
+    /// local node only.  Cluster peering: leaf `users` maps are NOT
+    /// merged — labels are per-node namespaces (each node has its own
+    /// apikeys file), so bare-name merging could conflate distinct
+    /// users (docs/006, decision 2).
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub users: HashMap<String, StatsUser>,
     /// Latest GPU metrics snapshot (empty on CPU-only hosts).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub gpus: Vec<crate::types::GpuStatus>,
@@ -413,11 +546,15 @@ pub async fn build_response(
         })
         .collect();
     let doc = stats.snapshot();
+    let stats_enabled = doc.is_some();
     let (version, started_at) = doc
         .as_ref()
         .map(|d| (d.version, d.started_at))
         .unwrap_or((1, 0));
     let mut updated_at = doc.as_ref().map(|d| d.updated_at).unwrap_or(0);
+    // Local users map: passed through verbatim, never merged with peers'
+    // (labels are per-node namespaces — see `StatsResponse::users`).
+    let (local_models, users) = doc.map(|d| (d.models, d.users)).unwrap_or_default();
     let peer_names = peers.peer_names();
     let mut peer_models: Vec<(String, HashMap<String, StatsModel>)> = Vec::new();
     if !peer_names.is_empty() {
@@ -450,7 +587,7 @@ pub async fn build_response(
     // - node-qualified entries (`<node>/<model>` for local models,
     //   `<peer>/<model>` for leaf models) carry that node's numbers;
     // - bare entries are the sum over every node serving the name.
-    let mut models: HashMap<String, StatsModel> = doc.map(|d| d.models).unwrap_or_default();
+    let mut models: HashMap<String, StatsModel> = local_models;
     // Self-qualification (`<node>/<model>` copies of local entries) is a
     // gateway feature: a node without peers emits bare-only stats so a
     // consuming master re-exports each entry exactly once (no nested
@@ -474,7 +611,10 @@ pub async fn build_response(
             bare.merge(&m);
         }
     }
-    let enabled = stats.snapshot().is_some() || !models.is_empty();
+    // `users` also counts towards `enabled`: a pure gateway serves every
+    // request via peers (no local per-model counters) but still records
+    // per-user counters for what it authenticated.
+    let enabled = stats_enabled || !models.is_empty() || !users.is_empty();
 
     StatsResponse {
         enabled,
@@ -482,6 +622,7 @@ pub async fn build_response(
         started_at,
         updated_at,
         models,
+        users,
         gpus,
     }
 }
@@ -519,9 +660,27 @@ mod tests {
     fn record_updates_both_sets_and_writes_file() {
         let path = temp_path("basic");
         let store = StatsStore::new(Some(&path));
-        store.record("model-a", Some(100), Some(40), Some(50), 1200, Some(150));
-        store.record("model-a", Some(10), None, Some(5), 800, Some(350));
-        store.record("model-b", None, None, Some(7), 500, None);
+        store.record(
+            "u",
+            "model-a",
+            true,
+            Some(100),
+            Some(40),
+            Some(50),
+            1200,
+            Some(150),
+        );
+        store.record(
+            "u",
+            "model-a",
+            true,
+            Some(10),
+            None,
+            Some(5),
+            800,
+            Some(350),
+        );
+        store.record("u", "model-b", true, None, None, Some(7), 500, None);
 
         let doc: StatsFile =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -547,8 +706,8 @@ mod tests {
         // they just contribute no token totals.
         let path = temp_path("no-usage");
         let store = StatsStore::new(Some(&path));
-        store.record("embedder", None, None, None, 42, None);
-        store.record("embedder", Some(7), None, None, 8, None);
+        store.record("u", "embedder", true, None, None, None, 42, None);
+        store.record("u", "embedder", true, Some(7), None, None, 8, None);
 
         let doc: StatsFile =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -565,7 +724,7 @@ mod tests {
     fn restores_total_from_file_and_zeroes_boot() {
         let path = temp_path("restore");
         let store = StatsStore::new(Some(&path));
-        store.record("model-a", Some(100), None, Some(50), 1000, None);
+        store.record("u", "model-a", true, Some(100), None, Some(50), 1000, None);
 
         // Simulate a restart: fresh store, same file.
         let restarted = StatsStore::new(Some(&path));
@@ -573,7 +732,7 @@ mod tests {
         assert_eq!(before.models["model-a"].total.requests, 1);
         assert_eq!(before.models["model-a"].boot.requests, 0);
 
-        restarted.record("model-a", Some(10), None, Some(5), 100, None);
+        restarted.record("u", "model-a", true, Some(10), None, Some(5), 100, None);
         let after = restarted.snapshot().unwrap();
         assert_eq!(after.models["model-a"].total.requests, 2);
         assert_eq!(after.models["model-a"].total.prompt_tokens, 110);
@@ -587,14 +746,14 @@ mod tests {
         std::fs::write(&path, "{not json").unwrap();
         let store = StatsStore::new(Some(&path));
         assert_eq!(store.snapshot().unwrap().models.len(), 0);
-        store.record("m", Some(1), None, Some(1), 10, None);
+        store.record("u", "m", true, Some(1), None, Some(1), 10, None);
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn disabled_store_is_noop() {
         let store = StatsStore::new(None);
-        store.record("model-a", Some(10), None, Some(5), 100, None);
+        store.record("u", "model-a", true, Some(10), None, Some(5), 100, None);
         assert!(store.snapshot().is_none());
         assert!(store.path().is_none());
     }
@@ -604,7 +763,7 @@ mod tests {
         let old = temp_path("retarget-old");
         let new = temp_path("retarget-new");
         let store = StatsStore::new(Some(&old));
-        store.record("m", Some(10), None, Some(5), 100, None);
+        store.record("u", "m", true, Some(10), None, Some(5), 100, None);
         store.set_path(Some(&new));
         assert!(std::fs::metadata(&new).is_ok());
         let doc: StatsFile = serde_json::from_str(&std::fs::read_to_string(&new).unwrap()).unwrap();
@@ -617,7 +776,161 @@ mod tests {
     fn missing_parent_dir_does_not_panic() {
         let path = temp_path("noparent").join("no-such-dir").join("stats.json");
         let store = StatsStore::new(Some(&path));
-        store.record("m", Some(10), None, Some(5), 100, None);
+        store.record("u", "m", true, Some(10), None, Some(5), 100, None);
         store.set_path(Some(&path));
+    }
+
+    #[test]
+    fn record_updates_user_matrix_and_aggregate() {
+        let path = temp_path("users");
+        let store = StatsStore::new(Some(&path));
+        store.record(
+            "alice",
+            "model-a",
+            true,
+            Some(100),
+            None,
+            Some(50),
+            1000,
+            None,
+        );
+        store.record(
+            "alice",
+            "model-b",
+            true,
+            Some(10),
+            None,
+            Some(5),
+            500,
+            Some(80),
+        );
+        store.record("bob", "model-a", true, Some(7), None, None, 42, None);
+
+        let doc: StatsFile =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let alice = &doc.users["alice"];
+        // Aggregate across models.
+        assert_eq!(alice.total.requests, 2);
+        assert_eq!(alice.total.prompt_tokens, 110);
+        assert_eq!(alice.total.completion_tokens, 55);
+        assert_eq!(alice.total.duration_sum_ms, 1500);
+        assert_eq!(alice.total.duration_avg_ms, 750);
+        assert_eq!(alice.total.ttft_count, 1);
+        assert_eq!(alice.total.ttft_min_ms, Some(80));
+        // Per-model breakdown.
+        assert_eq!(alice.models["model-a"].total.requests, 1);
+        assert_eq!(alice.models["model-a"].total.prompt_tokens, 100);
+        assert_eq!(alice.models["model-a"].total.ttft_count, 0);
+        assert_eq!(alice.models["model-b"].total.requests, 1);
+        assert_eq!(alice.models["model-b"].total.ttft_count, 1);
+        // Within one boot, boot mirrors total — aggregate and matrix.
+        assert_eq!(alice.boot, alice.total);
+        assert_eq!(alice.models["model-a"].boot, alice.models["model-a"].total);
+        // A second user's row is independent.
+        let bob = &doc.users["bob"];
+        assert_eq!(bob.total.requests, 1);
+        assert_eq!(bob.total.prompt_tokens, 7);
+        assert_eq!(bob.models["model-a"].total.requests, 1);
+        assert_eq!(bob.models["model-a"].total.completion_tokens, 0);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn peer_model_request_counts_per_user_only() {
+        // A peer-forwarded request (count_model=false) never touches the
+        // top-level per-model counters — the leaf's numbers are
+        // authoritative for its models — but the authenticating node still
+        // counts it per-user, keyed by the master-side model name
+        // (docs/006, decisions 2 and 9).
+        let path = temp_path("peer-user");
+        let store = StatsStore::new(Some(&path));
+        store.record(
+            "alice",
+            "cortana/qwen",
+            false,
+            Some(100),
+            None,
+            Some(50),
+            1000,
+            None,
+        );
+
+        let doc: StatsFile =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            !doc.models.contains_key("cortana/qwen"),
+            "per-model counters must skip peer-forwarded requests"
+        );
+        let alice = &doc.users["alice"];
+        assert_eq!(alice.total.requests, 1);
+        assert_eq!(alice.total.prompt_tokens, 100);
+        assert_eq!(alice.models["cortana/qwen"].total.requests, 1);
+        assert_eq!(alice.models["cortana/qwen"].total.completion_tokens, 50);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn restores_user_totals_and_zeroes_boot() {
+        let path = temp_path("users-restore");
+        let store = StatsStore::new(Some(&path));
+        store.record(
+            "alice",
+            "model-a",
+            true,
+            Some(100),
+            None,
+            Some(50),
+            1000,
+            None,
+        );
+
+        // Simulate a restart: fresh store, same file.
+        let restarted = StatsStore::new(Some(&path));
+        let before = restarted.snapshot().unwrap();
+        let alice = &before.users["alice"];
+        assert_eq!(alice.total.requests, 1);
+        assert_eq!(alice.total.prompt_tokens, 100);
+        assert_eq!(alice.boot.requests, 0, "boot user counters reset");
+        assert_eq!(alice.models["model-a"].total.requests, 1);
+        assert_eq!(alice.models["model-a"].boot.requests, 0);
+
+        restarted.record("alice", "model-a", true, Some(10), None, Some(5), 100, None);
+        let after = restarted.snapshot().unwrap();
+        let alice = &after.users["alice"];
+        assert_eq!(alice.total.requests, 2);
+        assert_eq!(alice.total.prompt_tokens, 110);
+        assert_eq!(alice.boot.requests, 1);
+        assert_eq!(alice.models["model-a"].total.prompt_tokens, 110);
+        assert_eq!(alice.models["model-a"].boot.requests, 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn old_file_without_users_loads() {
+        // Schema stays version 1: `users` is optional, so files written
+        // by older binaries load without it.
+        let path = temp_path("old-file");
+        let counters = r#"{"requests":3,"prompt_tokens":30,"cached_tokens":0,"completion_tokens":9,"ttft_count":0,"ttft_sum_ms":0,"duration_sum_ms":900,"duration_avg_ms":300}"#;
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"started_at":100,"updated_at":200,"models":{{"m":{{"total":{counters},"boot":{counters}}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let store = StatsStore::new(Some(&path));
+        let doc = store.snapshot().unwrap();
+        assert_eq!(doc.version, 1);
+        assert_eq!(doc.models["m"].total.requests, 3);
+        assert!(doc.users.is_empty());
+
+        // New records populate `users` next to the restored models.
+        store.record("alice", "m", true, Some(10), None, Some(5), 100, None);
+        let doc: StatsFile =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc.models["m"].total.requests, 4);
+        assert_eq!(doc.users["alice"].total.requests, 1);
+        assert_eq!(doc.users["alice"].models["m"].total.requests, 1);
+        std::fs::remove_file(&path).ok();
     }
 }
